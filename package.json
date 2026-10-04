@@ -1,13 +1,16 @@
 {
   "name": "multimodel-chat",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "One conversation, multiple AI models, shared context. Pick the best response as you go.",
   "type": "module",
   "private": true,
-  "engines": { "node": ">=22.13" },
+  "engines": {
+    "node": ">=22.13"
+  },
   "scripts": {
     "start": "node --disable-warning=ExperimentalWarning server.js",
     "dev": "node --watch --disable-warning=ExperimentalWarning server.js",
-    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js"
+    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js",
+    "langfuse:backfill": "node --disable-warning=ExperimentalWarning scripts/langfuse-backfill.js"
   }
 }

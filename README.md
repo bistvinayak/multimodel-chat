@@ -38,6 +38,28 @@ Create an account in the browser, pick models, and start chatting. Data lives in
 | Preference signal | Use, continue, save and final actions log a preference event with the competing responses and display position, ready for selection-rate analytics. |
 | Mobile | Answers become tabs per turn instead of squeezed columns. |
 
+## Langfuse tracing
+
+Add your keys to `.env` and restart. Every chat is then traced:
+
+| Langfuse | What it holds |
+|---|---|
+| Session | One chat (session id = conversation id) |
+| Trace | One message you sent: your text, reply target, mode, models asked, active skills, and every model's final answer |
+| Generation | One model run: the exact messages sent, the answer and reasoning, token usage, cost, latency, time to first token, provider, status and level |
+| Events | Rate-limit retries and automatic switches, on the generation where they happened |
+| Scores | Your choices: `user_use_as_context`, `user_continue`, `user_save`, `user_final`, attached to the chosen answer |
+
+```bash
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+LANGFUSE_HOST=https://cloud.langfuse.com    # or https://us.cloud.langfuse.com, or self-hosted
+LANGFUSE_LOG_CONTENT=true                   # false = metadata only, no prompts or answers
+npm run langfuse:backfill                   # optional: send chats from before tracing was on
+```
+
+It uses Langfuse's OpenTelemetry endpoint and needs no SDK. Langfuse Cloud shuts down the legacy ingestion API for traces on 2026-11-16. User ids are opaque UUIDs, and emails are never sent. Tracing runs in the background with retries, so a Langfuse outage never slows or breaks a chat. The chat header links to the session, each answer links to its trace, and Settings shows the connection status.
+
 ## Architecture
 
 ```
@@ -48,6 +70,8 @@ lib/db.js      SQLite schema (users, conversations, conversation_models, turns,
 lib/context.js Context Manager: builds each model's message list per turn
 lib/openrouter.js  streaming client + error classification
 lib/models.js  live catalog + tags
+lib/langfuse.js    OTLP tracing + scores for Langfuse
+lib/health.js  live model health from real traffic
 ```
 
 The API key stays on the server. The browser never sees it.

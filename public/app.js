@@ -475,6 +475,7 @@ function renderHead() {
   const canonical = selections.filter((s) => s.selection_type === 'canonical');
   el.innerHTML = `
     <div class="conv-title-row"><input class="conv-title" id="title" value="${esc(c.title)}" aria-label="Conversation title">
+      ${S.conv.langfuse?.session_url ? `<a class="btn small ghost" href="${esc(S.conv.langfuse.session_url)}" target="_blank" rel="noopener" title="Open this whole chat as a Langfuse session">Langfuse ↗</a>` : ''}
       <button class="btn small" id="finish-btn">Finish</button></div>
     <div class="lanes-bar">${models.map((m) => `<span class="lane-chip ${m.status}" title="${esc(m.model_id)}">
         <span class="dot" style="background:var(--lane-${m.position % 6})"></span>${esc(shortName(m.model_id))}${S.modelMap.get(m.model_id)?.free ? ' <span class="tag free">FREE</span>' : ''}
@@ -615,6 +616,8 @@ function cardHTML(r, tabActive) {
         <button class="btn small ghost ${r.saved ? 'on' : ''}" data-act="save" data-id="${r.id}">${r.saved ? 'Saved' : 'Save'}</button>
         <button class="btn small ghost ${r.final ? 'on' : ''}" data-act="final" data-id="${r.id}">${r.final ? 'Final ✓' : 'Use as final'}</button>` : ''}
       ${r.attempts ? `<button class="btn small ghost" data-act="context" data-id="${r.id}" title="See exactly what was sent to this model">Context sent</button>` : ''}
+      ${S.conv?.langfuse && r.trace_span_id ? `<a class="btn small ghost" target="_blank" rel="noopener" title="Open this run in Langfuse"
+          href="${esc(S.conv.langfuse.trace_base + (S.conv.turns.find((t) => t.id === r.turn_id)?.trace_id || '') + '?observation=' + r.trace_span_id)}">Trace ↗</a>` : ''}
     </div></article>`;
 }
 
@@ -929,11 +932,19 @@ function openSettings() {
       <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="set-free" ${p.free_only ? 'checked' : ''}> Show free models only by default</label>
       <label style="display:flex;gap:8px;align-items:flex-start"><input type="checkbox" id="set-auto" ${p.auto_switch !== false ? 'checked' : ''} style="margin-top:4px">
         <span>When a model is rate limited, switch to the best other model that is answering<br><span class="muted small">You always see when this happens. The busy model is paused, not removed. Turn this off to keep strict comparisons and retry for longer instead.</span></span></label>
+      <div id="lf-status" class="small muted">Checking Langfuse…</div>
       <hr style="border:0;border-top:1px solid var(--border);width:100%">
       <div><b>Delete account</b><p class="muted small">Permanently deletes your account, conversations, responses, and preference history.</p>
       <button class="btn danger" id="del-acct">Delete my account</button></div>`,
     foot: `<button class="btn" data-close>Cancel</button><button class="btn primary" id="set-save">Save</button>`,
   });
+  api('GET', '/api/langfuse/status').then((st) => {
+    const box = $('#lf-status', el); if (!box) return;
+    box.innerHTML = !st.enabled
+      ? '<b>Langfuse:</b> off. Add LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY to .env and restart to trace every chat.'
+      : `<b>Langfuse:</b> ${st.last_error ? `⚠ ${esc(st.last_error)}` : 'connected'} · ${st.spans_sent} spans and ${st.scores_sent} scores sent${st.spans_dropped ? ` · ${st.spans_dropped} dropped` : ''}
+         · ${st.log_content ? 'prompts and answers included' : 'metadata only'}${st.project_url ? ` · <a href="${esc(st.project_url)}" target="_blank" rel="noopener">open project ↗</a>` : ''}`;
+  }).catch(() => {});
   $('#set-save', el).onclick = async () => {
     try { S.me = await api('PATCH', '/api/me', { max_output_tokens: Number($('#set-max', el).value), free_only: $('#set-free', el).checked, auto_switch: $('#set-auto', el).checked }); S.filters.free = S.me.preferences.free_only; close(); toast('Settings saved'); if (S.conv) estimate(); }
     catch (e) { fail(e); }

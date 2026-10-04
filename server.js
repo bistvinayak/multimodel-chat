@@ -7,6 +7,7 @@ import { openDb, tx } from './lib/db.js';
 import { hashPassword, verifyPassword, createSession, destroySession, userFromRequest, parseCookies, sessionCookie } from './lib/auth.js';
 import { getCatalog, getModel, qualityScore, NOT_CHAT } from './lib/models.js';
 import { healthOf, recordOk, recordLimited, recordBlocked } from './lib/health.js';
+import * as lf from './lib/langfuse.js';
 import { buildContext } from './lib/context.js';
 import { streamCompletion, ModelError, probeModel } from './lib/openrouter.js';
 
@@ -26,6 +27,8 @@ const API_KEY = process.env.OPENROUTER_API_KEY;
 if (!API_KEY) console.warn('WARNING: OPENROUTER_API_KEY is not set. Model calls will fail.');
 
 const db = openDb(process.env.DB_PATH || path.join(ROOT, 'data', 'app.db'));
+let lfProject = null; // Langfuse project URL, for deep links
+if (lf.enabled()) lf.projectUrl().then((u) => { lfProject = u; console.log(u ? `Langfuse tracing on: ${u}` : 'Langfuse keys set, but the project lookup failed. Check LANGFUSE_HOST and keys.'); });
 const running = new Map(); // response_id -> AbortController
 const uid = () => crypto.randomUUID();
 const now = () => Date.now();
@@ -65,7 +68,7 @@ const touch = (convId) => db.prepare('UPDATE conversations SET updated_at=? WHER
 
 const RESPONSE_COLS = `id, turn_id, conversation_id, model_id, served_model, provider, display_position, content, reasoning,
   status, error_kind, error, finish_reason, latency_ms, first_token_ms, prompt_tokens, completion_tokens, cost,
-  saved, final, attempts, replaced_by, stands_in_for, auto_switched, created_at, finished_at`;
+  saved, final, attempts, replaced_by, stands_in_for, auto_switched, trace_span_id, created_at, finished_at`;
 const getResponseRow = (id) => db.prepare(`SELECT ${RESPONSE_COLS} FROM responses WHERE id=?`).get(id);
 
 function conversationPayload(conv) {
@@ -87,7 +90,8 @@ function conversationPayload(conv) {
   return {
     conversation: conv,
     models,
-    turns: turns.map((t) => ({ ...t, target_models: JSON.parse(t.target_models), responses: byTurn.get(t.id) })),
+    turns: turns.map((t) => ({ ...t, target_models: JSON.parse(t.target_models), trace_id: lf.traceIdFor(t.id), responses: byTurn.get(t.id) })),
+    langfuse: lf.enabled() && lfProject ? { session_url: `${lfProject}/sessions/${encodeURIComponent(conv.id)}`, trace_base: `${lfProject}/traces/` } : null,
     selections,
     stats,
     skill_ids: db.prepare('SELECT skill_id FROM conversation_skills WHERE conversation_id=?').all(conv.id).map((x) => x.skill_id),
@@ -155,6 +159,11 @@ function replyRef(convId, reply_to) {
 }
 
 function logPreference(user, resp, eventType) {
+  if (lf.enabled()) {
+    const cur = db.prepare('SELECT trace_span_id FROM responses WHERE id=?').get(resp.id);
+    lf.score({ name: `user_${eventType}`, traceId: lf.traceIdFor(resp.turn_id), observationId: cur?.trace_span_id || undefined,
+      comment: `User chose ${resp.model_id}`, metadata: { model: resp.model_id, response_id: resp.id, display_position: resp.display_position } });
+  }
   const others = db.prepare('SELECT id, model_id FROM responses WHERE turn_id=? AND id<>?').all(resp.turn_id, resp.id);
   db.prepare(`INSERT INTO preference_events (id, user_id, conversation_id, turn_id, event_type, winning_response, winning_model,
               compared_responses, compared_models, display_position, task_type, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
@@ -229,6 +238,31 @@ async function pickStandIn(r) {
   return candidates.find((m, i) => results[i].health === 'ok') || null;
 }
 
+// ---------- Langfuse tracing (never allowed to break a chat) ----------
+function traceRun(user, turn, respId, spanId, startedAt, messages, maxOut, events) {
+  if (!lf.enabled()) return;
+  try {
+    const conv = db.prepare('SELECT * FROM conversations WHERE id=?').get(turn.conversation_id);
+    const resp = db.prepare('SELECT * FROM responses WHERE id=?').get(respId);
+    db.prepare('UPDATE responses SET trace_span_id=? WHERE id=?').run(spanId, respId);
+    lf.enqueue(lf.generationSpan({ conv, user, turn, resp, spanId, startedAt, messages, maxOut, events }));
+    maybeTraceTurn(user, turn.id);
+  } catch (e) { console.warn('[langfuse] trace failed:', e.message); }
+}
+
+// The turn's root span goes out once every model in it has finished (stand-ins included).
+function maybeTraceTurn(user, turnId) {
+  const turn = db.prepare('SELECT * FROM turns WHERE id=?').get(turnId);
+  if (!turn || turn.traced) return;
+  const responses = db.prepare('SELECT * FROM responses WHERE turn_id=? ORDER BY display_position').all(turnId);
+  if (responses.some((r) => ['pending', 'generating'].includes(r.status) || running.has(r.id))) return;
+  const conv = db.prepare('SELECT * FROM conversations WHERE id=?').get(turn.conversation_id);
+  const turnIndex = db.prepare('SELECT COUNT(*) n FROM turns WHERE conversation_id=? AND created_at <= ?').get(conv.id, turn.created_at).n;
+  const decisions = db.prepare(`SELECT COUNT(*) n FROM context_selections WHERE conversation_id=? AND selection_type='canonical' AND active=1 AND created_at < ?`).get(conv.id, turn.created_at).n;
+  db.prepare('UPDATE turns SET traced=1 WHERE id=?').run(turnId);
+  lf.enqueue(lf.turnSpan({ conv, user, turn, responses, skills: skillsFor(conv.id), decisions, turnIndex }));
+}
+
 // ---------- model run (streams NDJSON to the client) ----------
 async function runResponse(user, resp, req, res) {
   if (running.has(resp.id)) throw new HttpError(409, 'This response is already generating');
@@ -251,6 +285,8 @@ async function runResponse(user, resp, req, res) {
 
   let content = '', reasoning = '', lastFlush = now();
   const started = now();
+  const spanId = lf.newSpanId();
+  const events = []; // retries and switches, attached to the Langfuse generation
   const flush = (force) => {
     if (force || now() - lastFlush > 1500) {
       db.prepare('UPDATE responses SET content=?, reasoning=? WHERE id=?').run(content, reasoning, resp.id);
@@ -278,6 +314,7 @@ async function runResponse(user, resp, req, res) {
         if (!retryable) { e.attempts = attempt + 1; throw e; }
         const wait = e.retryAfterMs ?? backoffMs(attempt);
         emit({ type: 'retrying', attempt: attempt + 1, of: maxRetries, wait_ms: wait });
+        events.push({ name: 'rate_limited_retry', time: now(), attributes: { attempt: attempt + 1, wait_ms: wait, error: e.message.slice(0, 300) } });
         await new Promise((ok) => {
           const t = setTimeout(ok, wait);
           ctl.signal.addEventListener('abort', () => { clearTimeout(t); ok(); }, { once: true });
@@ -315,17 +352,23 @@ async function runResponse(user, resp, req, res) {
       .run(content, reasoning, status, me.kind === 'stopped' ? null : me.message, me.kind, now(), resp.id);
     if (me.kind === 'rate_limit' && prefsOf(user).auto_switch && !ctl.signal.aborted && standInDepth(resp.id) < MAX_AUTO_SWITCHES) {
       emit({ type: 'switching' });
+      events.push({ name: 'auto_switch_started', time: now() });
       try {
         const alt = await pickStandIn(getResponseRow(resp.id));
         if (alt) {
           const newId = swapLane(getResponseRow(resp.id), alt.id, true);
           emit({ type: 'switched', from: resp.model_id, to: alt.id, new_response_id: newId });
-        } else emit({ type: 'switch_failed', message: 'No other free model is answering right now.' });
-      } catch (err) { emit({ type: 'switch_failed', message: err.message }); }
+          events.push({ name: 'auto_switched', time: now(), attributes: { from: resp.model_id, to: alt.id, new_response_id: newId } });
+        } else {
+          emit({ type: 'switch_failed', message: 'No other free model is answering right now.' });
+          events.push({ name: 'auto_switch_failed', time: now(), attributes: { reason: 'no responding alternative' } });
+        }
+      } catch (err) { emit({ type: 'switch_failed', message: err.message }); events.push({ name: 'auto_switch_failed', time: now(), attributes: { reason: err.message } }); }
     }
   } finally {
     running.delete(resp.id);
     touch(resp.conversation_id);
+    traceRun(user, turn, resp.id, spanId, started, messages, maxOut, events);
   }
   emit({ type: 'final', response: getResponseRow(resp.id) });
   res.end();
@@ -379,6 +422,11 @@ route('PATCH', '/api/me', async (req, res, { user }) => {
 route('DELETE', '/api/me', async (req, res, { user }) => {
   db.prepare('DELETE FROM users WHERE id=?').run(user.id); // cascades to all of the user's data
   send(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie('', 0) });
+});
+
+route('GET', '/api/langfuse/status', async (req, res) => {
+  if (lf.enabled() && !lfProject) lfProject = await lf.projectUrl();
+  send(res, 200, { ...lf.config(), project_url: lfProject, ...lf.stats, queued_flush: undefined });
 });
 
 route('GET', '/api/models', async (req, res) => {
@@ -683,6 +731,13 @@ export const server = http.createServer(async (req, res) => {
     else res.end();
   }
 });
+
+for (const sig of ['SIGINT', 'SIGTERM']) {
+  process.once(sig, async () => {
+    if (lf.enabled()) { console.log('Flushing Langfuse traces…'); await Promise.race([lf.flush(), new Promise((ok) => setTimeout(ok, 5000))]); }
+    process.exit(0);
+  });
+}
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   server.listen(PORT, HOST, () => console.log(`Multi-model workspace running at http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}`));
