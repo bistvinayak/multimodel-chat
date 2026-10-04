@@ -1,0 +1,475 @@
+import http from 'node:http';
+import crypto from 'node:crypto';
+import path from 'node:path';
+import { readFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import { openDb, tx } from './lib/db.js';
+import { hashPassword, verifyPassword, createSession, destroySession, userFromRequest, parseCookies, sessionCookie } from './lib/auth.js';
+import { getCatalog, getModel } from './lib/models.js';
+import { buildContext } from './lib/context.js';
+import { streamCompletion, ModelError } from './lib/openrouter.js';
+
+const ROOT = path.dirname(fileURLToPath(import.meta.url));
+try { process.loadEnvFile(path.join(ROOT, '.env')); } catch {}
+
+const PORT = Number(process.env.PORT || 3210);
+const HOST = process.env.HOST || '127.0.0.1';
+const MAX_MODELS = Number(process.env.MAX_MODELS || 3);
+const RATE_LIMIT_RETRIES = Number(process.env.RATE_LIMIT_RETRIES ?? 2);
+const API_KEY = process.env.OPENROUTER_API_KEY;
+if (!API_KEY) console.warn('WARNING: OPENROUTER_API_KEY is not set. Model calls will fail.');
+
+const db = openDb(process.env.DB_PATH || path.join(ROOT, 'data', 'app.db'));
+const running = new Map(); // response_id -> AbortController
+const uid = () => crypto.randomUUID();
+const now = () => Date.now();
+const DEFAULT_PREFS = { max_output_tokens: 8192, free_only: true };
+
+// ---------- helpers ----------
+class HttpError extends Error { constructor(status, msg) { super(msg); this.status = status; } }
+
+function send(res, status, data, headers = {}) {
+  res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...headers });
+  res.end(data === undefined ? '' : JSON.stringify(data));
+}
+
+async function readJson(req) {
+  let size = 0; const chunks = [];
+  for await (const c of req) { size += c.length; if (size > 1_000_000) throw new HttpError(413, 'Body too large'); chunks.push(c); }
+  if (!chunks.length) return {};
+  try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { throw new HttpError(400, 'Invalid JSON'); }
+}
+
+const prefsOf = (user) => ({ ...DEFAULT_PREFS, ...JSON.parse(user.preferences || '{}') });
+const publicUser = (u) => ({ id: u.id, name: u.name, email: u.email, plan: u.plan, created_at: u.created_at, preferences: prefsOf(u) });
+
+// Every lookup is scoped by the authenticated user_id (PRD section 25).
+function ownConversation(user, id) {
+  const c = db.prepare('SELECT * FROM conversations WHERE id=? AND user_id=?').get(id, user.id);
+  if (!c) throw new HttpError(404, 'Conversation not found');
+  return c;
+}
+function ownResponse(user, id) {
+  const r = db.prepare(`SELECT r.* FROM responses r JOIN conversations c ON c.id=r.conversation_id
+                        WHERE r.id=? AND c.user_id=?`).get(id, user.id);
+  if (!r) throw new HttpError(404, 'Response not found');
+  return r;
+}
+const touch = (convId) => db.prepare('UPDATE conversations SET updated_at=? WHERE id=?').run(now(), convId);
+
+const RESPONSE_COLS = `id, turn_id, conversation_id, model_id, served_model, provider, display_position, content, reasoning,
+  status, error_kind, error, finish_reason, latency_ms, first_token_ms, prompt_tokens, completion_tokens, cost,
+  saved, final, attempts, created_at, finished_at`;
+const getResponseRow = (id) => db.prepare(`SELECT ${RESPONSE_COLS} FROM responses WHERE id=?`).get(id);
+
+function conversationPayload(conv) {
+  const models = db.prepare('SELECT * FROM conversation_models WHERE conversation_id=? ORDER BY position').all(conv.id);
+  const turns = db.prepare('SELECT * FROM turns WHERE conversation_id=? ORDER BY created_at').all(conv.id);
+  const responses = db.prepare(`SELECT ${RESPONSE_COLS} FROM responses WHERE conversation_id=? ORDER BY display_position`).all(conv.id);
+  const byTurn = new Map(turns.map((t) => [t.id, []]));
+  for (const r of responses) byTurn.get(r.turn_id)?.push(r);
+  const selections = db.prepare(
+    `SELECT s.*, r.model_id FROM context_selections s JOIN responses r ON r.id=s.response_id
+     WHERE s.conversation_id=? AND s.active=1 AND (s.selection_type='canonical' OR s.consumed_turn_id IS NULL)
+     ORDER BY s.created_at`).all(conv.id);
+  const stats = responses.reduce((s, r) => {
+    if (r.status !== 'pending') s.calls += r.attempts;
+    s.cost += r.cost || 0;
+    s.tokens += (r.prompt_tokens || 0) + (r.completion_tokens || 0);
+    return s;
+  }, { cost: 0, calls: 0, tokens: 0, messages: turns.length });
+  return {
+    conversation: conv,
+    models,
+    turns: turns.map((t) => ({ ...t, target_models: JSON.parse(t.target_models), responses: byTurn.get(t.id) })),
+    selections,
+    stats,
+    max_models: MAX_MODELS,
+  };
+}
+
+function pinsFor(convId, turnId) {
+  return db.prepare(
+    `SELECT s.selected_text, r.model_id FROM context_selections s JOIN responses r ON r.id=s.response_id
+     WHERE s.conversation_id=? AND s.selection_type='continue' AND s.active=1 AND ${turnId ? 's.consumed_turn_id=?' : 's.consumed_turn_id IS NULL'}`
+  ).all(...(turnId ? [convId, turnId] : [convId]));
+}
+
+function maxOutFor(user, model) {
+  const want = Number(prefsOf(user).max_output_tokens) || 8192;
+  return model?.max_output ? Math.min(want, model.max_output) : want;
+}
+
+function resolveTargets(convId, target) {
+  const models = db.prepare('SELECT * FROM conversation_models WHERE conversation_id=? ORDER BY position').all(convId);
+  if (!target || target === 'all') {
+    const active = models.filter((m) => m.status === 'active');
+    if (!active.length) throw new HttpError(400, 'No active models. Add or resume a model first.');
+    return { mode: 'all', targets: active };
+  }
+  const m = models.find((x) => x.model_id === target && x.status !== 'removed');
+  if (!m) throw new HttpError(400, 'That model is not part of this conversation');
+  return { mode: 'single', targets: [m] };
+}
+
+function logPreference(user, resp, eventType) {
+  const others = db.prepare('SELECT id, model_id FROM responses WHERE turn_id=? AND id<>?').all(resp.turn_id, resp.id);
+  db.prepare(`INSERT INTO preference_events (id, user_id, conversation_id, turn_id, event_type, winning_response, winning_model,
+              compared_responses, compared_models, display_position, task_type, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(uid(), user.id, resp.conversation_id, resp.turn_id, eventType, resp.id, resp.model_id,
+      JSON.stringify(others.map((o) => o.id)), JSON.stringify(others.map((o) => o.model_id)), resp.display_position, null, now());
+}
+
+// ---------- model run (streams NDJSON to the client) ----------
+async function runResponse(user, resp, req, res) {
+  if (running.has(resp.id)) throw new HttpError(409, 'This response is already generating');
+  const turn = db.prepare('SELECT * FROM turns WHERE id=?').get(resp.turn_id);
+  const model = await getModel(resp.model_id);
+  const maxOut = maxOutFor(user, model);
+  const { messages } = buildContext(db, turn, resp.model_id, model, maxOut, pinsFor(turn.conversation_id, turn.id));
+
+  const ctl = new AbortController();
+  running.set(resp.id, ctl);
+  db.prepare(`UPDATE responses SET status='generating', content='', reasoning='', error=NULL, error_kind=NULL, finish_reason=NULL,
+              latency_ms=NULL, first_token_ms=NULL, prompt_tokens=NULL, completion_tokens=NULL, cost=NULL,
+              attempts=attempts+1, context_snapshot=?, finished_at=NULL WHERE id=?`).run(JSON.stringify(messages), resp.id);
+
+  res.writeHead(200, { 'Content-Type': 'application/x-ndjson', 'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no' });
+  const emit = (obj) => { if (!res.writableEnded && !res.destroyed) res.write(JSON.stringify(obj) + '\n'); };
+  // If the browser tab goes away, stop paying for tokens nobody will see.
+  res.on('close', () => { if (!res.writableEnded) ctl.abort('user'); });
+  emit({ type: 'start', response: getResponseRow(resp.id) });
+
+  let content = '', reasoning = '', lastFlush = now();
+  const flush = (force) => {
+    if (force || now() - lastFlush > 1500) {
+      db.prepare('UPDATE responses SET content=?, reasoning=? WHERE id=?').run(content, reasoning, resp.id);
+      lastFlush = now();
+    }
+  };
+
+  try {
+    let stats;
+    // Free models are often rate-limited upstream for a few seconds. Retry the SAME model
+    // with backoff (never a different one: that would invalidate the comparison).
+    for (let attempt = 0; ; attempt++) {
+      try {
+        stats = await streamCompletion({
+          apiKey: API_KEY, model: resp.model_id, messages, maxTokens: maxOut, signal: ctl.signal,
+          onDelta: (t) => { content += t; emit({ type: 'delta', content: t }); flush(); },
+          onReasoning: (t) => { reasoning += t; emit({ type: 'reasoning', content: t }); flush(); },
+        });
+        break;
+      } catch (e) {
+        const retryable = e instanceof ModelError && e.kind === 'rate_limit' && !content && !reasoning && attempt < RATE_LIMIT_RETRIES;
+        if (!retryable) throw e;
+        emit({ type: 'retrying', attempt: attempt + 1, of: RATE_LIMIT_RETRIES, message: 'Rate limited upstream, retrying' });
+        await new Promise((ok) => {
+          const t = setTimeout(ok, 2500 * (attempt + 1));
+          ctl.signal.addEventListener('abort', () => { clearTimeout(t); ok(); }, { once: true });
+        });
+        if (ctl.signal.aborted) throw new ModelError('stopped', 'Stopped by user');
+      }
+    }
+    const u = stats.usage || {};
+    let status = 'completed', error = null, kind = null;
+    if (!content.trim()) {
+      status = 'failed'; kind = 'empty';
+      error = stats.finish_reason === 'length'
+        ? 'The model used its whole output budget on reasoning. Raise "max output tokens" in settings and retry.'
+        : 'The model returned an empty response.';
+    } else if (stats.finish_reason === 'content_filter') {
+      kind = 'safety'; error = 'The provider filtered part of this response.';
+    } else if (stats.finish_reason === 'length') {
+      kind = 'truncated'; error = 'Hit the max output length. The answer may be cut off.';
+    }
+    db.prepare(`UPDATE responses SET content=?, reasoning=?, status=?, error=?, error_kind=?, finish_reason=?, latency_ms=?, first_token_ms=?,
+                prompt_tokens=?, completion_tokens=?, cost=?, served_model=?, provider=?, finished_at=? WHERE id=?`)
+      .run(content, reasoning, status, error, kind, stats.finish_reason, stats.latency_ms, stats.first_token_ms,
+        u.prompt_tokens ?? null, u.completion_tokens ?? null, u.cost ?? null, stats.served_model, stats.provider, now(), resp.id);
+  } catch (e) {
+    const me = e instanceof ModelError ? e : new ModelError('unknown', e.message);
+    const status = me.kind === 'stopped' ? 'stopped' : me.status;
+    db.prepare(`UPDATE responses SET content=?, reasoning=?, status=?, error=?, error_kind=?, finished_at=? WHERE id=?`)
+      .run(content, reasoning, status, me.kind === 'stopped' ? null : me.message, me.kind, now(), resp.id);
+  } finally {
+    running.delete(resp.id);
+    touch(resp.conversation_id);
+  }
+  emit({ type: 'final', response: getResponseRow(resp.id) });
+  res.end();
+}
+
+// ---------- routes ----------
+const routes = [];
+const route = (method, pattern, handler, { auth = true } = {}) => {
+  const keys = [];
+  const re = new RegExp('^' + pattern.replace(/:(\w+)/g, (_, k) => { keys.push(k); return '([^/]+)'; }) + '$');
+  routes.push({ method, re, keys, handler, auth });
+};
+
+route('POST', '/api/signup', async (req, res) => {
+  const { name, email, password } = await readJson(req);
+  const em = String(email || '').trim().toLowerCase();
+  if (!name?.trim() || !/^\S+@\S+\.\S+$/.test(em)) throw new HttpError(400, 'Name and a valid email are required');
+  if (String(password || '').length < 8) throw new HttpError(400, 'Password must be at least 8 characters');
+  if (db.prepare('SELECT 1 FROM users WHERE email=?').get(em)) throw new HttpError(409, 'An account with that email already exists');
+  const id = uid();
+  db.prepare('INSERT INTO users (id, name, email, password_hash, preferences, created_at) VALUES (?,?,?,?,?,?)')
+    .run(id, name.trim(), em, hashPassword(password), JSON.stringify(DEFAULT_PREFS), now());
+  const token = createSession(db, id);
+  send(res, 201, publicUser(db.prepare('SELECT * FROM users WHERE id=?').get(id)), { 'Set-Cookie': sessionCookie(token) });
+}, { auth: false });
+
+route('POST', '/api/login', async (req, res) => {
+  const { email, password } = await readJson(req);
+  const u = db.prepare('SELECT * FROM users WHERE email=?').get(String(email || '').trim().toLowerCase());
+  if (!u || !verifyPassword(String(password || ''), u.password_hash)) throw new HttpError(401, 'Wrong email or password');
+  send(res, 200, publicUser(u), { 'Set-Cookie': sessionCookie(createSession(db, u.id)) });
+}, { auth: false });
+
+route('POST', '/api/logout', async (req, res) => {
+  destroySession(db, parseCookies(req.headers.cookie).sid);
+  send(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie('', 0) });
+}, { auth: false });
+
+route('GET', '/api/me', async (req, res, { user }) => send(res, 200, publicUser(user)));
+
+route('PATCH', '/api/me', async (req, res, { user }) => {
+  const body = await readJson(req);
+  const prefs = prefsOf(user);
+  if (body.max_output_tokens !== undefined) prefs.max_output_tokens = Math.max(256, Math.min(32_000, Number(body.max_output_tokens) || 8192));
+  if (body.free_only !== undefined) prefs.free_only = !!body.free_only;
+  db.prepare('UPDATE users SET preferences=? WHERE id=?').run(JSON.stringify(prefs), user.id);
+  send(res, 200, publicUser(db.prepare('SELECT * FROM users WHERE id=?').get(user.id)));
+});
+
+route('DELETE', '/api/me', async (req, res, { user }) => {
+  db.prepare('DELETE FROM users WHERE id=?').run(user.id); // cascades to all of the user's data
+  send(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie('', 0) });
+});
+
+route('GET', '/api/models', async (req, res) => {
+  try { send(res, 200, { models: await getCatalog(), max_models: MAX_MODELS }); }
+  catch (e) { throw new HttpError(502, `Could not load the model catalog: ${e.message}`); }
+});
+
+route('GET', '/api/conversations', async (req, res, { user }) => {
+  send(res, 200, db.prepare(`SELECT c.id, c.title, c.created_at, c.updated_at,
+    (SELECT COUNT(*) FROM turns t WHERE t.conversation_id=c.id) AS turns
+    FROM conversations c WHERE c.user_id=? ORDER BY c.updated_at DESC`).all(user.id));
+});
+
+route('POST', '/api/conversations', async (req, res, { user }) => {
+  const { models = [], title } = await readJson(req);
+  const ids = [...new Set(models.map(String))];
+  if (!ids.length) throw new HttpError(400, 'Pick at least one model');
+  if (ids.length > MAX_MODELS) throw new HttpError(400, `Pick at most ${MAX_MODELS} models`);
+  for (const m of ids) if (!(await getModel(m))) throw new HttpError(400, `Unknown model: ${m}`);
+  const id = uid(), t = now();
+  tx(db, () => {
+    db.prepare('INSERT INTO conversations (id, user_id, title, created_at, updated_at) VALUES (?,?,?,?,?)')
+      .run(id, user.id, String(title || 'New conversation').slice(0, 120), t, t);
+    ids.forEach((m, i) => db.prepare('INSERT INTO conversation_models (conversation_id, model_id, status, position, added_at) VALUES (?,?,?,?,?)')
+      .run(id, m, 'active', i, t));
+  });
+  send(res, 201, conversationPayload(ownConversation(user, id)));
+});
+
+route('GET', '/api/conversations/:id', async (req, res, { user, params }) => send(res, 200, conversationPayload(ownConversation(user, params.id))));
+
+route('PATCH', '/api/conversations/:id', async (req, res, { user, params }) => {
+  const c = ownConversation(user, params.id);
+  const { title } = await readJson(req);
+  if (title?.trim()) db.prepare('UPDATE conversations SET title=? WHERE id=?').run(title.trim().slice(0, 120), c.id);
+  send(res, 200, conversationPayload(ownConversation(user, c.id)));
+});
+
+route('DELETE', '/api/conversations/:id', async (req, res, { user, params }) => {
+  const c = ownConversation(user, params.id);
+  for (const r of db.prepare('SELECT id FROM responses WHERE conversation_id=?').all(c.id)) running.get(r.id)?.abort('user');
+  db.prepare('DELETE FROM conversations WHERE id=?').run(c.id);
+  send(res, 200, { ok: true });
+});
+
+route('POST', '/api/conversations/:id/models', async (req, res, { user, params }) => {
+  const c = ownConversation(user, params.id);
+  const { model_id } = await readJson(req);
+  if (!(await getModel(model_id))) throw new HttpError(400, 'Unknown model');
+  const rows = db.prepare('SELECT * FROM conversation_models WHERE conversation_id=?').all(c.id);
+  if (rows.filter((r) => r.status === 'active' && r.model_id !== model_id).length >= MAX_MODELS)
+    throw new HttpError(400, `At most ${MAX_MODELS} active models. Pause or remove one first.`);
+  const existing = rows.find((r) => r.model_id === model_id);
+  if (existing) db.prepare(`UPDATE conversation_models SET status='active', removed_at=NULL WHERE conversation_id=? AND model_id=?`).run(c.id, model_id);
+  else db.prepare('INSERT INTO conversation_models (conversation_id, model_id, status, position, added_at) VALUES (?,?,?,?,?)')
+    .run(c.id, model_id, 'active', rows.length, now());
+  touch(c.id);
+  send(res, 200, conversationPayload(c));
+});
+
+route('PATCH', '/api/conversations/:id/models/:model', async (req, res, { user, params }) => {
+  const c = ownConversation(user, params.id);
+  const { status } = await readJson(req);
+  if (!['active', 'paused'].includes(status)) throw new HttpError(400, 'status must be active or paused');
+  const rows = db.prepare('SELECT * FROM conversation_models WHERE conversation_id=?').all(c.id);
+  const row = rows.find((r) => r.model_id === params.model);
+  if (!row) throw new HttpError(404, 'Model not in conversation');
+  if (status === 'active' && row.status !== 'active' && rows.filter((r) => r.status === 'active').length >= MAX_MODELS)
+    throw new HttpError(400, `At most ${MAX_MODELS} active models. Pause or remove one first.`);
+  db.prepare('UPDATE conversation_models SET status=?, removed_at=NULL WHERE conversation_id=? AND model_id=?').run(status, c.id, params.model);
+  send(res, 200, conversationPayload(c));
+});
+
+route('DELETE', '/api/conversations/:id/models/:model', async (req, res, { user, params }) => {
+  const c = ownConversation(user, params.id);
+  db.prepare(`UPDATE conversation_models SET status='removed', removed_at=? WHERE conversation_id=? AND model_id=?`).run(now(), c.id, params.model);
+  send(res, 200, conversationPayload(c)); // history stays visible
+});
+
+route('POST', '/api/conversations/:id/estimate', async (req, res, { user, params }) => {
+  const c = ownConversation(user, params.id);
+  const { message = '', target } = await readJson(req);
+  const { targets } = resolveTargets(c.id, target);
+  const draft = { conversation_id: c.id, created_at: now() + 1, user_message: String(message) };
+  const pins = pinsFor(c.id, null);
+  const out = [];
+  for (const t of targets) {
+    const model = await getModel(t.model_id);
+    const maxOut = maxOutFor(user, model);
+    const { promptTokensEst, droppedTurns } = buildContext(db, draft, t.model_id, model, maxOut, pins);
+    const min = model ? promptTokensEst * model.prompt_price : null;
+    const max = model ? min + maxOut * model.completion_price : null;
+    out.push({ model_id: t.model_id, prompt_tokens: promptTokensEst, max_output: maxOut, free: !!model?.free, cost_min: min, cost_max: max, dropped_turns: droppedTurns });
+  }
+  send(res, 200, {
+    models: out,
+    cost_min: out.reduce((s, m) => s + (m.cost_min || 0), 0),
+    cost_max: out.reduce((s, m) => s + (m.cost_max || 0), 0),
+  });
+});
+
+route('POST', '/api/conversations/:id/messages', async (req, res, { user, params }) => {
+  const c = ownConversation(user, params.id);
+  const { message, target } = await readJson(req);
+  const text = String(message || '').trim();
+  if (!text) throw new HttpError(400, 'Message is empty');
+  const { mode, targets } = resolveTargets(c.id, target);
+  const turnId = uid(), t = now();
+  tx(db, () => {
+    db.prepare('INSERT INTO turns (id, conversation_id, user_message, mode, target_models, created_at) VALUES (?,?,?,?,?,?)')
+      .run(turnId, c.id, text, mode, JSON.stringify(targets.map((x) => x.model_id)), t);
+    // "Continue with this" pins apply to exactly this next turn.
+    db.prepare(`UPDATE context_selections SET consumed_turn_id=? WHERE conversation_id=? AND selection_type='continue'
+                AND active=1 AND consumed_turn_id IS NULL`).run(turnId, c.id);
+    targets.forEach((m) => db.prepare(`INSERT INTO responses (id, turn_id, conversation_id, model_id, display_position, status, created_at)
+      VALUES (?,?,?,?,?, 'pending', ?)`).run(uid(), turnId, c.id, m.model_id, m.position, t));
+    if (c.title === 'New conversation') db.prepare('UPDATE conversations SET title=? WHERE id=?').run(text.replace(/\s+/g, ' ').slice(0, 60), c.id);
+    db.prepare('UPDATE conversations SET updated_at=? WHERE id=?').run(t, c.id);
+  });
+  send(res, 201, conversationPayload(ownConversation(user, c.id)));
+});
+
+route('POST', '/api/responses/:id/run', async (req, res, { user, params }) => {
+  const r = ownResponse(user, params.id);
+  if (r.status === 'completed') throw new HttpError(400, 'Response already completed');
+  await runResponse(user, r, req, res);
+});
+
+route('POST', '/api/responses/:id/stop', async (req, res, { user, params }) => {
+  const r = ownResponse(user, params.id);
+  running.get(r.id)?.abort('user');
+  send(res, 200, { ok: true });
+});
+
+route('GET', '/api/responses/:id/context', async (req, res, { user, params }) => {
+  const r = ownResponse(user, params.id);
+  const row = db.prepare('SELECT context_snapshot FROM responses WHERE id=?').get(r.id);
+  send(res, 200, { messages: row.context_snapshot ? JSON.parse(row.context_snapshot) : null });
+});
+
+route('POST', '/api/responses/:id/use', async (req, res, { user, params }) => {
+  const r = ownResponse(user, params.id);
+  if (!r.content.trim()) throw new HttpError(400, 'Nothing to use yet');
+  const { selected_text } = await readJson(req);
+  const text = String(selected_text || '').trim() || r.content;
+  db.prepare(`INSERT INTO context_selections (id, conversation_id, response_id, selected_text, selection_type, created_at)
+              VALUES (?,?,?,?,'canonical',?)`).run(uid(), r.conversation_id, r.id, text, now());
+  logPreference(user, r, 'use_as_context');
+  send(res, 200, conversationPayload(ownConversation(user, r.conversation_id)));
+});
+
+route('POST', '/api/responses/:id/continue', async (req, res, { user, params }) => {
+  const r = ownResponse(user, params.id);
+  if (!r.content.trim()) throw new HttpError(400, 'Nothing to continue from yet');
+  tx(db, () => {
+    db.prepare(`UPDATE context_selections SET active=0 WHERE conversation_id=? AND selection_type='continue' AND consumed_turn_id IS NULL`).run(r.conversation_id);
+    db.prepare(`INSERT INTO context_selections (id, conversation_id, response_id, selected_text, selection_type, created_at)
+                VALUES (?,?,?,?,'continue',?)`).run(uid(), r.conversation_id, r.id, r.content, now());
+  });
+  logPreference(user, r, 'continue');
+  send(res, 200, conversationPayload(ownConversation(user, r.conversation_id)));
+});
+
+for (const flag of ['save', 'final']) {
+  route('POST', `/api/responses/:id/${flag}`, async (req, res, { user, params }) => {
+    const r = ownResponse(user, params.id);
+    const col = flag === 'save' ? 'saved' : 'final';
+    const value = r[col] ? 0 : 1;
+    db.prepare(`UPDATE responses SET ${col}=? WHERE id=?`).run(value, r.id);
+    if (value) logPreference(user, r, flag);
+    send(res, 200, getResponseRow(r.id));
+  });
+}
+
+route('DELETE', '/api/selections/:id', async (req, res, { user, params }) => {
+  const s = db.prepare(`SELECT s.* FROM context_selections s JOIN conversations c ON c.id=s.conversation_id WHERE s.id=? AND c.user_id=?`)
+    .get(params.id, user.id);
+  if (!s) throw new HttpError(404, 'Selection not found');
+  db.prepare('UPDATE context_selections SET active=0 WHERE id=?').run(s.id);
+  send(res, 200, conversationPayload(ownConversation(user, s.conversation_id)));
+});
+
+// ---------- static ----------
+const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml' };
+async function serveStatic(req, res, pathname) {
+  const file = pathname === '/' ? 'index.html' : pathname.slice(1);
+  if (file.includes('..')) return send(res, 400, { error: 'Bad path' });
+  try {
+    const buf = await readFile(path.join(ROOT, 'public', file));
+    res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-cache' });
+    res.end(buf);
+  } catch {
+    // SPA fallback
+    const buf = await readFile(path.join(ROOT, 'public', 'index.html'));
+    res.writeHead(200, { 'Content-Type': MIME['.html'] }); res.end(buf);
+  }
+}
+
+export const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, 'http://localhost');
+  try {
+    if (!url.pathname.startsWith('/api/')) return await serveStatic(req, res, url.pathname);
+    // Basic CSRF guard for a cookie-authenticated JSON API.
+    if (req.method !== 'GET' && req.headers.origin && new URL(req.headers.origin).host !== req.headers.host)
+      throw new HttpError(403, 'Cross-origin request blocked');
+    for (const r of routes) {
+      if (r.method !== req.method) continue;
+      const m = url.pathname.match(r.re);
+      if (!m) continue;
+      const params = Object.fromEntries(r.keys.map((k, i) => [k, decodeURIComponent(m[i + 1])]));
+      const user = userFromRequest(db, req);
+      if (r.auth && !user) throw new HttpError(401, 'Please sign in');
+      return await r.handler(req, res, { user, params });
+    }
+    throw new HttpError(404, 'Not found');
+  } catch (e) {
+    if (!(e instanceof HttpError)) console.error(e);
+    if (!res.headersSent) send(res, e.status || 500, { error: e.status ? e.message : 'Internal error' });
+    else res.end();
+  }
+});
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  server.listen(PORT, HOST, () => console.log(`Multi-model workspace running at http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}`));
+}
+export { db };
