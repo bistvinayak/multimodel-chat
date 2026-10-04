@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { openDb, tx } from './lib/db.js';
 import { hashPassword, verifyPassword, createSession, destroySession, userFromRequest, parseCookies, sessionCookie } from './lib/auth.js';
 import { getCatalog, getModel } from './lib/models.js';
+import { healthOf, recordOk, recordLimited, recordBlocked } from './lib/health.js';
 import { buildContext } from './lib/context.js';
 import { streamCompletion, ModelError } from './lib/openrouter.js';
 
@@ -15,7 +16,9 @@ try { process.loadEnvFile(path.join(ROOT, '.env')); } catch {}
 const PORT = Number(process.env.PORT || 3210);
 const HOST = process.env.HOST || '127.0.0.1';
 const MAX_MODELS = Number(process.env.MAX_MODELS || 3);
-const RATE_LIMIT_RETRIES = Number(process.env.RATE_LIMIT_RETRIES ?? 2);
+const RATE_LIMIT_RETRIES = Number(process.env.RATE_LIMIT_RETRIES ?? 4);
+// Exponential backoff with jitter: about 3s, 6s, 11s, 18s (~40s total) before giving up.
+const backoffMs = (attempt) => Math.round([3000, 6000, 11000, 18000][Math.min(attempt, 3)] * (0.85 + Math.random() * 0.3));
 const API_KEY = process.env.OPENROUTER_API_KEY;
 if (!API_KEY) console.warn('WARNING: OPENROUTER_API_KEY is not set. Model calls will fail.');
 
@@ -141,6 +144,7 @@ async function runResponse(user, resp, req, res) {
   emit({ type: 'start', response: getResponseRow(resp.id) });
 
   let content = '', reasoning = '', lastFlush = now();
+  const started = now();
   const flush = (force) => {
     if (force || now() - lastFlush > 1500) {
       db.prepare('UPDATE responses SET content=?, reasoning=? WHERE id=?').run(content, reasoning, resp.id);
@@ -161,17 +165,21 @@ async function runResponse(user, resp, req, res) {
         });
         break;
       } catch (e) {
-        const retryable = e instanceof ModelError && e.kind === 'rate_limit' && !content && !reasoning && attempt < RATE_LIMIT_RETRIES;
-        if (!retryable) throw e;
-        emit({ type: 'retrying', attempt: attempt + 1, of: RATE_LIMIT_RETRIES, message: 'Rate limited upstream, retrying' });
+        if (e instanceof ModelError && e.kind === 'rate_limit') recordLimited(resp.model_id);
+        const retryable = e instanceof ModelError && e.kind === 'rate_limit' && !content && !reasoning && attempt < RATE_LIMIT_RETRIES
+          && !(e.retryAfterMs > 60_000);
+        if (!retryable) { e.attempts = attempt + 1; throw e; }
+        const wait = e.retryAfterMs ?? backoffMs(attempt);
+        emit({ type: 'retrying', attempt: attempt + 1, of: RATE_LIMIT_RETRIES, wait_ms: wait });
         await new Promise((ok) => {
-          const t = setTimeout(ok, 2500 * (attempt + 1));
+          const t = setTimeout(ok, wait);
           ctl.signal.addEventListener('abort', () => { clearTimeout(t); ok(); }, { once: true });
         });
         if (ctl.signal.aborted) throw new ModelError('stopped', 'Stopped by user');
       }
     }
     const u = stats.usage || {};
+    if (content.trim()) recordOk(resp.model_id);
     let status = 'completed', error = null, kind = null;
     if (!content.trim()) {
       status = 'failed'; kind = 'empty';
@@ -190,6 +198,12 @@ async function runResponse(user, resp, req, res) {
   } catch (e) {
     const me = e instanceof ModelError ? e : new ModelError('unknown', e.message);
     const status = me.kind === 'stopped' ? 'stopped' : me.status;
+    if (['forbidden', 'invalid_model', 'insufficient_credits'].includes(me.kind)) recordBlocked(resp.model_id);
+    if (me.kind === 'rate_limit') {
+      me.message = me.retryAfterMs > 60_000
+        ? `Rate limited upstream. The provider says capacity returns in about ${Math.ceil(me.retryAfterMs / 60_000)} min. Raw: ${me.message}`
+        : `Still rate limited after ${me.attempts || 1} attempts over about ${Math.round((Date.now() - started) / 1000)}s. Raw: ${me.message}`;
+    }
     db.prepare(`UPDATE responses SET content=?, reasoning=?, status=?, error=?, error_kind=?, finished_at=? WHERE id=?`)
       .run(content, reasoning, status, me.kind === 'stopped' ? null : me.message, me.kind, now(), resp.id);
   } finally {
@@ -250,7 +264,7 @@ route('DELETE', '/api/me', async (req, res, { user }) => {
 });
 
 route('GET', '/api/models', async (req, res) => {
-  try { send(res, 200, { models: await getCatalog(), max_models: MAX_MODELS }); }
+  try { send(res, 200, { models: (await getCatalog()).map((m) => ({ ...m, health: healthOf(m.id) })), max_models: MAX_MODELS }); }
   catch (e) { throw new HttpError(502, `Could not load the model catalog: ${e.message}`); }
 });
 
@@ -373,6 +387,63 @@ route('POST', '/api/responses/:id/run', async (req, res, { user, params }) => {
   const r = ownResponse(user, params.id);
   if (r.status === 'completed') throw new HttpError(400, 'Response already completed');
   await runResponse(user, r, req, res);
+});
+
+// Suggest healthy models to swap in for a busy/failed lane. Never applied automatically:
+// silently swapping a model would invalidate the comparison.
+const NOT_CHAT = /(safety|guard|moderation|embed|rerank)/i;
+route('GET', '/api/responses/:id/alternatives', async (req, res, { user, params }) => {
+  const r = ownResponse(user, params.id);
+  const inConv = new Set(db.prepare(`SELECT model_id FROM conversation_models WHERE conversation_id=? AND status<>'removed'`)
+    .all(r.conversation_id).map((x) => x.model_id));
+  const cur = await getModel(r.model_id);
+  const wantTags = new Set((cur?.tags || []).filter((t) => t !== 'free'));
+  const vendor = (id) => id.split('/')[0];
+  const score = (m) => ({ ok: 4, unknown: 1 }[healthOf(m.id)] || 0)
+    + m.tags.filter((t) => wantTags.has(t)).length
+    + (m.context_length >= (cur?.context_length || 0) ? 1 : 0)
+    + (m.id.endsWith(':free') ? 1 : 0)                                    // zero-priced non-:free endpoints can still demand credits
+    - (r.error_kind === 'rate_limit' && vendor(m.id) === vendor(r.model_id) ? 3 : 0); // same vendor likely shares the exhausted pool
+  const alts = (await getCatalog())
+    .filter((m) => !inConv.has(m.id) && !NOT_CHAT.test(m.id))
+    .filter((m) => (cur && !cur.free) || m.free)          // a free lane only suggests free models
+    .filter((m) => !['busy', 'blocked'].includes(healthOf(m.id)))
+    .sort((a, b) => score(b) - score(a) || b.created - a.created)
+    .slice(0, 3)
+    .map((m) => ({ id: m.id, name: m.name, free: m.free, health: healthOf(m.id) }));
+  send(res, 200, { alternatives: alts });
+});
+
+route('POST', '/api/responses/:id/replace', async (req, res, { user, params }) => {
+  const r = ownResponse(user, params.id);
+  if (running.has(r.id)) throw new HttpError(409, 'Stop this response first');
+  const { model_id } = await readJson(req);
+  if (!(await getModel(model_id))) throw new HttpError(400, 'Unknown model');
+  if (model_id === r.model_id) throw new HttpError(400, 'Pick a different model');
+  let newId;
+  tx(db, () => {
+    const rows = db.prepare('SELECT * FROM conversation_models WHERE conversation_id=?').all(r.conversation_id);
+    // Pause (not remove) the busy model so it can be resumed later with its history.
+    db.prepare(`UPDATE conversation_models SET status='paused' WHERE conversation_id=? AND model_id=? AND status='active'`).run(r.conversation_id, r.model_id);
+    const existing = rows.find((x) => x.model_id === model_id);
+    const activeAfter = rows.filter((x) => x.status === 'active' && x.model_id !== r.model_id && x.model_id !== model_id).length + 1;
+    if (activeAfter > MAX_MODELS) throw new HttpError(400, `At most ${MAX_MODELS} active models`);
+    if (existing) db.prepare(`UPDATE conversation_models SET status='active', removed_at=NULL WHERE conversation_id=? AND model_id=?`).run(r.conversation_id, model_id);
+    else db.prepare('INSERT INTO conversation_models (conversation_id, model_id, status, position, added_at) VALUES (?,?,?,?,?)')
+      .run(r.conversation_id, model_id, 'active', rows.length, now());
+    const pos = db.prepare('SELECT position FROM conversation_models WHERE conversation_id=? AND model_id=?').get(r.conversation_id, model_id).position;
+    const already = db.prepare('SELECT id, status FROM responses WHERE turn_id=? AND model_id=?').get(r.turn_id, model_id);
+    if (already) {
+      newId = already.id;
+      if (already.status !== 'completed') db.prepare(`UPDATE responses SET status='pending' WHERE id=?`).run(newId);
+    } else {
+      newId = uid();
+      db.prepare(`INSERT INTO responses (id, turn_id, conversation_id, model_id, display_position, status, created_at) VALUES (?,?,?,?,?,'pending',?)`)
+        .run(newId, r.turn_id, r.conversation_id, model_id, pos, now());
+    }
+  });
+  touch(r.conversation_id);
+  send(res, 200, { ...conversationPayload(ownConversation(user, r.conversation_id)), new_response_id: newId });
 });
 
 route('POST', '/api/responses/:id/stop', async (req, res, { user, params }) => {

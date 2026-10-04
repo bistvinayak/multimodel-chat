@@ -138,7 +138,8 @@ a { color: var(--accent); }
 .cursor::after { content: "▍"; animation: blink 1s steps(2) infinite; color: var(--accent); }
 @keyframes blink { 50% { opacity: 0; } }
 .err-box { margin: 10px 14px; padding: 8px 10px; border-radius: 8px; font-size: 13px; background: color-mix(in srgb, var(--err) 10%, transparent); color: var(--err); }
-.err-box.warn { background: color-mix(in srgb, var(--warn) 12%, transparent); color: var(--warn); }
+.err-box.warn { background: color-mix(in srgb, var(--warn) 10%, transparent); color: var(--text); }
+.err-box.warn .err-title { color: var(--warn); }
 .card-meta { padding: 0 14px 6px; font-size: 12px; color: var(--muted); display: flex; gap: 10px; flex-wrap: wrap; }
 .card-actions { display: flex; flex-wrap: wrap; gap: 4px; padding: 8px 10px; border-top: 1px solid var(--border); }
 .empty-thread { max-width: 520px; margin: 60px auto; text-align: center; color: var(--muted); }
@@ -193,3 +194,17 @@ a { color: var(--accent); }
   .main { position: relative; }
   .model-row .price { grid-column: 2; text-align: left; }
 }
+
+/* rate limits & recovery */
+.tag.busy { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); font-weight: 600; }
+.tag.ok { background: color-mix(in srgb, var(--ok) 16%, transparent); color: var(--ok); }
+.err-box { display: grid; gap: 6px; }
+.err-title { font-weight: 600; }
+.err-box .alts { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 2px; color: var(--text); }
+.err-box .alts .btn { color: var(--text); }
+.err-box details.tech { font-size: 12px; opacity: .85; }
+.err-box details.tech summary { cursor: pointer; }
+.err-box details.tech div { margin-top: 4px; overflow-wrap: anywhere; color: var(--muted); }
+.retrying { display: grid; gap: 4px; font-size: 14px; }
+.retry-bar { height: 3px; background: var(--panel-2); border-radius: 2px; overflow: hidden; }
+.retry-bar i { display: block; height: 100%; background: var(--warn); }

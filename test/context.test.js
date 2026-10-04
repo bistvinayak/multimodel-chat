@@ -61,3 +61,25 @@ test('error classification', () => {
   assert.equal(classifyError(400, { error: { message: "This endpoint's maximum context length is 8192" } }).kind, 'context_limit');
   assert.equal(classifyError(503, 'down').kind, 'provider_unavailable');
 });
+
+import { retryAfterMs } from '../lib/openrouter.js';
+import { healthOf, recordOk, recordLimited, recordBlocked, _reset } from '../lib/health.js';
+
+test('retry-after parsing', () => {
+  const h = (o) => ({ get: (k) => o[k] ?? null });
+  assert.equal(retryAfterMs(h({ 'retry-after': '7' })), 7000);
+  assert.equal(retryAfterMs(h({ 'x-ratelimit-reset': String(1_000_000 + 5000) }), null, 1_000_000), null); // too small to be epoch
+  assert.equal(retryAfterMs(h({ 'x-ratelimit-reset': String(2e12 + 4000) }), null, 2e12), 4000);
+  assert.equal(retryAfterMs(h({})), null);
+  assert.equal(retryAfterMs(null, { error: { metadata: { headers: { 'X-RateLimit-Reset': String(2e12 + 9000) } } } }, 2e12), 9000);
+});
+
+test('model health: busy after a 429, ok after a success, blocked after a 403', () => {
+  _reset();
+  assert.equal(healthOf('m'), 'unknown');
+  recordLimited('m'); assert.equal(healthOf('m'), 'busy');
+  recordOk('m'); assert.equal(healthOf('m'), 'ok');
+  recordLimited('m'); assert.equal(healthOf('m'), 'busy');
+  assert.equal(healthOf('m', Date.now() + 4 * 60_000), 'unknown'); // busy expires
+  recordBlocked('x'); assert.equal(healthOf('x'), 'blocked');
+});

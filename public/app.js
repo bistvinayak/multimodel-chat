@@ -14,13 +14,14 @@ const S = {
   expanded: new Set(),
   target: 'all',
   filters: { q: '', free: true, fast: false, reasoning: false, coding: false, popular: false },
-  lastSel: null,                 // { id, text } highlighted inside a card
+  lastSel: null,
+  alts: new Map(),               // response id -> alternatives array | 'loading'                 // { id, text } highlighted inside a card
   navOpen: false,
 };
 
 const STATUS_LABEL = { pending: 'Not started', generating: 'Generating', completed: 'Completed', failed: 'Failed', rate_limited: 'Rate limited', stopped: 'Stopped' };
 const ERROR_HINT = {
-  rate_limit: 'The provider is rate-limiting this model. Free models share capacity, so retry in a moment or pick another model.',
+  rate_limit: 'Free models share capacity with everyone on OpenRouter, and this one has run out for the moment. Retry in a minute, or swap in a model that is responding now.',
   insufficient_credits: 'Your OpenRouter account has no credits for this paid model. Add credits or use a free model.',
   context_limit: 'The conversation is too long for this model\'s context window.',
   invalid_model: 'This model is unavailable or no longer exists.',
@@ -189,7 +190,7 @@ function mountPicker(el, opts) {
       const on = sel.includes(m.id), dis = !on && full;
       return `<label class="model-row ${dis ? 'disabled' : ''}" data-id="${esc(m.id)}">
         <input type="checkbox" ${on ? 'checked' : ''} ${dis ? 'disabled' : ''}>
-        <div><div class="model-name">${esc(m.name)}</div><div class="model-id">${esc(m.id)}</div>
+        <div><div class="model-name">${esc(m.name)}${m.health === 'busy' ? ' <span class="tag busy">busy now</span>' : m.health === 'blocked' ? ' <span class="tag busy">unavailable</span>' : m.health === 'ok' ? ' <span class="tag ok">responding</span>' : ''}</div><div class="model-id">${esc(m.id)}</div>
           <div>${m.tags.filter((t) => t !== 'free').map((t) => `<span class="tag">${t}</span>`).join('')}${m.context_length ? `<span class="tag">${fmtTokens(m.context_length)} context</span>` : ''}</div>
           <div class="model-desc">${esc(m.description)}</div></div>
         <div class="price">${priceLabel(m)}</div></label>`;
@@ -387,8 +388,8 @@ function cardHTML(r, tabActive) {
   const live = r.status === 'generating';
   const has = !!r.content.trim();
   const long = r.content.length > 2500 && !S.expanded.has(r.id) && !live;
-  const isErr = ['failed', 'rate_limited'].includes(r.status);
-  const errText = r.error ? `${ERROR_HINT[r.error_kind] ? `${ERROR_HINT[r.error_kind]}<br>` : ''}<span class="small">${esc(r.error)}</span>` : '';
+  const isErr = r.status === 'failed' && r.error_kind !== 'rate_limit';
+  const errText = r.error ? errorHTML(r) : '';
   const meta = [];
   if (r.latency_ms) meta.push(`${(r.latency_ms / 1000).toFixed(1)}s`);
   if (r.first_token_ms) meta.push(`first token ${(r.first_token_ms / 1000).toFixed(1)}s`);
@@ -396,7 +397,7 @@ function cardHTML(r, tabActive) {
   if (r.cost != null) meta.push(fmtCost(r.cost));
   if (r.provider) meta.push(`via ${esc(r.provider)}`);
   if (r.attempts > 1) meta.push(`attempt ${r.attempts}`);
-  const body = has ? md(r.content) : live ? `<span class="muted">${r.retrying || (r.reasoning ? 'Thinking…' : 'Waiting for the first token…')}</span>`
+  const body = has ? md(r.content) : live ? (r.retrying ? retryingHTML(r) : `<span class="muted">${r.reasoning ? 'Thinking…' : 'Waiting for the first token…'}</span>`)
     : r.status === 'pending' ? '<span class="muted">Not started yet.</span>' : '';
   return `<article class="card ${r.final ? 'is-final' : ''} ${tabActive ? 'tab-active' : ''}" id="card-${r.id}" data-id="${r.id}" style="--lane:${laneColor(r.model_id)}">
     <div class="card-head"><span class="dot" style="background:${laneColor(r.model_id)}"></span>
@@ -406,7 +407,7 @@ function cardHTML(r, tabActive) {
     ${r.reasoning ? `<details class="thinking" ${live && !has ? 'open' : ''}><summary>Reasoning (${fmtTokens(Math.ceil(r.reasoning.length / 4))} tokens)</summary><pre>${esc(r.reasoning.slice(-20000))}</pre></details>` : ''}
     ${body ? `<div class="card-body md ${live ? 'cursor' : ''} ${long ? 'collapsed' : ''}">${body}</div>` : ''}
     ${long ? `<button class="btn small ghost expand" data-act="expand" data-id="${r.id}">Show full answer</button>` : ''}
-    ${errText ? `<div class="err-box ${isErr ? '' : 'warn'}">⚠ ${errText}</div>` : ''}
+    ${errText ? `<div class="err-box ${isErr ? '' : 'warn'}">${errText}</div>` : ''}
     ${meta.length ? `<div class="card-meta">${meta.join('<span>·</span>')}</div>` : ''}
     <div class="card-actions">
       ${live ? `<button class="btn small" data-act="stop" data-id="${r.id}">■ Stop</button>` : ''}
@@ -421,6 +422,53 @@ function cardHTML(r, tabActive) {
       ${r.attempts ? `<button class="btn small ghost" data-act="context" data-id="${r.id}" title="See exactly what was sent to this model">Context sent</button>` : ''}
     </div></article>`;
 }
+
+
+const SWAPPABLE = new Set(['rate_limit', 'forbidden', 'invalid_model', 'insufficient_credits', 'provider_unavailable', 'timeout', 'empty']);
+function retryingHTML(r) {
+  const secs = Math.max(0, Math.ceil((r.retrying.until - Date.now()) / 1000));
+  return `<div class="retrying"><b>${esc(shortName(r.model_id))} is busy upstream.</b>
+    <span class="muted">${secs ? `Retrying in ${secs}s` : 'Retrying now'} · attempt ${r.retrying.attempt + 1} of ${r.retrying.of + 1}</span>
+    <div class="retry-bar"><i style="width:${Math.max(0, Math.min(100, ((r.retrying.until - Date.now()) / r.retrying.total) * 100))}%"></i></div></div>`;
+}
+function errorHTML(r) {
+  const name = esc(shortName(r.model_id));
+  const [summary, raw] = r.error.includes(' Raw: ') ? r.error.split(' Raw: ') : [null, r.error];
+  const title = { rate_limit: `${name} is busy right now`, insufficient_credits: 'No OpenRouter credits for this model', forbidden: `${name} isn't available to this app`,
+    invalid_model: `${name} is unavailable`, context_limit: 'Conversation too long for this model', timeout: `${name} stopped responding`,
+    provider_unavailable: `${name}'s provider is down`, empty: 'Empty answer', truncated: 'Answer cut off', safety: 'Blocked by a safety filter' }[r.error_kind] || 'Something went wrong';
+  const hint = ERROR_HINT[r.error_kind] || '';
+  let alts = '';
+  const laneStatus = S.conv?.models.find((m) => m.model_id === r.model_id)?.status;
+  if (laneStatus && laneStatus !== 'active') {
+    alts = `<div class="small muted">This lane is ${laneStatus} now${laneStatus === 'paused' ? '. Resume it from the model chips above.' : '.'}</div>`;
+  } else if (SWAPPABLE.has(r.error_kind) && ['failed', 'rate_limited'].includes(r.status)) {
+    const a = S.alts.get(r.id);
+    if (a === undefined) loadAlternatives(r.id);
+    alts = `<div class="alts">${Array.isArray(a) && a.length ? `<span class="small">Swap this lane to:</span>${a.map((m) =>
+        `<button class="btn small" data-act="swap" data-id="${r.id}" data-model="${esc(m.id)}" title="${esc(m.id)}">${esc(shortName(m.id))}${m.health === 'ok' ? ' <span class="tag ok">responding</span>' : ''}</button>`).join('')}` : ''}
+      <button class="btn small ghost" data-act="swap-pick" data-id="${r.id}">Pick another model…</button></div>`;
+  }
+  return `<div class="err-title">⚠ ${title}</div>
+    ${summary ? `<div class="small">${esc(summary)}</div>` : ''}
+    ${hint && !(r.error_kind === 'empty' || r.error_kind === 'truncated') ? `<div class="small">${hint}</div>` : (!summary ? `<div class="small">${esc(raw)}</div>` : '')}
+    ${alts}
+    ${raw && (summary || hint) ? `<details class="tech"><summary>Technical details</summary><div>${esc(raw)}</div></details>` : ''}`;
+}
+async function loadAlternatives(id) {
+  S.alts.set(id, 'loading');
+  try { S.alts.set(id, (await api('GET', `/api/responses/${id}/alternatives`)).alternatives); }
+  catch { S.alts.set(id, []); }
+  renderCard(id);
+}
+async function swapModel(id, modelId) {
+  const payload = await api('POST', `/api/responses/${id}/replace`, { model_id: modelId });
+  setConv(payload); renderHead(); renderThread(); renderComposerMeta();
+  toast(`${shortName(S.resp.get(id).model_id)} paused. ${shortName(modelId)} is answering this turn and future ones.`);
+  runResponse(payload.new_response_id);
+}
+// Tick countdowns on cards that are waiting to retry.
+setInterval(() => { for (const [id, r] of S.resp) if (r.retrying && r.status === 'generating') renderCard(id); }, 1000);
 
 const pendingCardRender = new Set();
 let renderTimer = null;
@@ -470,7 +518,8 @@ async function runResponse(id) {
   if (S.running.has(id)) return;
   S.running.set(id, true);
   const r = S.resp.get(id);
-  Object.assign(r, { status: 'generating', content: '', reasoning: '', error: null, error_kind: null });
+  Object.assign(r, { status: 'generating', content: '', reasoning: '', error: null, error_kind: null, retrying: null });
+  S.alts.delete(id);
   renderCard(id);
   try {
     const res = await fetch(`/api/responses/${id}/run`, { method: 'POST' });
@@ -488,7 +537,7 @@ async function runResponse(id) {
         if (ev.type === 'delta') cur.content += ev.content;
         else if (ev.type === 'reasoning') cur.reasoning += ev.content;
         else if (ev.type === 'start' || ev.type === 'final') { Object.assign(cur, ev.response); cur.retrying = null; }
-        else if (ev.type === 'retrying') cur.retrying = `Rate limited upstream. Retrying (${ev.attempt}/${ev.of})…`;
+        else if (ev.type === 'retrying') cur.retrying = { attempt: ev.attempt, of: ev.of, until: Date.now() + ev.wait_ms, total: ev.wait_ms };
         renderCard(id);
       }
     }
@@ -541,6 +590,8 @@ async function onThreadClick(e) {
         break;
       }
       case 'context': await openContextView(id); break;
+      case 'swap': b.disabled = true; await swapModel(id, b.dataset.model); break;
+      case 'swap-pick': openSwapPicker(id); break;
     }
   } catch (err) { fail(err); }
 }
@@ -558,7 +609,25 @@ function modal({ title, body, foot = '', wide = false }) {
   return { el: root.querySelector('.modal'), close };
 }
 
-function openAddModel() {
+async function openSwapPicker(id) {
+  await loadModels();
+  const r = S.resp.get(id);
+  const existing = S.conv.models.filter((m) => m.status !== 'removed').map((m) => m.model_id);
+  let picked = [];
+  const { el, close } = modal({
+    title: `Replace ${shortName(r.model_id)}`,
+    body: `<p class="muted small" style="margin:0">${esc(shortName(r.model_id))} will be paused, not removed, so you can resume it later. The new model answers this turn and the next ones.</p><div id="swap-picker"></div>`,
+    foot: `<button class="btn" data-close>Cancel</button><button class="btn primary" id="swap-confirm">Swap and answer</button>`,
+  });
+  mountPicker($('#swap-picker', el), { selected: picked, max: 1, exclude: existing, onChange: (s) => (picked = s) });
+  $('#swap-confirm', el).onclick = async () => {
+    if (!picked.length) return toast('Pick a model');
+    try { close(); await swapModel(id, picked[0]); } catch (e) { fail(e); }
+  };
+}
+
+async function openAddModel() {
+  await loadModels();
   const existing = S.conv.models.filter((m) => m.status !== 'removed').map((m) => m.model_id);
   let picked = [];
   const { el, close } = modal({

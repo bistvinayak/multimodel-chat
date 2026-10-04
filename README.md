@@ -23,10 +23,10 @@ Create an account in the browser, pick models, and start chatting. Data lives in
 | Area | What it does |
 |---|---|
 | Accounts | Email and password sign-up with scrypt hashing and HttpOnly session cookies. Every query is scoped to the signed-in user. Account deletion removes all of the user's data. |
-| Model catalog | Live from OpenRouter, so free status and prices are never hard-coded. Filters for free, fast, reasoning, coding and popular. Routers such as `openrouter/auto` are excluded because they would silently swap models mid-comparison. |
+| Model catalog | Live from OpenRouter, with a busy now or responding label from recent traffic, so free status and prices are never hard-coded. Filters for free, fast, reasoning, coding and popular. Routers such as `openrouter/auto` are excluded because they would silently swap models mid-comparison. |
 | Parallel turns | One request per model, all concurrent. OpenRouter's `models` fallback array is never used, because it is sequential fallback rather than parallel output. |
 | Streaming | Each card streams independently and shows generating, completed, failed, rate limited or stopped. You can stop one model without stopping the others. |
-| Failures | Each model fails and retries on its own. Rate limits retry the same model twice with backoff before showing Retry. Errors are mapped to plain-language causes such as credits, context limit, invalid model or timeout. |
+| Failures | Each model fails and retries on its own. Rate limits retry the same model 4 times with backoff (about 40s), and the card shows a live countdown. After that, the card explains the problem in plain language, keeps the raw provider error under Technical details, and offers one-click swaps to free models that are responding right now. A swap pauses the busy model, never removes it, and is always the user's explicit choice. |
 | Context | Shared user messages, plus each model's own history, plus the decisions you selected. Skipped turns are merged so roles still alternate. The "Context sent" button shows the exact messages each model received. |
 | Context window | Token budget per model. Older turns are condensed into a list of your earlier messages instead of being dropped. Selected decisions always survive. |
 | Response actions | Use as context (whole answer or highlighted part), Continue with this (applies to the next turn only), Ask this model, Copy, Save, Use as final, and Context sent. |
