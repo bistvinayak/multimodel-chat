@@ -17,6 +17,9 @@ const PORT = Number(process.env.PORT || 3210);
 const HOST = process.env.HOST || '127.0.0.1';
 const MAX_MODELS = Number(process.env.MAX_MODELS || 3);
 const RATE_LIMIT_RETRIES = Number(process.env.RATE_LIMIT_RETRIES ?? 4);
+// With auto-switch on, retry briefly, then hand the lane to a model that is answering.
+const AUTO_SWITCH_RETRIES = Number(process.env.AUTO_SWITCH_RETRIES ?? 1);
+const MAX_AUTO_SWITCHES = 2; // per lane per turn
 // Exponential backoff with jitter: about 3s, 6s, 11s, 18s (~40s total) before giving up.
 const backoffMs = (attempt) => Math.round([3000, 6000, 11000, 18000][Math.min(attempt, 3)] * (0.85 + Math.random() * 0.3));
 const API_KEY = process.env.OPENROUTER_API_KEY;
@@ -26,7 +29,7 @@ const db = openDb(process.env.DB_PATH || path.join(ROOT, 'data', 'app.db'));
 const running = new Map(); // response_id -> AbortController
 const uid = () => crypto.randomUUID();
 const now = () => Date.now();
-const DEFAULT_PREFS = { max_output_tokens: 8192, free_only: true };
+const DEFAULT_PREFS = { max_output_tokens: 8192, free_only: true, auto_switch: true };
 
 // ---------- helpers ----------
 class HttpError extends Error { constructor(status, msg) { super(msg); this.status = status; } }
@@ -62,7 +65,7 @@ const touch = (convId) => db.prepare('UPDATE conversations SET updated_at=? WHER
 
 const RESPONSE_COLS = `id, turn_id, conversation_id, model_id, served_model, provider, display_position, content, reasoning,
   status, error_kind, error, finish_reason, latency_ms, first_token_ms, prompt_tokens, completion_tokens, cost,
-  saved, final, attempts, created_at, finished_at`;
+  saved, final, attempts, replaced_by, stands_in_for, auto_switched, created_at, finished_at`;
 const getResponseRow = (id) => db.prepare(`SELECT ${RESPONSE_COLS} FROM responses WHERE id=?`).get(id);
 
 function conversationPayload(conv) {
@@ -127,16 +130,28 @@ function maxOutFor(user, model) {
   return model?.max_output ? Math.min(want, model.max_output) : want;
 }
 
+// target: 'all' | model_id | [model_id, ...]  (any subset of the conversation's models)
 function resolveTargets(convId, target) {
   const models = db.prepare('SELECT * FROM conversation_models WHERE conversation_id=? ORDER BY position').all(convId);
+  const active = models.filter((m) => m.status === 'active');
   if (!target || target === 'all') {
-    const active = models.filter((m) => m.status === 'active');
     if (!active.length) throw new HttpError(400, 'No active models. Add or resume a model first.');
     return { mode: 'all', targets: active };
   }
-  const m = models.find((x) => x.model_id === target && x.status !== 'removed');
-  if (!m) throw new HttpError(400, 'That model is not part of this conversation');
-  return { mode: 'single', targets: [m] };
+  const ids = [...new Set(Array.isArray(target) ? target.map(String) : [String(target)])];
+  if (!ids.length) throw new HttpError(400, 'Pick at least one model to send to');
+  const targets = models.filter((m) => ids.includes(m.model_id) && m.status !== 'removed');
+  if (targets.length !== ids.length) throw new HttpError(400, 'One of those models is not part of this conversation');
+  if (targets.length > MAX_MODELS) throw new HttpError(400, `At most ${MAX_MODELS} models per message`);
+  const isAll = active.length && targets.length === active.length && active.every((a) => ids.includes(a.model_id));
+  return { mode: isAll ? 'all' : targets.length === 1 ? 'single' : 'subset', targets };
+}
+
+function replyRef(convId, reply_to) {
+  if (!reply_to?.response_id) return { id: null, quote: null };
+  const r = db.prepare('SELECT id FROM responses WHERE id=? AND conversation_id=?').get(String(reply_to.response_id), convId);
+  if (!r) throw new HttpError(400, 'The answer you are replying to is not in this conversation');
+  return { id: r.id, quote: reply_to.quote ? String(reply_to.quote).slice(0, 8000) : null };
 }
 
 function logPreference(user, resp, eventType) {
@@ -145,6 +160,73 @@ function logPreference(user, resp, eventType) {
               compared_responses, compared_models, display_position, task_type, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
     .run(uid(), user.id, resp.conversation_id, resp.turn_id, eventType, resp.id, resp.model_id,
       JSON.stringify(others.map((o) => o.id)), JSON.stringify(others.map((o) => o.model_id)), resp.display_position, null, now());
+}
+
+// ---------- lane swaps (manual and automatic) ----------
+// Healthy models that could stand in for a busy/failed lane, best first.
+async function rankAlternatives(r) {
+  const inConv = new Set(db.prepare(`SELECT model_id FROM conversation_models WHERE conversation_id=? AND status<>'removed'`)
+    .all(r.conversation_id).map((x) => x.model_id));
+  const cur = await getModel(r.model_id);
+  const wantTags = new Set((cur?.tags || []).filter((t) => t !== 'free'));
+  const vendor = (id) => id.split('/')[0];
+  const limited = r.error_kind === 'rate_limit' || r.status === 'rate_limited';
+  const score = (m) => ({ ok: 4, unknown: 1 }[healthOf(m.id)] || 0)
+    + qualityScore(m, { health: healthOf(m.id) }) / 4                       // prefer stronger models
+    + m.tags.filter((t) => wantTags.has(t)).length
+    + (m.context_length >= (cur?.context_length || 0) ? 1 : 0)
+    + (m.id.endsWith(':free') ? 1 : 0)                                    // zero-priced non-:free endpoints can still demand credits
+    - (limited && vendor(m.id) === vendor(r.model_id) ? 3 : 0);           // same vendor likely shares the exhausted pool
+  return (await getCatalog())
+    .filter((m) => !inConv.has(m.id) && !NOT_CHAT.test(m.id))
+    .filter((m) => (cur && !cur.free) || m.free)                          // a free lane only gets free stand-ins
+    .filter((m) => !['busy', 'blocked'].includes(healthOf(m.id)))
+    .sort((a, b) => score(b) - score(a) || b.created - a.created);
+}
+
+// Pauses r's model (never removes it), activates model_id, and gives it a pending response in the same turn.
+function swapLane(r, model_id, auto) {
+  let newId;
+  tx(db, () => {
+    const rows = db.prepare('SELECT * FROM conversation_models WHERE conversation_id=?').all(r.conversation_id);
+    db.prepare(`UPDATE conversation_models SET status='paused' WHERE conversation_id=? AND model_id=? AND status='active'`).run(r.conversation_id, r.model_id);
+    const existing = rows.find((x) => x.model_id === model_id);
+    const activeAfter = rows.filter((x) => x.status === 'active' && x.model_id !== r.model_id && x.model_id !== model_id).length + 1;
+    if (activeAfter > MAX_MODELS) throw new HttpError(400, `At most ${MAX_MODELS} active models`);
+    if (existing) db.prepare(`UPDATE conversation_models SET status='active', removed_at=NULL WHERE conversation_id=? AND model_id=?`).run(r.conversation_id, model_id);
+    else db.prepare('INSERT INTO conversation_models (conversation_id, model_id, status, position, added_at) VALUES (?,?,?,?,?)')
+      .run(r.conversation_id, model_id, 'active', rows.length, now());
+    const pos = db.prepare('SELECT position FROM conversation_models WHERE conversation_id=? AND model_id=?').get(r.conversation_id, model_id).position;
+    const already = db.prepare('SELECT id, status FROM responses WHERE turn_id=? AND model_id=?').get(r.turn_id, model_id);
+    if (already) {
+      newId = already.id;
+      if (already.status !== 'completed') db.prepare(`UPDATE responses SET status='pending' WHERE id=?`).run(newId);
+    } else {
+      newId = uid();
+      db.prepare(`INSERT INTO responses (id, turn_id, conversation_id, model_id, display_position, status, created_at) VALUES (?,?,?,?,?,'pending',?)`)
+        .run(newId, r.turn_id, r.conversation_id, model_id, pos, now());
+    }
+    db.prepare('UPDATE responses SET stands_in_for=?, auto_switched=? WHERE id=?').run(r.id, auto ? 1 : 0, newId);
+    db.prepare('UPDATE responses SET replaced_by=? WHERE id=?').run(newId, r.id);
+  });
+  touch(r.conversation_id);
+  return newId;
+}
+
+// How many automatic stand-ins already happened in this chain (stops endless hopping).
+function standInDepth(id) {
+  let depth = 0, cur = db.prepare('SELECT stands_in_for, auto_switched FROM responses WHERE id=?').get(id);
+  while (cur?.stands_in_for && depth < 10) { if (cur.auto_switched) depth++; cur = db.prepare('SELECT stands_in_for, auto_switched FROM responses WHERE id=?').get(cur.stands_in_for); }
+  return depth;
+}
+
+// Pick the best alternative that is actually answering right now (checked with a tiny request).
+async function pickStandIn(r) {
+  const candidates = (await rankAlternatives({ ...r, status: 'rate_limited', error_kind: 'rate_limit' })).slice(0, 4);
+  if (!candidates.length) return null;
+  const results = await Promise.all(candidates.map((m) => probeModel(API_KEY, m.id)));
+  results.forEach((x) => (x.health === 'ok' ? recordOk(x.model) : x.health === 'busy' ? recordLimited(x.model) : x.health === 'blocked' ? recordBlocked(x.model) : null));
+  return candidates.find((m, i) => results[i].health === 'ok') || null;
 }
 
 // ---------- model run (streams NDJSON to the client) ----------
@@ -190,11 +272,12 @@ async function runResponse(user, resp, req, res) {
         break;
       } catch (e) {
         if (e instanceof ModelError && e.kind === 'rate_limit') recordLimited(resp.model_id);
-        const retryable = e instanceof ModelError && e.kind === 'rate_limit' && !content && !reasoning && attempt < RATE_LIMIT_RETRIES
+        const maxRetries = prefsOf(user).auto_switch ? AUTO_SWITCH_RETRIES : RATE_LIMIT_RETRIES;
+        const retryable = e instanceof ModelError && e.kind === 'rate_limit' && !content && !reasoning && attempt < maxRetries
           && !(e.retryAfterMs > 60_000);
         if (!retryable) { e.attempts = attempt + 1; throw e; }
         const wait = e.retryAfterMs ?? backoffMs(attempt);
-        emit({ type: 'retrying', attempt: attempt + 1, of: RATE_LIMIT_RETRIES, wait_ms: wait });
+        emit({ type: 'retrying', attempt: attempt + 1, of: maxRetries, wait_ms: wait });
         await new Promise((ok) => {
           const t = setTimeout(ok, wait);
           ctl.signal.addEventListener('abort', () => { clearTimeout(t); ok(); }, { once: true });
@@ -230,6 +313,16 @@ async function runResponse(user, resp, req, res) {
     }
     db.prepare(`UPDATE responses SET content=?, reasoning=?, status=?, error=?, error_kind=?, finished_at=? WHERE id=?`)
       .run(content, reasoning, status, me.kind === 'stopped' ? null : me.message, me.kind, now(), resp.id);
+    if (me.kind === 'rate_limit' && prefsOf(user).auto_switch && !ctl.signal.aborted && standInDepth(resp.id) < MAX_AUTO_SWITCHES) {
+      emit({ type: 'switching' });
+      try {
+        const alt = await pickStandIn(getResponseRow(resp.id));
+        if (alt) {
+          const newId = swapLane(getResponseRow(resp.id), alt.id, true);
+          emit({ type: 'switched', from: resp.model_id, to: alt.id, new_response_id: newId });
+        } else emit({ type: 'switch_failed', message: 'No other free model is answering right now.' });
+      } catch (err) { emit({ type: 'switch_failed', message: err.message }); }
+    }
   } finally {
     running.delete(resp.id);
     touch(resp.conversation_id);
@@ -278,6 +371,7 @@ route('PATCH', '/api/me', async (req, res, { user }) => {
   const prefs = prefsOf(user);
   if (body.max_output_tokens !== undefined) prefs.max_output_tokens = Math.max(256, Math.min(32_000, Number(body.max_output_tokens) || 8192));
   if (body.free_only !== undefined) prefs.free_only = !!body.free_only;
+  if (body.auto_switch !== undefined) prefs.auto_switch = !!body.auto_switch;
   db.prepare('UPDATE users SET preferences=? WHERE id=?').run(JSON.stringify(prefs), user.id);
   send(res, 200, publicUser(db.prepare('SELECT * FROM users WHERE id=?').get(user.id)));
 });
@@ -430,9 +524,10 @@ route('DELETE', '/api/conversations/:id/models/:model', async (req, res, { user,
 
 route('POST', '/api/conversations/:id/estimate', async (req, res, { user, params }) => {
   const c = ownConversation(user, params.id);
-  const { message = '', target } = await readJson(req);
+  const { message = '', target, reply_to } = await readJson(req);
   const { targets } = resolveTargets(c.id, target);
-  const draft = { conversation_id: c.id, created_at: now() + 1, user_message: String(message) };
+  const ref = replyRef(c.id, reply_to);
+  const draft = { conversation_id: c.id, created_at: now() + 1, user_message: String(message), reply_to_response: ref.id, reply_quote: ref.quote };
   const pins = pinsFor(c.id, null);
   const skills = skillsFor(c.id);
   const out = [];
@@ -453,14 +548,15 @@ route('POST', '/api/conversations/:id/estimate', async (req, res, { user, params
 
 route('POST', '/api/conversations/:id/messages', async (req, res, { user, params }) => {
   const c = ownConversation(user, params.id);
-  const { message, target } = await readJson(req);
+  const { message, target, reply_to } = await readJson(req);
   const text = String(message || '').trim();
   if (!text) throw new HttpError(400, 'Message is empty');
   const { mode, targets } = resolveTargets(c.id, target);
+  const ref = replyRef(c.id, reply_to);
   const turnId = uid(), t = now();
   tx(db, () => {
-    db.prepare('INSERT INTO turns (id, conversation_id, user_message, mode, target_models, created_at) VALUES (?,?,?,?,?,?)')
-      .run(turnId, c.id, text, mode, JSON.stringify(targets.map((x) => x.model_id)), t);
+    db.prepare('INSERT INTO turns (id, conversation_id, user_message, mode, target_models, reply_to_response, reply_quote, created_at) VALUES (?,?,?,?,?,?,?,?)')
+      .run(turnId, c.id, text, mode, JSON.stringify(targets.map((x) => x.model_id)), ref.id, ref.quote, t);
     // "Continue with this" pins apply to exactly this next turn.
     db.prepare(`UPDATE context_selections SET consumed_turn_id=? WHERE conversation_id=? AND selection_type='continue'
                 AND active=1 AND consumed_turn_id IS NULL`).run(turnId, c.id);
@@ -478,27 +574,9 @@ route('POST', '/api/responses/:id/run', async (req, res, { user, params }) => {
   await runResponse(user, r, req, res);
 });
 
-// Suggest healthy models to swap in for a busy/failed lane. Never applied automatically:
-// silently swapping a model would invalidate the comparison.
 route('GET', '/api/responses/:id/alternatives', async (req, res, { user, params }) => {
   const r = ownResponse(user, params.id);
-  const inConv = new Set(db.prepare(`SELECT model_id FROM conversation_models WHERE conversation_id=? AND status<>'removed'`)
-    .all(r.conversation_id).map((x) => x.model_id));
-  const cur = await getModel(r.model_id);
-  const wantTags = new Set((cur?.tags || []).filter((t) => t !== 'free'));
-  const vendor = (id) => id.split('/')[0];
-  const score = (m) => ({ ok: 4, unknown: 1 }[healthOf(m.id)] || 0)
-    + m.tags.filter((t) => wantTags.has(t)).length
-    + (m.context_length >= (cur?.context_length || 0) ? 1 : 0)
-    + (m.id.endsWith(':free') ? 1 : 0)                                    // zero-priced non-:free endpoints can still demand credits
-    - (r.error_kind === 'rate_limit' && vendor(m.id) === vendor(r.model_id) ? 3 : 0); // same vendor likely shares the exhausted pool
-  const alts = (await getCatalog())
-    .filter((m) => !inConv.has(m.id) && !NOT_CHAT.test(m.id))
-    .filter((m) => (cur && !cur.free) || m.free)          // a free lane only suggests free models
-    .filter((m) => !['busy', 'blocked'].includes(healthOf(m.id)))
-    .sort((a, b) => score(b) - score(a) || b.created - a.created)
-    .slice(0, 3)
-    .map((m) => ({ id: m.id, name: m.name, free: m.free, health: healthOf(m.id) }));
+  const alts = (await rankAlternatives(r)).slice(0, 3).map((m) => ({ id: m.id, name: m.name, free: m.free, health: healthOf(m.id) }));
   send(res, 200, { alternatives: alts });
 });
 
@@ -508,29 +586,7 @@ route('POST', '/api/responses/:id/replace', async (req, res, { user, params }) =
   const { model_id } = await readJson(req);
   if (!(await getModel(model_id))) throw new HttpError(400, 'Unknown model');
   if (model_id === r.model_id) throw new HttpError(400, 'Pick a different model');
-  let newId;
-  tx(db, () => {
-    const rows = db.prepare('SELECT * FROM conversation_models WHERE conversation_id=?').all(r.conversation_id);
-    // Pause (not remove) the busy model so it can be resumed later with its history.
-    db.prepare(`UPDATE conversation_models SET status='paused' WHERE conversation_id=? AND model_id=? AND status='active'`).run(r.conversation_id, r.model_id);
-    const existing = rows.find((x) => x.model_id === model_id);
-    const activeAfter = rows.filter((x) => x.status === 'active' && x.model_id !== r.model_id && x.model_id !== model_id).length + 1;
-    if (activeAfter > MAX_MODELS) throw new HttpError(400, `At most ${MAX_MODELS} active models`);
-    if (existing) db.prepare(`UPDATE conversation_models SET status='active', removed_at=NULL WHERE conversation_id=? AND model_id=?`).run(r.conversation_id, model_id);
-    else db.prepare('INSERT INTO conversation_models (conversation_id, model_id, status, position, added_at) VALUES (?,?,?,?,?)')
-      .run(r.conversation_id, model_id, 'active', rows.length, now());
-    const pos = db.prepare('SELECT position FROM conversation_models WHERE conversation_id=? AND model_id=?').get(r.conversation_id, model_id).position;
-    const already = db.prepare('SELECT id, status FROM responses WHERE turn_id=? AND model_id=?').get(r.turn_id, model_id);
-    if (already) {
-      newId = already.id;
-      if (already.status !== 'completed') db.prepare(`UPDATE responses SET status='pending' WHERE id=?`).run(newId);
-    } else {
-      newId = uid();
-      db.prepare(`INSERT INTO responses (id, turn_id, conversation_id, model_id, display_position, status, created_at) VALUES (?,?,?,?,?,'pending',?)`)
-        .run(newId, r.turn_id, r.conversation_id, model_id, pos, now());
-    }
-  });
-  touch(r.conversation_id);
+  const newId = swapLane(r, model_id, false);
   send(res, 200, { ...conversationPayload(ownConversation(user, r.conversation_id)), new_response_id: newId });
 });
 

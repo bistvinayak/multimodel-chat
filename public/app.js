@@ -13,7 +13,8 @@ const S = {
   running: new Map(),            // response id -> true while streaming in this tab
   tabs: {},                      // turn id -> response id shown on mobile
   expanded: new Set(),
-  target: 'all',
+  target: 'all',                 // 'all' or an array of model ids (any subset)
+  reply: null,                   // { id, model_id, quote } when replying to one answer
   filters: { q: '', free: true, fast: false, reasoning: false, coding: false, popular: false },
   lastSel: null,
   alts: new Map(),               // response id -> alternatives array | 'loading'                 // { id, text } highlighted inside a card
@@ -47,7 +48,7 @@ async function api(method, url, body) {
   return data;
 }
 let toastTimer;
-function toast(msg) { const t = $('#toast'); t.textContent = msg; t.classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 2400); }
+function toast(msg, ms = 2400) { const t = $('#toast'); t.textContent = msg; t.classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), ms); }
 const fail = (e) => toast(e.message || String(e));
 function md(text) {
   if (window.marked && window.DOMPurify) return DOMPurify.sanitize(marked.parse(text || '', { breaks: false, gfm: true }));
@@ -386,7 +387,7 @@ function renderNew() {
       const text = newState.text.trim();
       if (text) payload = await api('POST', `/api/conversations/${payload.conversation.id}/messages`, { message: text, target: 'all' });
       newState = { text: '', selected: [], skills: null };
-      S.target = 'all';
+      S.target = 'all'; S.reply = null;
       setConv(payload);
       history.replaceState(null, '', `#/c/${payload.conversation.id}`);
       renderConv();
@@ -408,12 +409,17 @@ function setConv(payload) {
       S.resp.set(r.id, r); return r;
     });
   }
-  if (S.target !== 'all' && !payload.models.some((m) => m.model_id === S.target && m.status !== 'removed')) S.target = 'all';
+  if (Array.isArray(S.target)) {
+    const live = new Set(payload.models.filter((m) => m.status !== 'removed').map((m) => m.model_id));
+    S.target = S.target.filter((id) => live.has(id));
+    if (!S.target.length) S.target = 'all';
+  }
+  if (S.reply && !S.resp.has(S.reply.id)) S.reply = null;
 }
 
 async function openConversation(id) {
   if (S.conv?.conversation.id === id) { renderConv(); return; }
-  try { setConv(await api('GET', `/api/conversations/${id}`)); S.target = 'all'; renderConv(); renderSidebar(); }
+  try { S.target = 'all'; S.reply = null; setConv(await api('GET', `/api/conversations/${id}`)); renderConv(); renderSidebar(); }
   catch (e) { fail(e); location.hash = '#/new'; }
 }
 const refreshConv = debounce(async () => {
@@ -428,10 +434,11 @@ function renderConv() {
     <div class="thread" id="thread"></div>
     <div class="composer"><div class="composer-inner">
       <div id="pin-note"></div>
+      <div id="reply-note"></div>
       <div class="composer-row">
         <textarea class="textarea" id="msg" rows="1" placeholder="Ask anything… (Enter to send, Shift+Enter for a new line)"></textarea>
         <button class="btn primary" id="send-btn">Send</button></div>
-      <div class="composer-meta"><label>Send to <select class="select" id="target"></select></label><span id="estimate"></span></div>
+      <div class="composer-meta"><div class="send-to" id="send-to"></div><span id="estimate"></span></div>
     </div></div>`;
   renderHead(); renderThread(); renderComposerMeta();
   const msg = $('#msg');
@@ -443,7 +450,20 @@ function renderConv() {
   };
   msg.onkeydown = (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendMessage(); } };
   $('#send-btn').onclick = sendMessage;
-  $('#target').onchange = (e) => { S.target = e.target.value; estimate(); };
+  $('#send-to').onclick = (e) => {
+    const b = e.target.closest('[data-to]'); if (!b) return;
+    const v = b.dataset.to;
+    if (v === 'all') S.target = 'all';
+    else {
+      const cur = new Set(S.target === 'all' ? activeIds() : S.target);
+      if (cur.has(v)) cur.delete(v); else cur.add(v);
+      if (cur.size > S.conv.max_models) return toast(`At most ${S.conv.max_models} models per message`);
+      if (!cur.size) return toast('Pick at least one model');
+      const act = activeIds();
+      S.target = cur.size === act.length && act.every((id) => cur.has(id)) ? 'all' : [...cur];
+    }
+    renderComposerMeta();
+  };
   $('#thread').addEventListener('click', onThreadClick);
   const th = $('#thread'); th.scrollTop = th.scrollHeight;
 }
@@ -488,13 +508,28 @@ function renderHead() {
   };
 }
 
+const replyBody = () => (S.reply ? { response_id: S.reply.id, quote: S.reply.quote || null } : null);
+const activeIds = () => S.conv.models.filter((m) => m.status === 'active').map((m) => m.model_id);
+function targetIds() { return S.target === 'all' ? activeIds() : S.target; }
+
 function renderComposerMeta() {
-  if (!S.conv || !$('#target')) return;
+  if (!S.conv || !$('#send-to')) return;
   const models = S.conv.models.filter((m) => m.status !== 'removed');
-  const active = models.filter((m) => m.status === 'active');
-  $('#target').innerHTML = `<option value="all">All active models (${active.length})</option>` +
-    models.map((m) => `<option value="${esc(m.model_id)}">Only ${esc(shortName(m.model_id))}${m.status === 'paused' ? ' (paused)' : ''}</option>`).join('');
-  $('#target').value = S.target;
+  const chosen = new Set(targetIds());
+  $('#send-to').innerHTML = `<span class="muted">Send to</span>
+    <button class="to-chip ${S.target === 'all' ? 'on' : ''}" data-to="all" title="Every active model">All active (${activeIds().length})</button>
+    ${models.map((m) => `<button class="to-chip ${chosen.has(m.model_id) ? 'on' : ''} ${m.status}" data-to="${esc(m.model_id)}" style="--lane:var(--lane-${m.position % 6})"
+        title="${m.status === 'paused' ? 'Paused lane: you can still ask it directly' : 'Click to include or leave out'}">
+        <span class="dot" style="background:var(--lane-${m.position % 6})"></span>${esc(shortName(m.model_id))}${chosen.has(m.model_id) ? ' ✓' : ''}</button>`).join('')}`;
+  const n = chosen.size;
+  $('#send-btn').textContent = S.target === 'all' ? 'Send' : `Send to ${n}`;
+  const r = S.reply && S.resp.get(S.reply.id);
+  $('#reply-note').innerHTML = r ? `<div class="reply-note"><span class="dot" style="background:${laneColor(r.model_id)}"></span>
+      <div style="flex:1;min-width:0"><b>↩ Replying to ${esc(shortName(r.model_id))}</b>${S.reply.quote ? ' (highlighted part)' : ''}
+        <div class="snip">${esc((S.reply.quote || r.content).slice(0, 220))}</div>
+        <div class="small muted">Only ${esc(shortName(r.model_id))} is selected. Tick more models below to get their take on this answer too.</div></div>
+      <button class="btn small ghost" id="reply-cancel" title="Cancel reply">✕</button></div>` : '';
+  const rc = $('#reply-cancel'); if (rc) rc.onclick = () => { S.reply = null; S.target = 'all'; renderComposerMeta(); };
   const pin = S.conv.selections.find((s) => s.selection_type === 'continue');
   $('#pin-note').innerHTML = pin ? `<div class="pin-note">↳ Your next message continues from <b>${esc(shortName(pin.model_id))}</b>'s answer. <button class="btn small ghost" data-unpin="${pin.id}">Cancel</button></div>` : '';
   const up = $('[data-unpin]'); if (up) up.onclick = async () => { try { setConv(await api('DELETE', `/api/selections/${up.dataset.unpin}`)); renderComposerMeta(); } catch (e) { fail(e); } };
@@ -504,7 +539,7 @@ function renderComposerMeta() {
 const estimate = debounce(async () => {
   const el = $('#estimate'); if (!el || !S.conv) return;
   try {
-    const est = await api('POST', `/api/conversations/${S.conv.conversation.id}/estimate`, { message: $('#msg')?.value || '', target: S.target });
+    const est = await api('POST', `/api/conversations/${S.conv.conversation.id}/estimate`, { message: $('#msg')?.value || '', target: S.target, reply_to: replyBody() });
     const n = est.models.length;
     const allFree = est.models.every((m) => m.free);
     const dropped = Math.max(0, ...est.models.map((m) => m.dropped_turns));
@@ -525,12 +560,21 @@ function turnHTML(t) {
   const rs = t.responses;
   const active = S.tabs[t.id] && rs.some((r) => r.id === S.tabs[t.id]) ? S.tabs[t.id] : rs[0]?.id;
   return `<section class="turn" id="turn-${t.id}">
+    ${t.reply_to_response ? replyQuoteHTML(t) : ''}
     <div class="user-msg">${esc(t.user_message)}</div>
-    ${t.mode === 'single' ? `<div class="turn-meta">Asked only ${esc(shortName(t.target_models[0]))}</div>` : ''}
+    ${t.mode === 'single' ? `<div class="turn-meta">Asked only ${esc(shortName(t.target_models[0]))}</div>`
+      : t.mode === 'subset' ? `<div class="turn-meta">Asked ${t.target_models.map((m) => esc(shortName(m))).join(' and ')}</div>` : ''}
     <div class="lane-tabs">${rs.map((r) => `<button class="${r.id === active ? 'on' : ''}" style="--lane:${laneColor(r.model_id)}" data-act="tab" data-turn="${t.id}" data-id="${r.id}">
       <span class="dot" style="background:${laneColor(r.model_id)};width:8px;height:8px;border-radius:50%"></span>${esc(shortName(r.model_id))}${r.status === 'completed' ? ' ✓' : r.status === 'generating' ? ' …' : ['failed', 'rate_limited'].includes(r.status) ? ' ⚠' : ''}</button>`).join('')}</div>
     <div class="lanes" style="--n:${Math.max(1, rs.length)}">${rs.map((r) => cardHTML(r, r.id === active)).join('')}</div>
   </section>`;
+}
+
+function replyQuoteHTML(t) {
+  const r = S.resp.get(t.reply_to_response);
+  if (!r) return '<div class="reply-quote muted">↩ Reply to an earlier answer</div>';
+  return `<a class="reply-quote" href="#" data-act="jump" data-id="${r.id}" style="--lane:${laneColor(r.model_id)}">
+    <b>↩ Reply to ${esc(shortName(r.model_id))}</b><span>${esc((t.reply_quote || r.content).replace(/\s+/g, ' ').slice(0, 160))}</span></a>`;
 }
 
 function cardHTML(r, tabActive) {
@@ -546,11 +590,12 @@ function cardHTML(r, tabActive) {
   if (r.cost != null) meta.push(fmtCost(r.cost));
   if (r.provider) meta.push(`via ${esc(r.provider)}`);
   if (r.attempts > 1) meta.push(`attempt ${r.attempts}`);
-  const body = has ? md(r.content) : live ? (r.retrying ? retryingHTML(r) : `<span class="muted">${r.reasoning ? 'Thinking…' : 'Waiting for the first token…'}</span>`)
+  const body = has ? md(r.content) : live ? (r.switching ? `<div class="retrying"><b>${esc(shortName(r.model_id))} is still rate limited.</b><span class="muted">Finding the best other model that is answering right now…</span></div>` : r.retrying ? retryingHTML(r) : `<span class="muted">${r.reasoning ? 'Thinking…' : 'Waiting for the first token…'}</span>`)
     : r.status === 'pending' ? '<span class="muted">Not started yet.</span>' : '';
   return `<article class="card ${r.final ? 'is-final' : ''} ${tabActive ? 'tab-active' : ''}" id="card-${r.id}" data-id="${r.id}" style="--lane:${laneColor(r.model_id)}">
     <div class="card-head"><span class="dot" style="background:${laneColor(r.model_id)}"></span>
       <span class="name" title="${esc(r.model_id)}">${esc(shortName(r.model_id))}</span>
+      ${r.stands_in_for && S.resp.get(r.stands_in_for) ? `<span class="badge standin" title="Answering in place of ${esc(shortName(S.resp.get(r.stands_in_for).model_id))}, which was ${S.resp.get(r.stands_in_for).error_kind === 'rate_limit' ? 'rate limited' : 'unavailable'}">Stand-in for ${esc(shortName(S.resp.get(r.stands_in_for).model_id))}</span>` : ''}
       ${r.final ? '<span class="badge final">Final</span>' : ''}${r.saved ? '<span class="badge">Saved</span>' : ''}
       <span class="badge ${r.status}">${STATUS_LABEL[r.status] || r.status}</span></div>
     ${r.reasoning ? `<details class="thinking" ${live && !has ? 'open' : ''}><summary>Reasoning (${fmtTokens(Math.ceil(r.reasoning.length / 4))} tokens)</summary><pre>${esc(r.reasoning.slice(-20000))}</pre></details>` : ''}
@@ -564,6 +609,7 @@ function cardHTML(r, tabActive) {
       ${has && !live ? `
         <button class="btn small" data-act="use" data-id="${r.id}" title="Send this answer (or the part you highlighted) to every model on future turns">Use as context</button>
         <button class="btn small" data-act="continue" data-id="${r.id}" title="Your next message builds on this answer, for all models">Continue with this</button>
+        <button class="btn small" data-act="reply" data-id="${r.id}" title="Reply to this answer. Highlight part of it first to quote just that part.">↩ Reply</button>
         <button class="btn small ghost" data-act="ask" data-id="${r.id}" title="Send the next message only to this model">Ask this model</button>
         <button class="btn small ghost" data-act="copy" data-id="${r.id}">Copy</button>
         <button class="btn small ghost ${r.saved ? 'on' : ''}" data-act="save" data-id="${r.id}">${r.saved ? 'Saved' : 'Save'}</button>
@@ -589,7 +635,12 @@ function errorHTML(r) {
   const hint = ERROR_HINT[r.error_kind] || '';
   let alts = '';
   const laneStatus = S.conv?.models.find((m) => m.model_id === r.model_id)?.status;
-  if (laneStatus && laneStatus !== 'active') {
+  const standIn = r.replaced_by && S.resp.get(r.replaced_by);
+  if (standIn) {
+    alts = `<div class="switched">⇄ ${r.replaced_by && standIn.auto_switched ? 'Switched automatically' : 'You switched this lane'} to
+      <a href="#" data-act="jump" data-id="${standIn.id}"><b>${esc(shortName(standIn.model_id))}</b></a>, which answered this message instead.
+      ${esc(shortName(r.model_id))} is paused. Resume it from the model chips above when it is free again.</div>`;
+  } else if (laneStatus && laneStatus !== 'active') {
     alts = `<div class="small muted">This lane is ${laneStatus} now${laneStatus === 'paused' ? '. Resume it from the model chips above.' : '.'}</div>`;
   } else if (SWAPPABLE.has(r.error_kind) && ['failed', 'rate_limited'].includes(r.status)) {
     const a = S.alts.get(r.id);
@@ -649,7 +700,8 @@ async function sendMessage() {
   if (!text || !S.conv) return;
   const btn = $('#send-btn'); btn.disabled = true;
   try {
-    const payload = await api('POST', `/api/conversations/${S.conv.conversation.id}/messages`, { message: text, target: S.target });
+    const payload = await api('POST', `/api/conversations/${S.conv.conversation.id}/messages`, { message: text, target: S.target, reply_to: replyBody() });
+    S.reply = null;
     msg.value = ''; msg.style.height = 'auto';
     try { sessionStorage.removeItem(`draft:${S.conv.conversation.id}`); } catch {}
     setConv(payload); renderHead(); renderThread(); renderComposerMeta(); loadConvs();
@@ -672,6 +724,7 @@ async function runResponse(id) {
   S.alts.delete(id);
   renderCard(id);
   try {
+    var switched = null;
     const res = await fetch(`/api/responses/${id}/run`, { method: 'POST' });
     if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `HTTP ${res.status}`); }
     const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = '';
@@ -688,6 +741,9 @@ async function runResponse(id) {
         else if (ev.type === 'reasoning') cur.reasoning += ev.content;
         else if (ev.type === 'start' || ev.type === 'final') { Object.assign(cur, ev.response); cur.retrying = null; }
         else if (ev.type === 'retrying') cur.retrying = { attempt: ev.attempt, of: ev.of, until: Date.now() + ev.wait_ms, total: ev.wait_ms };
+        else if (ev.type === 'switching') { cur.retrying = null; cur.switching = true; }
+        else if (ev.type === 'switched') switched = ev;
+        else if (ev.type === 'switch_failed') { cur.switching = false; toast(`${shortName(cur.model_id)} is rate limited. ${ev.message}`); }
         renderCard(id);
       }
     }
@@ -697,8 +753,22 @@ async function runResponse(id) {
     renderCard(id);
   } finally {
     S.running.delete(id);
-    refreshConv();
+    const cur = S.resp.get(id); if (cur) cur.switching = false;
+    if (typeof switched !== 'undefined' && switched) await applySwitch(switched);
+    else refreshConv();
   }
+}
+
+// The server swapped a rate-limited lane to a stand-in model: tell the user, show it, run it.
+async function applySwitch(ev) {
+  toast(`${shortName(ev.from)} was rate limited, so ${shortName(ev.to)} is answering instead. ${shortName(ev.from)} is paused.`, 6000);
+  if (Array.isArray(S.target)) S.target = S.target.map((m) => (m === ev.from ? ev.to : m));
+  if (S.reply?.model_id === ev.from) S.reply = null;
+  try {
+    setConv(await api('GET', `/api/conversations/${S.conv.conversation.id}`));
+    renderHead(); renderThread(); renderComposerMeta();
+  } catch {}
+  runResponse(ev.new_response_id);
 }
 
 async function onThreadClick(e) {
@@ -728,8 +798,24 @@ async function onThreadClick(e) {
         S.target = 'all'; renderComposerMeta(); $('#msg').focus();
         toast('Your next message will build on this answer');
         break;
+      case 'reply': {
+        const part = S.lastSel?.id === id && S.lastSel.text.trim().length > 3 ? S.lastSel.text.trim() : '';
+        S.reply = { id, model_id: r.model_id, quote: part };
+        S.target = [r.model_id]; S.lastSel = null;
+        renderComposerMeta(); $('#msg').focus();
+        break;
+      }
+      case 'jump': {
+        e.preventDefault();
+        const turn = S.conv.turns.find((t) => t.responses.some((x) => x.id === id));
+        if (turn) { S.tabs[turn.id] = id; renderThread(); }
+        const card = document.getElementById(`card-${id}`);
+        card?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        card?.classList.add('flash'); setTimeout(() => card?.classList.remove('flash'), 1400);
+        break;
+      }
       case 'ask':
-        S.target = r.model_id; renderComposerMeta(); $('#msg').focus();
+        S.target = [r.model_id]; renderComposerMeta(); $('#msg').focus();
         toast(`Next message goes only to ${shortName(r.model_id)}`);
         break;
       case 'copy': await navigator.clipboard.writeText(r.content); toast('Copied'); break;
@@ -841,13 +927,15 @@ function openSettings() {
     body: `<label class="small">Max output tokens per answer<input class="input" id="set-max" type="number" min="256" max="32000" step="256" value="${p.max_output_tokens}"></label>
       <p class="muted small" style="margin:-6px 0 0">Reasoning models spend part of this on thinking. Raise it if answers come back empty.</p>
       <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="set-free" ${p.free_only ? 'checked' : ''}> Show free models only by default</label>
+      <label style="display:flex;gap:8px;align-items:flex-start"><input type="checkbox" id="set-auto" ${p.auto_switch !== false ? 'checked' : ''} style="margin-top:4px">
+        <span>When a model is rate limited, switch to the best other model that is answering<br><span class="muted small">You always see when this happens. The busy model is paused, not removed. Turn this off to keep strict comparisons and retry for longer instead.</span></span></label>
       <hr style="border:0;border-top:1px solid var(--border);width:100%">
       <div><b>Delete account</b><p class="muted small">Permanently deletes your account, conversations, responses, and preference history.</p>
       <button class="btn danger" id="del-acct">Delete my account</button></div>`,
     foot: `<button class="btn" data-close>Cancel</button><button class="btn primary" id="set-save">Save</button>`,
   });
   $('#set-save', el).onclick = async () => {
-    try { S.me = await api('PATCH', '/api/me', { max_output_tokens: Number($('#set-max', el).value), free_only: $('#set-free', el).checked }); S.filters.free = S.me.preferences.free_only; close(); toast('Settings saved'); if (S.conv) estimate(); }
+    try { S.me = await api('PATCH', '/api/me', { max_output_tokens: Number($('#set-max', el).value), free_only: $('#set-free', el).checked, auto_switch: $('#set-auto', el).checked }); S.filters.free = S.me.preferences.free_only; close(); toast('Settings saved'); if (S.conv) estimate(); }
     catch (e) { fail(e); }
   };
   $('#del-acct', el).onclick = async () => {

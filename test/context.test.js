@@ -83,3 +83,13 @@ test('model health: busy after a 429, ok after a success, blocked after a 403', 
   assert.equal(healthOf('m', Date.now() + 4 * 60_000), 'unknown'); // busy expires
   recordBlocked('x'); assert.equal(healthOf('x'), 'blocked');
 });
+
+test('a reply tells every recipient which answer (or quoted part) is being replied to', () => {
+  const { db } = seed();
+  const turn = { conversation_id: 'c', created_at: 30, user_message: 'Why that?', reply_to_response: 'a1', reply_quote: 'planner-worker' };
+  const own = buildContext(db, turn, 'A', null, 1000, []).messages[0].content;
+  const other = buildContext(db, turn, 'B', null, 1000, []).messages[0].content;
+  assert.match(own, /replying to this part of your own earlier answer\n+planner-worker/);
+  assert.match(other, /written by A, another model/);
+  assert.doesNotMatch(other, /A says planner-worker/); // only the quoted part is shared
+});
