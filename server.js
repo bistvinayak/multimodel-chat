@@ -5,10 +5,10 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { openDb, tx } from './lib/db.js';
 import { hashPassword, verifyPassword, createSession, destroySession, userFromRequest, parseCookies, sessionCookie } from './lib/auth.js';
-import { getCatalog, getModel } from './lib/models.js';
+import { getCatalog, getModel, qualityScore, NOT_CHAT } from './lib/models.js';
 import { healthOf, recordOk, recordLimited, recordBlocked } from './lib/health.js';
 import { buildContext } from './lib/context.js';
-import { streamCompletion, ModelError } from './lib/openrouter.js';
+import { streamCompletion, ModelError, probeModel } from './lib/openrouter.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 try { process.loadEnvFile(path.join(ROOT, '.env')); } catch {}
@@ -87,8 +87,32 @@ function conversationPayload(conv) {
     turns: turns.map((t) => ({ ...t, target_models: JSON.parse(t.target_models), responses: byTurn.get(t.id) })),
     selections,
     stats,
+    skill_ids: db.prepare('SELECT skill_id FROM conversation_skills WHERE conversation_id=?').all(conv.id).map((x) => x.skill_id),
     max_models: MAX_MODELS,
   };
+}
+
+function skillsFor(convId) {
+  return db.prepare(`SELECT k.name, k.instructions FROM conversation_skills cs JOIN skills k ON k.id=cs.skill_id
+    WHERE cs.conversation_id=? ORDER BY cs.added_at`).all(convId);
+}
+const SKILL_COLS = 'id, name, description, instructions, auto, created_at, updated_at';
+function ownSkill(user, id) {
+  const k = db.prepare(`SELECT ${SKILL_COLS} FROM skills WHERE id=? AND user_id=?`).get(id, user.id);
+  if (!k) throw new HttpError(404, 'Skill not found');
+  return k;
+}
+function cleanSkill(body, partial = false) {
+  const out = {};
+  if (!partial || body.name !== undefined) { out.name = String(body.name || '').trim().slice(0, 60); if (!out.name) throw new HttpError(400, 'Skill name is required'); }
+  if (!partial || body.instructions !== undefined) {
+    out.instructions = String(body.instructions || '').trim();
+    if (!out.instructions) throw new HttpError(400, 'Instructions are required');
+    if (out.instructions.length > 8000) throw new HttpError(400, 'Instructions are limited to 8,000 characters');
+  }
+  if (body.description !== undefined) out.description = String(body.description).trim().slice(0, 200);
+  if (body.auto !== undefined) out.auto = body.auto ? 1 : 0;
+  return out;
 }
 
 function pinsFor(convId, turnId) {
@@ -129,7 +153,7 @@ async function runResponse(user, resp, req, res) {
   const turn = db.prepare('SELECT * FROM turns WHERE id=?').get(resp.turn_id);
   const model = await getModel(resp.model_id);
   const maxOut = maxOutFor(user, model);
-  const { messages } = buildContext(db, turn, resp.model_id, model, maxOut, pinsFor(turn.conversation_id, turn.id));
+  const { messages } = buildContext(db, turn, resp.model_id, model, maxOut, pinsFor(turn.conversation_id, turn.id), skillsFor(turn.conversation_id));
 
   const ctl = new AbortController();
   running.set(resp.id, ctl);
@@ -264,8 +288,67 @@ route('DELETE', '/api/me', async (req, res, { user }) => {
 });
 
 route('GET', '/api/models', async (req, res) => {
-  try { send(res, 200, { models: (await getCatalog()).map((m) => ({ ...m, health: healthOf(m.id) })), max_models: MAX_MODELS }); }
+  try {
+    // Aggregate preference wins (counts only, no content) feed the "best" ranking.
+    const wins = new Map(db.prepare(`SELECT winning_model, COUNT(*) n FROM preference_events
+      WHERE created_at > ? AND event_type IN ('use_as_context','final','continue') GROUP BY winning_model`)
+      .all(now() - 30 * 86400_000).map((r) => [r.winning_model, r.n]));
+    const models = (await getCatalog()).map((m) => {
+      const health = healthOf(m.id);
+      return { ...m, health, chat: !NOT_CHAT.test(m.id), quality: qualityScore(m, { health, wins: wins.get(m.id) || 0 }) };
+    });
+    send(res, 200, { models, max_models: MAX_MODELS });
+  }
   catch (e) { throw new HttpError(502, `Could not load the model catalog: ${e.message}`); }
+});
+
+// ---------- skills ----------
+route('GET', '/api/skills', async (req, res, { user }) => {
+  send(res, 200, db.prepare(`SELECT ${SKILL_COLS} FROM skills WHERE user_id=? ORDER BY name COLLATE NOCASE`).all(user.id));
+});
+route('POST', '/api/skills', async (req, res, { user }) => {
+  const k = cleanSkill(await readJson(req));
+  if (db.prepare('SELECT COUNT(*) n FROM skills WHERE user_id=?').get(user.id).n >= 50) throw new HttpError(400, 'Limit of 50 skills');
+  const id = uid(), t = now();
+  db.prepare('INSERT INTO skills (id, user_id, name, description, instructions, auto, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)')
+    .run(id, user.id, k.name, k.description || '', k.instructions, k.auto || 0, t, t);
+  send(res, 201, ownSkill(user, id));
+});
+route('PATCH', '/api/skills/:id', async (req, res, { user, params }) => {
+  const k = ownSkill(user, params.id);
+  const upd = cleanSkill(await readJson(req), true);
+  const cols = Object.keys(upd);
+  if (cols.length) db.prepare(`UPDATE skills SET ${cols.map((c) => `${c}=?`).join(', ')}, updated_at=? WHERE id=?`).run(...cols.map((c) => upd[c]), now(), k.id);
+  send(res, 200, ownSkill(user, k.id));
+});
+route('DELETE', '/api/skills/:id', async (req, res, { user, params }) => {
+  const k = ownSkill(user, params.id);
+  db.prepare('DELETE FROM skills WHERE id=?').run(k.id);
+  send(res, 200, { ok: true });
+});
+route('PUT', '/api/conversations/:id/skills/:skill', async (req, res, { user, params }) => {
+  const c = ownConversation(user, params.id); const k = ownSkill(user, params.skill);
+  db.prepare('INSERT OR IGNORE INTO conversation_skills (conversation_id, skill_id, added_at) VALUES (?,?,?)').run(c.id, k.id, now());
+  send(res, 200, conversationPayload(c));
+});
+route('DELETE', '/api/conversations/:id/skills/:skill', async (req, res, { user, params }) => {
+  const c = ownConversation(user, params.id);
+  db.prepare('DELETE FROM conversation_skills WHERE conversation_id=? AND skill_id=?').run(c.id, params.skill);
+  send(res, 200, conversationPayload(c));
+});
+
+// Checks up to 8 models in parallel with a tiny request and records their health.
+route('POST', '/api/models/probe', async (req, res) => {
+  const { ids = [] } = await readJson(req);
+  const list = [...new Set(ids.map(String))].slice(0, 8);
+  for (const id of list) if (!(await getModel(id))) throw new HttpError(400, `Unknown model: ${id}`);
+  const results = await Promise.all(list.map((id) => probeModel(API_KEY, id)));
+  for (const r of results) {
+    if (r.health === 'ok') recordOk(r.model);
+    else if (r.health === 'busy') recordLimited(r.model);
+    else if (r.health === 'blocked') recordBlocked(r.model);
+  }
+  send(res, 200, { results });
 });
 
 route('GET', '/api/conversations', async (req, res, { user }) => {
@@ -275,7 +358,7 @@ route('GET', '/api/conversations', async (req, res, { user }) => {
 });
 
 route('POST', '/api/conversations', async (req, res, { user }) => {
-  const { models = [], title } = await readJson(req);
+  const { models = [], title, skill_ids } = await readJson(req);
   const ids = [...new Set(models.map(String))];
   if (!ids.length) throw new HttpError(400, 'Pick at least one model');
   if (ids.length > MAX_MODELS) throw new HttpError(400, `Pick at most ${MAX_MODELS} models`);
@@ -286,6 +369,11 @@ route('POST', '/api/conversations', async (req, res, { user }) => {
       .run(id, user.id, String(title || 'New conversation').slice(0, 120), t, t);
     ids.forEach((m, i) => db.prepare('INSERT INTO conversation_models (conversation_id, model_id, status, position, added_at) VALUES (?,?,?,?,?)')
       .run(id, m, 'active', i, t));
+    // Skills: explicit list from the new-chat screen, otherwise the user's "on for new chats" skills.
+    const skillRows = Array.isArray(skill_ids)
+      ? skill_ids.map((sid) => db.prepare('SELECT id FROM skills WHERE id=? AND user_id=?').get(String(sid), user.id)).filter(Boolean)
+      : db.prepare('SELECT id FROM skills WHERE user_id=? AND auto=1').all(user.id);
+    skillRows.forEach((k, i) => db.prepare('INSERT OR IGNORE INTO conversation_skills (conversation_id, skill_id, added_at) VALUES (?,?,?)').run(id, k.id, t + i));
   });
   send(res, 201, conversationPayload(ownConversation(user, id)));
 });
@@ -346,11 +434,12 @@ route('POST', '/api/conversations/:id/estimate', async (req, res, { user, params
   const { targets } = resolveTargets(c.id, target);
   const draft = { conversation_id: c.id, created_at: now() + 1, user_message: String(message) };
   const pins = pinsFor(c.id, null);
+  const skills = skillsFor(c.id);
   const out = [];
   for (const t of targets) {
     const model = await getModel(t.model_id);
     const maxOut = maxOutFor(user, model);
-    const { promptTokensEst, droppedTurns } = buildContext(db, draft, t.model_id, model, maxOut, pins);
+    const { promptTokensEst, droppedTurns } = buildContext(db, draft, t.model_id, model, maxOut, pins, skills);
     const min = model ? promptTokensEst * model.prompt_price : null;
     const max = model ? min + maxOut * model.completion_price : null;
     out.push({ model_id: t.model_id, prompt_tokens: promptTokensEst, max_output: maxOut, free: !!model?.free, cost_min: min, cost_max: max, dropped_turns: droppedTurns });
@@ -391,7 +480,6 @@ route('POST', '/api/responses/:id/run', async (req, res, { user, params }) => {
 
 // Suggest healthy models to swap in for a busy/failed lane. Never applied automatically:
 // silently swapping a model would invalidate the comparison.
-const NOT_CHAT = /(safety|guard|moderation|embed|rerank)/i;
 route('GET', '/api/responses/:id/alternatives', async (req, res, { user, params }) => {
   const r = ownResponse(user, params.id);
   const inConv = new Set(db.prepare(`SELECT model_id FROM conversation_models WHERE conversation_id=? AND status<>'removed'`)

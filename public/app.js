@@ -8,6 +8,7 @@ const S = {
   me: null,
   models: [], modelMap: new Map(), maxModels: 3, modelsError: null,
   convs: [],
+  skills: [],
   conv: null, resp: new Map(),
   running: new Map(),            // response id -> true while streaming in this tab
   tabs: {},                      // turn id -> response id shown on mobile
@@ -36,7 +37,12 @@ const ERROR_HINT = {
 async function api(method, url, body) {
   const r = await fetch(url, { method, headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
   const data = await r.json().catch(() => null);
-  if (r.status === 401 && !url.startsWith('/api/login') && !url.startsWith('/api/signup')) { S.me = null; renderAuth('login'); throw new Error('Please sign in'); }
+  if (r.status === 401 && !url.startsWith('/api/login') && !url.startsWith('/api/signup')) {
+    const wasSignedIn = !!S.me;
+    S.me = null; S.conv = null;
+    renderAuth('login', wasSignedIn ? 'Your session ended. Sign in again and you will be back in this conversation, with any unsent message kept.' : '');
+    throw new Error('Please sign in');
+  }
   if (!r.ok) throw new Error(data?.error || `${r.status} ${r.statusText}`);
   return data;
 }
@@ -62,8 +68,10 @@ document.addEventListener('selectionchange', () => {
 });
 
 // ---------- auth ----------
-function renderAuth(mode) {
+function renderAuth(mode, notice = '') {
+  $('#modal-root').innerHTML = '';
   app.innerHTML = `<div class="auth"><div class="auth-card">
+    ${notice ? `<div class="notice">${esc(notice)}</div>` : ''}
     <h1>${mode === 'login' ? 'Welcome back' : 'Create your account'}</h1>
     <div class="muted">One conversation. Multiple models. Pick the best response as you go.</div>
     <form id="auth-form">
@@ -76,7 +84,7 @@ function renderAuth(mode) {
     <p class="small muted" style="margin:14px 0 0">${mode === 'login' ? 'No account yet?' : 'Already have an account?'}
       <a href="#" id="auth-switch">${mode === 'login' ? 'Create one' : 'Sign in'}</a></p>
   </div></div>`;
-  $('#auth-switch').onclick = (e) => { e.preventDefault(); renderAuth(mode === 'login' ? 'signup' : 'login'); };
+  $('#auth-switch').onclick = (e) => { e.preventDefault(); renderAuth(mode === 'login' ? 'signup' : 'login', notice); };
   $('#auth-form').onsubmit = async (e) => {
     e.preventDefault();
     const fd = Object.fromEntries(new FormData(e.target));
@@ -90,7 +98,7 @@ async function startApp() {
   S.filters.free = S.me.preferences.free_only !== false;
   renderShell();
   loadModels();
-  await loadConvs();
+  await Promise.all([loadConvs(), loadSkills()]);
   route();
 }
 
@@ -102,6 +110,7 @@ function renderShell() {
         <button class="btn primary" id="new-btn">+ New conversation</button>
       </div>
       <nav class="conv-list" id="conv-list"></nav>
+      <section class="skills" id="skills"></section>
       <div class="sidebar-foot"><span class="who" title="${esc(S.me.email)}">${esc(S.me.name)}</span>
         <button class="btn small ghost" id="settings-btn">Settings</button>
         <button class="btn small ghost" id="logout-btn">Sign out</button></div>
@@ -129,6 +138,100 @@ async function loadConvs() {
   S.convs = await api('GET', '/api/conversations');
   renderSidebar();
 }
+async function loadSkills() {
+  try { S.skills = await api('GET', '/api/skills'); } catch { S.skills = []; }
+  renderSkills();
+}
+
+function renderSkills() {
+  const el = $('#skills'); if (!el) return;
+  const inConv = !!S.conv;
+  const on = new Set(inConv ? S.conv.skill_ids : newSkillIds());
+  el.innerHTML = `<div class="skills-head"><b style="flex:1">Skills</b>
+      <button class="btn small ghost" id="skill-tpl" title="Add from templates">Templates</button>
+      <button class="btn small ghost" id="skill-new" title="Create a skill">+ New</button></div>
+    ${S.skills.length ? `<div class="muted small skills-sub">Checked skills apply to ${inConv ? 'this chat' : 'the new chat'}</div>` : ''}
+    <div class="skills-list">${S.skills.length ? S.skills.map((k) => `<div class="skill-row ${on.has(k.id) ? 'on' : ''}" title="${esc(k.description || k.instructions.slice(0, 160))}">
+        <label><input type="checkbox" data-skill="${k.id}" ${on.has(k.id) ? 'checked' : ''}> <span>${esc(k.name)}</span></label>
+        ${k.auto ? '<span class="tag" title="Switched on for every new chat">auto</span>' : ''}
+        <button class="btn small ghost" data-edit-skill="${k.id}" title="Edit">✎</button></div>`).join('')
+      : '<div class="muted small">Reusable instructions every model follows, like "Answer concisely" or "Act as a senior PM". <a href="#" id="skill-tpl2">Start from a template</a>.</div>'}</div>`;
+  $('#skill-new').onclick = () => openSkillEditor();
+  $('#skill-tpl').onclick = openSkillTemplates;
+  const t2 = $('#skill-tpl2'); if (t2) t2.onclick = (e) => { e.preventDefault(); openSkillTemplates(); };
+  el.onchange = async (e) => {
+    const id = e.target.dataset.skill; if (!id) return;
+    if (!S.conv) {
+      const cur = new Set(newSkillIds());
+      e.target.checked ? cur.add(id) : cur.delete(id);
+      newState.skills = [...cur]; renderSkills(); return;
+    }
+    try {
+      setConv(await api(e.target.checked ? 'PUT' : 'DELETE', `/api/conversations/${S.conv.conversation.id}/skills/${id}`));
+      renderSkills(); renderHead(); estimate();
+      toast(e.target.checked ? 'Skill on. Every model follows it from your next message.' : 'Skill off for this chat');
+    } catch (err) { fail(err); e.target.checked = !e.target.checked; }
+  };
+  el.onclick = (e) => { const b = e.target.closest('[data-edit-skill]'); if (b) openSkillEditor(S.skills.find((k) => k.id === b.dataset.editSkill)); };
+}
+
+const SKILL_TEMPLATES = [
+  { name: 'Concise answers', description: 'Short, direct, no preamble', instructions: 'Lead with the answer. Keep it under about 150 words unless the user asks for depth. Use short bullet points for lists. No preamble, no closing summary.' },
+  { name: 'Plain writing', description: 'Natural human tone, no AI tics', instructions: 'Write in plain, natural language. Use short sentences and simple words. Never use em dashes. Avoid filler openers like "Great question" and avoid restating everything at the end.' },
+  { name: 'Senior PM reviewer', description: 'Product thinking: users, metrics, trade-offs', instructions: 'Act as a senior product manager. Frame answers around the user problem, who it affects, success metrics, trade-offs, and risks. Call out assumptions. End with one recommended next step.' },
+  { name: 'Code reviewer', description: 'Correctness first, then security and clarity', instructions: 'When code is involved, review for correctness first, then security, then readability and performance. Quote the exact lines you are commenting on and show a corrected version. Say explicitly if you found no real problems.' },
+  { name: 'Facts vs. assumptions', description: 'Flag uncertainty instead of guessing', instructions: 'Separate facts from assumptions and opinions. State how confident you are in key claims. If you do not know something or it may be out of date, say so instead of guessing.' },
+  { name: 'Explain simply', description: 'Beginner-friendly explanations', instructions: 'Explain as you would to a smart newcomer. Define any jargon the first time you use it. Use one concrete everyday analogy. Build from the basics to the answer.' },
+  { name: 'Structured comparison', description: 'Tables for options and trade-offs', instructions: 'When comparing options, start with a one-line recommendation, then a table with the options as rows and the key criteria as columns, then a short note on when you would choose differently.' },
+];
+
+function openSkillTemplates() {
+  const have = new Set(S.skills.map((k) => k.name.toLowerCase()));
+  const { el } = modal({
+    title: 'Skill templates',
+    body: `<p class="muted small" style="margin:0">Add a template, then edit it however you like. Skills are sent to every model in a chat where they are switched on.</p>` +
+      SKILL_TEMPLATES.map((t, i) => `<div class="out-item"><div style="display:flex;gap:8px;align-items:center"><b style="flex:1">${esc(t.name)}</b>
+        ${have.has(t.name.toLowerCase()) ? '<span class="badge completed">Added</span>' : `<button class="btn small primary" data-tpl="${i}">Add</button>`}</div>
+        <div class="small muted">${esc(t.description)}</div><div class="small">${esc(t.instructions)}</div></div>`).join(''),
+  });
+  el.addEventListener('click', async (e) => {
+    const b = e.target.closest('[data-tpl]'); if (!b) return;
+    b.disabled = true;
+    try { await api('POST', '/api/skills', SKILL_TEMPLATES[Number(b.dataset.tpl)]); await loadSkills(); b.outerHTML = '<span class="badge completed">Added</span>'; toast('Skill added. Switch it on in the sidebar.'); }
+    catch (err) { fail(err); b.disabled = false; }
+  });
+}
+
+function openSkillEditor(skill) {
+  const { el, close } = modal({
+    title: skill ? 'Edit skill' : 'New skill',
+    body: `<label class="small">Name<input class="input" id="sk-name" maxlength="60" value="${esc(skill?.name || '')}" placeholder="e.g. Senior PM reviewer"></label>
+      <label class="small">Short description <span class="muted">(optional)</span><input class="input" id="sk-desc" maxlength="200" value="${esc(skill?.description || '')}"></label>
+      <label class="small">Instructions every model should follow<textarea class="textarea" id="sk-ins" rows="8" maxlength="8000" placeholder="e.g. Act as a senior product manager. Frame answers around user problems, metrics and trade-offs.">${esc(skill?.instructions || '')}</textarea></label>
+      <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="sk-auto" ${skill?.auto ? 'checked' : ''}> Switch on automatically for new chats</label>
+      <div class="err-text" id="sk-err"></div>`,
+    foot: `${skill ? '<button class="btn danger" id="sk-del" style="margin-right:auto">Delete</button>' : ''}<button class="btn" data-close>Cancel</button><button class="btn primary" id="sk-save">Save skill</button>`,
+  });
+  $('#sk-save', el).onclick = async () => {
+    const body = { name: $('#sk-name', el).value, description: $('#sk-desc', el).value, instructions: $('#sk-ins', el).value, auto: $('#sk-auto', el).checked };
+    try {
+      const saved = await api(skill ? 'PATCH' : 'POST', skill ? `/api/skills/${skill.id}` : '/api/skills', body);
+      close(); await loadSkills();
+      if (!skill && S.conv) { setConv(await api('PUT', `/api/conversations/${S.conv.conversation.id}/skills/${saved.id}`)); renderSkills(); renderHead(); estimate(); toast('Skill created and switched on for this chat'); }
+      else toast('Skill saved');
+    } catch (e) { $('#sk-err', el).textContent = e.message; }
+  };
+  const del = $('#sk-del', el);
+  if (del) del.onclick = async () => {
+    if (!confirm(`Delete the skill "${skill.name}"? It will be switched off in every chat.`)) return;
+    try {
+      await api('DELETE', `/api/skills/${skill.id}`); close(); await loadSkills();
+      if (S.conv) { setConv(await api('GET', `/api/conversations/${S.conv.conversation.id}`)); renderHead(); renderSkills(); }
+      toast('Skill deleted');
+    } catch (e) { fail(e); }
+  };
+}
+
 function renderSidebar() {
   const el = $('#conv-list'); if (!el) return;
   const cur = S.conv?.conversation.id;
@@ -156,12 +259,31 @@ function route() {
 window.addEventListener('hashchange', () => S.me && route());
 
 // ---------- model picker ----------
-const FILTERS = [['free', 'Free only'], ['fast', 'Fast'], ['reasoning', 'Best reasoning'], ['coding', 'Coding'], ['popular', 'Popular']];
+const FILTERS = [['best', '★ Free & best'], ['free', 'Free only'], ['fast', 'Fast'], ['reasoning', 'Best reasoning'], ['coding', 'Coding'], ['popular', 'Popular']];
+// Free chat models ranked by the server's estimated quality score (size, reasoning, context,
+// recency, live health and how often people here pick them).
+function bestFree() {
+  return S.models.filter((m) => m.free && m.chat && m.health !== 'blocked').sort((a, b) => b.quality - a.quality);
+}
 function filteredModels(exclude = []) {
   const f = S.filters, q = f.q.trim().toLowerCase();
-  return S.models.filter((m) => !exclude.includes(m.id)
+  const base = f.best ? bestFree() : S.models;
+  return base.filter((m) => !exclude.includes(m.id)
     && (!q || `${m.id} ${m.name}`.toLowerCase().includes(q))
-    && FILTERS.every(([k]) => !f[k] || m.tags.includes(k)));
+    && FILTERS.every(([k]) => k === 'best' || !f[k] || (f.best && k === 'free') || m.tags.includes(k)));
+}
+function pickBestFree(n, exclude = []) {
+  const picked = [], vendors = new Set();
+  const pool = bestFree().filter((m) => !exclude.includes(m.id));
+  // Prefer healthy models from different vendors, so one busy provider can't take out every lane.
+  const vendorOk = (m) => !vendors.has(m.id.split('/')[0]);
+  for (const pass of [(m) => m.health === 'ok' && vendorOk(m), (m) => m.health === 'ok', (m) => m.health !== 'busy' && vendorOk(m), (m) => m.health !== 'busy', () => true]) {
+    for (const m of pool) {
+      if (picked.length >= n) break;
+      if (!picked.includes(m.id) && pass(m)) { picked.push(m.id); vendors.add(m.id.split('/')[0]); }
+    }
+  }
+  return picked;
 }
 function priceLabel(m) {
   if (m.free) return '<span class="tag free">FREE</span>';
@@ -186,24 +308,28 @@ function mountPicker(el, opts) {
     if (!S.models.length) { list.innerHTML = '<div class="muted" style="padding:14px">Loading models…</div>'; return; }
     const rows = filteredModels(opts.exclude || []);
     const full = sel.length >= opts.max;
-    list.innerHTML = rows.length ? rows.slice(0, 200).map((m) => {
+    const rankOf = S.filters.best ? new Map(bestFree().map((m, i) => [m.id, i + 1])) : null;
+    list.innerHTML = (S.filters.best ? '<div class="muted small best-note">Free models ranked by an estimated score: size, reasoning support, context window, recency, whether they are answering right now, and how often people here pick them.</div>' : '')
+      + (rows.length ? rows.slice(0, 200).map((m) => {
       const on = sel.includes(m.id), dis = !on && full;
       return `<label class="model-row ${dis ? 'disabled' : ''}" data-id="${esc(m.id)}">
         <input type="checkbox" ${on ? 'checked' : ''} ${dis ? 'disabled' : ''}>
-        <div><div class="model-name">${esc(m.name)}${m.health === 'busy' ? ' <span class="tag busy">busy now</span>' : m.health === 'blocked' ? ' <span class="tag busy">unavailable</span>' : m.health === 'ok' ? ' <span class="tag ok">responding</span>' : ''}</div><div class="model-id">${esc(m.id)}</div>
+        <div><div class="model-name">${rankOf?.get(m.id) <= 10 ? `<span class="rank">#${rankOf.get(m.id)}</span> ` : ''}${esc(m.name)}${m.health === 'busy' ? ' <span class="tag busy">busy now</span>' : m.health === 'blocked' ? ' <span class="tag busy">unavailable</span>' : m.health === 'ok' ? ' <span class="tag ok">responding</span>' : ''}</div><div class="model-id">${esc(m.id)}</div>
           <div>${m.tags.filter((t) => t !== 'free').map((t) => `<span class="tag">${t}</span>`).join('')}${m.context_length ? `<span class="tag">${fmtTokens(m.context_length)} context</span>` : ''}</div>
           <div class="model-desc">${esc(m.description)}</div></div>
         <div class="price">${priceLabel(m)}</div></label>`;
     }).join('') + (rows.length > 200 ? `<div class="muted small" style="padding:10px">Showing 200 of ${rows.length}. Search to narrow down.</div>` : '')
-      : '<div class="muted" style="padding:14px">No models match these filters.</div>';
+      : '<div class="muted" style="padding:14px">No models match these filters.</div>');
   };
   el._redraw = draw;
+  el._setSelected = (ids) => { opts.selected = ids.slice(0, opts.max); opts.onChange?.(opts.selected); draw(); };
   $('[data-q]', el).oninput = debounce((e) => { S.filters.q = e.target.value; draw(); }, 120);
   el.addEventListener('click', (e) => {
     const f = e.target.closest('[data-f]');
     if (f) {
       const k = f.dataset.f; S.filters[k] = !S.filters[k]; f.classList.toggle('on', S.filters[k]);
       if (k === 'free') api('PATCH', '/api/me', { free_only: S.filters.free }).then((u) => (S.me = u)).catch(() => {});
+      if (k === 'best' && S.filters.best) $('[data-list]', el).scrollTop = 0;
       draw(); return;
     }
     const un = e.target.closest('[data-unsel]');
@@ -220,13 +346,15 @@ function mountPicker(el, opts) {
 }
 
 // ---------- new conversation ----------
-let newState = { text: '', selected: [] };
+let newState = { text: '', selected: [], skills: null };
+const newSkillIds = () => newState.skills ?? S.skills.filter((k) => k.auto).map((k) => k.id);
 function renderNew() {
-  S.conv = null; S.resp = new Map(); renderSidebar();
+  S.conv = null; S.resp = new Map(); renderSidebar(); renderSkills();
   $('#main').innerHTML = `${mobileTop('New conversation')}<div class="new-wrap"><div class="new-inner">
     <h1>What would you like help with?</h1>
     <textarea class="textarea" id="new-text" rows="4" placeholder="Describe your task. Every model you pick will answer, and the conversation keeps its context.">${esc(newState.text)}</textarea>
-    <div><div class="section-title">Choose models <span class="muted small">One model is a normal chat. Two or three gives you a side-by-side comparison on every turn.</span></div>
+    <div><div class="section-title" style="flex-wrap:wrap">Choose models <span class="muted small" style="flex:1">One model is a normal chat. Two or three gives you a side-by-side comparison on every turn.</span>
+        <button class="btn small" id="best-btn" title="Picks the top-ranked free models, from different vendors where possible">★ Pick ${S.maxModels} best free models</button></div>
       <div id="new-picker"></div></div>
     <div style="display:flex;gap:10px;justify-content:flex-end;align-items:center"><span class="err-text" id="new-err"></span>
       <button class="btn primary" id="start-btn">Start conversation</button></div>
@@ -234,15 +362,30 @@ function renderNew() {
   $('#new-text').oninput = (e) => { newState.text = e.target.value; };
   $('#new-text').onkeydown = (e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) $('#start-btn').click(); };
   mountPicker($('#new-picker'), { selected: newState.selected, max: S.maxModels, onChange: (s) => (newState.selected = s) });
+  $('#best-btn').onclick = async () => {
+    const btn = $('#best-btn'); const label = btn.textContent;
+    btn.disabled = true; btn.textContent = 'Checking which free models are answering…';
+    try {
+      await loadModels();
+      // Ask the top candidates a tiny question first, so we never pick a model that is busy or gated.
+      const candidates = bestFree().filter((m) => m.health !== 'busy').slice(0, 8).map((m) => m.id);
+      if (candidates.length) await api('POST', '/api/models/probe', { ids: candidates });
+      await loadModels();
+    } catch (e) { fail(e); } finally { btn.disabled = false; btn.textContent = label; }
+    const ids = pickBestFree(S.maxModels);
+    if (!ids.length) return toast('No free models are available right now');
+    $('#new-picker')._setSelected(ids);
+    toast(`Picked: ${ids.map(shortName).join(', ')}`);
+  };
   $('#start-btn').onclick = async () => {
     const err = $('#new-err');
     if (!newState.selected.length) { err.textContent = 'Pick at least one model.'; return; }
     const btn = $('#start-btn'); btn.disabled = true; err.textContent = '';
     try {
-      let payload = await api('POST', '/api/conversations', { models: newState.selected });
+      let payload = await api('POST', '/api/conversations', { models: newState.selected, skill_ids: newSkillIds() });
       const text = newState.text.trim();
       if (text) payload = await api('POST', `/api/conversations/${payload.conversation.id}/messages`, { message: text, target: 'all' });
-      newState = { text: '', selected: [] };
+      newState = { text: '', selected: [], skills: null };
       S.target = 'all';
       setConv(payload);
       history.replaceState(null, '', `#/c/${payload.conversation.id}`);
@@ -279,7 +422,7 @@ const refreshConv = debounce(async () => {
 }, 250);
 
 function renderConv() {
-  renderSidebar();
+  renderSidebar(); renderSkills();
   $('#main').innerHTML = `${mobileTop(S.conv.conversation.title)}
     <header class="conv-head" id="conv-head"></header>
     <div class="thread" id="thread"></div>
@@ -292,7 +435,12 @@ function renderConv() {
     </div></div>`;
   renderHead(); renderThread(); renderComposerMeta();
   const msg = $('#msg');
-  msg.oninput = () => { msg.style.height = 'auto'; msg.style.height = Math.min(msg.scrollHeight, 240) + 'px'; estimate(); };
+  const draftKey = `draft:${S.conv.conversation.id}`;
+  try { msg.value = sessionStorage.getItem(draftKey) || ''; } catch {}
+  msg.oninput = () => {
+    msg.style.height = 'auto'; msg.style.height = Math.min(msg.scrollHeight, 240) + 'px'; estimate();
+    try { sessionStorage.setItem(draftKey, msg.value); } catch {}
+  };
   msg.onkeydown = (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendMessage(); } };
   $('#send-btn').onclick = sendMessage;
   $('#target').onchange = (e) => { S.target = e.target.value; estimate(); };
@@ -314,6 +462,7 @@ function renderHead() {
         <button class="btn small ghost" data-lane="${m.status === 'paused' ? 'resume' : 'pause'}" data-model="${esc(m.model_id)}" title="${m.status === 'paused' ? 'Resume' : 'Pause'}">${m.status === 'paused' ? '▶' : '⏸'}</button>
         <button class="btn small ghost" data-lane="remove" data-model="${esc(m.model_id)}" title="Remove from conversation">✕</button></span>`).join('')}
       <button class="btn small" id="add-model" ${active >= S.conv.max_models ? `disabled title="Max ${S.conv.max_models} active models"` : ''}>+ Add model</button></div>
+    ${S.conv.skill_ids?.length ? `<div class="skills-on small">Skills on: ${S.conv.skill_ids.map((id) => S.skills.find((k) => k.id === id)).filter(Boolean).map((k) => `<span class="tag">${esc(k.name)}</span>`).join('')}</div>` : ''}
     <div class="stats"><span>Conversation cost <b>${fmtCost(stats.cost)}</b></span><span>Model calls <b>${stats.calls}</b></span>
       <span>Messages <b>${stats.messages}</b></span><span>Tokens <b>${fmtTokens(stats.tokens)}</b></span></div>
     ${canonical.length ? `<details class="context-panel" ${S.ctxOpen ? 'open' : ''} ontoggle="window.__ctxOpen=this.open"><summary>Shared context: ${canonical.length} selected decision${canonical.length > 1 ? 's' : ''} sent to every model</summary>
@@ -502,6 +651,7 @@ async function sendMessage() {
   try {
     const payload = await api('POST', `/api/conversations/${S.conv.conversation.id}/messages`, { message: text, target: S.target });
     msg.value = ''; msg.style.height = 'auto';
+    try { sessionStorage.removeItem(`draft:${S.conv.conversation.id}`); } catch {}
     setConv(payload); renderHead(); renderThread(); renderComposerMeta(); loadConvs();
     const th = $('#thread'); th.scrollTop = th.scrollHeight;
     startPending();
