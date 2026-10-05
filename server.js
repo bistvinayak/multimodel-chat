@@ -1169,7 +1169,9 @@ setInterval(async () => {
   }
 }, 60_000).unref();
 
-const watchPayload = (w) => ({ ...w, history: db.prepare('SELECT checked_at, price, ok, error FROM watch_checks WHERE watch_id=? ORDER BY checked_at DESC LIMIT 60').all(w.id).reverse() });
+const watchPayload = (w) => ({ ...w,
+  read_by: db.prepare('SELECT method, model FROM watch_checks WHERE watch_id=? AND ok=1 ORDER BY checked_at DESC LIMIT 1').get(w.id) || null,
+  history: db.prepare('SELECT checked_at, price, ok, error FROM watch_checks WHERE watch_id=? ORDER BY checked_at DESC LIMIT 60').all(w.id).reverse() });
 const ownWatch = (user, id) => { const w = db.prepare('SELECT * FROM watches WHERE id=? AND user_id=?').get(id, user.id); if (!w) throw new HttpError(404, 'Watch not found'); return w; };
 function watchSettings(body, base = {}) {
   const out = {};

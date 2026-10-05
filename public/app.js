@@ -1833,7 +1833,7 @@ function watchCardHTML(w) {
       <div class="muted small">Lowest ${money(w.lowest_price, w.currency)}${w.in_stock === 0 ? ' · ⚠ out of stock' : ''}</div></div>
       <div class="spark" id="spark-${w.id}"></div></div>
     ${w.last_error ? `<div class="err-box small">⚠ ${esc(w.last_error)}</div>` : ''}
-    <div class="muted small" title="${w.method === 'ai' ? 'Price read by AI' : 'Price from product data'}">Checked ${ago(w.last_checked_at)} · ${esc(freqLabel(w.interval_minutes))}</div>
+    <div class="muted small">Checked ${ago(w.last_checked_at)} · ${esc(freqLabel(w.interval_minutes))} · ${w.read_by?.method === 'ai' ? `price read by ${esc(shortName(w.read_by.model || 'AI'))}` : 'price from product data (no AI)'}</div>
     <div class="card-actions">
       <button class="btn small" data-w-act="check">Check now</button>
       <button class="btn small ghost" data-w-act="ask" title="Ask the models whether this is a good deal">💬 Ask</button>
@@ -1926,6 +1926,7 @@ function renderAgents() {
       <div class="seg ag-tabs" role="tablist">${[['trackers', 'Agents'], ['prices', 'Prices'], ['alerts', 'Alerts']].map(([k, l]) => `<button data-tab="${k}" role="tab">${l}${k === 'alerts' ? '<span class="tab-dot" id="tab-dot" hidden></span>' : ''}</button>`).join('')}</div></header>
     <div class="ag-new"><span class="ag-new-icon">＋</span><input class="input" id="ag-req" placeholder="New agent: describe what to keep an eye on…" autocomplete="off"><button class="btn primary" id="ag-plan">Set up</button>
       <div class="ag-suggest" id="ag-suggest" hidden>${AGENT_EXAMPLES.map((x, i) => `<button data-ex="${i}">${esc(x)}</button>`).join('')}</div></div>
+    <div class="ag-quick"><span class="muted small">Or set one up yourself:</span>${AGENT_TYPES.map((t) => `<button class="chip" data-new="${t.type}">${t.icon} ${t.label}</button>`).join('')}</div>
     <div id="ag-body"><div class="muted">Loading…</div></div></div></div>`;
   const req = $('#ag-req'), sug = $('#ag-suggest');
   const showSug = () => { sug.hidden = !!req.value; };
@@ -1934,6 +1935,7 @@ function renderAgents() {
   req.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); planAgent(); } if (e.key === 'Escape') req.blur(); };
   sug.onmousedown = (e) => { const b = e.target.closest('[data-ex]'); if (b) { e.preventDefault(); req.value = AGENT_EXAMPLES[b.dataset.ex]; sug.hidden = true; req.focus(); } };
   $('#ag-plan').onclick = planAgent;
+  $('.ag-quick').onclick = (e) => { const b = e.target.closest('[data-new]'); if (b) newAgentOfType(b.dataset.new); };
   $('.ag-tabs').onclick = (e) => { const b = e.target.closest('[data-tab]'); if (b) { S.agentTab = b.dataset.tab; drawAgents(); if (b.dataset.tab === 'alerts') markAlertsRead(); } };
   if (S.agentPrefill) { req.value = S.agentPrefill; S.agentPrefill = null; planAgent(); }
   loadAgents();
@@ -1971,7 +1973,8 @@ function drawAgents() {
     watches.forEach(drawSpark);
   } else {
     body.innerHTML = monitors.length ? `<div class="ag-list">${monitors.map(agentRowHTML).join('')}</div>`
-      : emptyState('📡', 'No agents yet', 'Describe what you want above, for example new AI PM roles, news about a company, or a page to watch.');
+      : `<div class="ag-types">${AGENT_TYPES.map((t) => `<button class="ag-type" data-new="${t.type}"><span class="ag-type-icon">${t.icon}</span><b>${t.label}</b><span class="muted small">${t.desc}</span></button>`).join('')}</div>`;
+    body.querySelectorAll('.ag-type').forEach((b) => { b.onclick = () => newAgentOfType(b.dataset.new); });
     if (S.agentFocus) { document.getElementById(`mon-${S.agentFocus}`)?.scrollIntoView({ block: 'start' }); S.agentFocus = null; }
   }
 }
@@ -2031,6 +2034,23 @@ function openMenu(anchor, items) {
   });
 }
 
+const AGENT_TYPES = [
+  { type: 'jobs', icon: '💼', label: 'Job openings', desc: 'New roles matching a title, location and level, from AI and tech company career pages and job boards.' },
+  { type: 'news', icon: '📰', label: 'News on a topic', desc: 'New articles about a company, product or topic, screened so only real matches reach you.' },
+  { type: 'price', icon: '🏷', label: 'Price drop', desc: 'A product link: alert when it drops below your price, checked up to 24 times a day.' },
+  { type: 'page', icon: '📄', label: 'Page change', desc: 'Any web page: alert when it changes, or when it starts saying something, such as "applications are open".' },
+];
+// Manual setup: an empty plan of the chosen type, no AI planning step.
+async function newAgentOfType(type) {
+  if (type === 'price') return openWatchModal();
+  try { catalog = catalog || await api('GET', '/api/agents/catalog'); } catch (e) { return fail(e); }
+  const p = { type, name: '', query: '', location: '', exclude: '', criteria: '', url: '', interval_minutes: type === 'news' ? 360 : type === 'jobs' ? 720 : 288,
+    companies: type === 'jobs' ? catalog.company_presets : [], summary: AGENT_TYPES.find((t) => t.type === type).desc };
+  const { el, close } = modal({ title: `New ${AGENT_TYPES.find((t) => t.type === type).label.toLowerCase()} agent`, body: planCardHTML(p) });
+  wirePlanCard(el, p, () => close());
+  setTimeout(() => el.querySelector('[data-pf="query"], [data-pf="url"]')?.focus(), 0);
+}
+
 async function planAgent() {
   const input = $('#ag-req'); const req = input.value.trim();
   if (req.length < 8) { input.focus(); return toast('Describe what to keep an eye on'); }
@@ -2050,12 +2070,12 @@ function planCardHTML(p) {
   const ints = INTERVALS.map(([v, l]) => `<option value="${v}" ${v === p.interval_minutes ? 'selected' : ''}>${l}</option>`).join('');
   let fields = '';
   if (p.type === 'price') fields = field('url', 'Product link', p.url) + `<div class="pf-row">${field('target_price', 'Alert at or below', p.target_price, 'e.g. 180')}</div>`;
-  if (p.type === 'jobs' || p.type === 'news') fields = field('query', p.type === 'jobs' ? 'Roles (comma-separated, include synonyms)' : 'Topics (comma-separated)', p.query)
+  if (p.type === 'jobs' || p.type === 'news') fields = field('query', p.type === 'jobs' ? 'Roles (comma-separated, include synonyms)' : 'Topics (comma-separated)', p.query, p.type === 'jobs' ? 'AI Product Manager, AI PM, Associate Product Manager' : 'OpenAI launch, Anthropic Claude, GPT-6')
     + (p.type === 'jobs' ? `<div class="pf-row">${field('location', 'Location (optional)', p.location, 'London, Remote')}${field('exclude', 'Leave out titles with', p.exclude, 'Senior, Director')}</div>` : '')
     + field('criteria', 'What counts (the AI screener uses this)', p.criteria, 'e.g. entry-level PM roles focused on AI products')
     + `<div class="small"><b>Sources</b><div class="eval-crit">${catalog.sources.filter((x) => x.kind === p.type).map((x) => `<label class="chk"><input type="checkbox" data-src="${x.key}" ${p.type === 'news' || x.key !== 'companies' || p.companies?.length ? 'checked' : ''}> ${esc(x.label)}${x.key === 'companies' ? ` (${catalog.company_presets.length} AI & tech companies)` : ''}</label>`).join('')}</div></div>`;
   if (p.type === 'page') fields = field('url', 'Page link', p.url) + field('criteria', 'Alert when the page says (leave empty to alert on any change)', p.criteria, 'e.g. applications are open');
-  return `<div class="plan-card"><div class="plan-head"><span class="badge">${KIND_LABEL[p.type]}</span> <input class="input plan-name" data-pf="name" value="${esc(p.name || '')}" aria-label="Name"></div>
+  return `<div class="plan-card"><div class="plan-head"><span class="badge">${KIND_LABEL[p.type]}</span> <input class="input plan-name" data-pf="name" value="${esc(p.name || '')}" aria-label="Name" placeholder="Name (optional)"></div>
     ${p.summary ? `<div class="small muted">${esc(p.summary)}</div>` : ''}
     ${fields}
     <label class="small">How often<select class="select" data-pf="interval_minutes">${ints}</select></label>

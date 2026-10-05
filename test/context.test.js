@@ -212,3 +212,12 @@ test('fake-IP range is allowed only through DNS, never as a literal address', as
   await assert.rejects(assertPublicUrl('http://127.0.0.1/'), /Private or local/);
   await assert.rejects(assertPublicUrl('http://169.254.169.254/latest'), /Private or local/);
 });
+
+import { jobMatchTerms } from '../lib/monitor.js';
+test('job matching is role-based: topic words are dropped and abbreviations expand', () => {
+  const t = jobMatchTerms('AI Product Manager, Graduate AI PM, MLE');
+  assert.ok(t.includes('product manager'));            // "AI Product Manager" matches "Product Manager, Learning"
+  assert.ok(t.includes('graduate product manager'));    // PM expands
+  assert.ok(t.includes('machine learning engineer'));   // MLE expands
+  assert.ok(!t.includes('manager') && !t.includes('engineer')); // never a lone generic word
+});
