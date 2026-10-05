@@ -16,7 +16,9 @@ npm start                  # http://127.0.0.1:3210
 npm test                   # context-manager and error-mapping tests
 ```
 
-Create an account in the browser, pick models, and start chatting. Data lives in `data/app.db` (SQLite, gitignored).
+Create an account in the browser, pick models, and start chatting. Data lives in `data/app.db` (SQLite, gitignored). `OPENROUTER_API_KEY` is optional if each user adds their own key in Settings.
+
+Personal keys are encrypted with a master key from `APP_SECRET` (64 hex characters), or one generated into `data/secret.key`. Back that file up with the database: without it, saved keys can't be decrypted and users must add them again.
 
 ## What's in V1
 
@@ -36,6 +38,8 @@ Create an account in the browser, pick models, and start chatting. Data lives in
 | Model lanes | Add, pause, resume or remove models mid-conversation. Free users get at most 3 active models (`MAX_MODELS`). History stays visible after removal. |
 | Cost | Cost estimate before sending, real cost, tokens and latency per answer, and running totals per conversation. |
 | Convenience | AI-written chat titles. Search across titles, your messages and answers (press `/`). New chats start with the models you used last. Code blocks get syntax highlighting and a Copy button. Cmd/Ctrl+K starts a new chat. |
+| Compare models | A page (sidebar: **Compare models**) that puts up to 4 models side by side. Catalog facts: price, context window, max answer length, strengths, estimated rank among free models, and whether each is answering right now. Your own data: answers, how often you picked each one when it was shown next to others, response time, time to first token, answer length, cost, and failure rate. The best value in each row is highlighted. It also shows head-to-head records, a personal leaderboard, and a button to start a chat with the models you're comparing. |
+| Your own OpenRouter key | In Settings, add your own key so your chats run on your OpenRouter account: your credits, your rate limits, and paid models. The key is checked with OpenRouter before saving, encrypted at rest with AES-256-GCM, and never sent back to the browser. Only the last 4 characters are shown. Settings shows its limit, usage and free requests left today. Without a personal key, chats use the shared `OPENROUTER_API_KEY` if the server has one. |
 | Finish | Lists saved and final picks from any model and any turn, with copy and Markdown download. |
 | Preference signal | Use, continue, save and final actions log a preference event with the competing responses and display position, ready for selection-rate analytics. |
 | Mobile | Answers become tabs per turn instead of squeezed columns. |
@@ -75,6 +79,7 @@ lib/models.js  live catalog + tags
 lib/langfuse.js    OTLP tracing + scores for Langfuse
 lib/health.js  live model health from real traffic
 lib/memory.js  AI titles + rolling conversation summary
+lib/secrets.js AES-256-GCM encryption for personal API keys
 ```
 
 The API key stays on the server. The browser never sees it.

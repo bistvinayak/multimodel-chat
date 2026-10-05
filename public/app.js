@@ -32,6 +32,8 @@ const ERROR_HINT = {
   network: 'Network problem reaching OpenRouter.',
   provider_unavailable: 'The provider is down or overloaded.',
   safety: 'The provider\'s safety filter blocked this request.',
+  no_key: 'There is no OpenRouter key to run this model. Add your own key in Settings.',
+  invalid_key: 'OpenRouter rejected your key. Update it in Settings.',
 };
 
 // ---------- utils ----------
@@ -109,6 +111,7 @@ function renderShell() {
       <div class="sidebar-head">
         <div class="brand"><span class="brand-mark"><i style="background:var(--lane-0)"></i><i style="background:var(--lane-1)"></i><i style="background:var(--lane-2)"></i></span>Multi-Model Workspace</div>
         <button class="btn primary" id="new-btn">+ New conversation</button>
+        <button class="btn" id="compare-btn">⚖ Compare models</button>
       </div>
       <div class="search-wrap"><input class="input" id="conv-search" placeholder="Search chats  (/)" aria-label="Search chats"></div>
       <nav class="conv-list" id="conv-list"></nav>
@@ -120,6 +123,7 @@ function renderShell() {
     <main class="main" id="main"></main>
   </div>`;
   $('#new-btn').onclick = () => { location.hash = '#/new'; closeNav(); };
+  $('#compare-btn').onclick = () => { location.hash = '#/compare'; closeNav(); };
   $('#logout-btn').onclick = async () => { await api('POST', '/api/logout').catch(() => {}); S.me = null; renderAuth('login'); };
   $('#settings-btn').onclick = openSettings;
   $('#conv-search').oninput = searchConvs;
@@ -272,7 +276,9 @@ function renderSidebar() {
 
 function route() {
   const m = location.hash.match(/^#\/c\/([\w-]+)/);
-  if (m) openConversation(m[1]); else renderNew();
+  if (m) openConversation(m[1]);
+  else if (location.hash.startsWith('#/compare')) renderCompare();
+  else renderNew();
 }
 window.addEventListener('hashchange', () => S.me && route());
 
@@ -1066,12 +1072,40 @@ function openSettings() {
       <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="set-free" ${p.free_only ? 'checked' : ''}> Show free models only by default</label>
       <label style="display:flex;gap:8px;align-items:flex-start"><input type="checkbox" id="set-auto" ${p.auto_switch !== false ? 'checked' : ''} style="margin-top:4px">
         <span>When a model is rate limited, switch to the best other model that is answering<br><span class="muted small">You always see when this happens. The busy model is paused, not removed. Turn this off to keep strict comparisons and retry for longer instead.</span></span></label>
+      <div class="key-box"><b>Your OpenRouter key</b>
+        <div id="key-status" class="small muted">Checking…</div>
+        <div class="key-row"><input class="input" id="key-input" type="password" autocomplete="off" spellcheck="false" placeholder="sk-or-v1-…">
+          <button class="btn" id="key-save">${S.me.openrouter_key?.set ? 'Replace key' : 'Save key'}</button>
+          ${S.me.openrouter_key?.set ? '<button class="btn danger" id="key-del">Remove</button>' : ''}</div>
+        <div class="small muted">Use your own OpenRouter account: your credits, your rate limits, and paid models if you have credits. Get a key at <a href="https://openrouter.ai/keys" target="_blank" rel="noopener">openrouter.ai/keys</a>. It is checked with OpenRouter, encrypted on the server, and never shown again. Only the last 4 characters are kept visible.</div>
+        <div class="err-text" id="key-err"></div></div>
       <div id="lf-status" class="small muted">Checking Langfuse…</div>
       <hr style="border:0;border-top:1px solid var(--border);width:100%">
       <div><b>Delete account</b><p class="muted small">Permanently deletes your account, conversations, responses, and preference history.</p>
       <button class="btn danger" id="del-acct">Delete my account</button></div>`,
     foot: `<button class="btn" data-close>Cancel</button><button class="btn primary" id="set-save">Save</button>`,
   });
+  const showKey = () => api('GET', '/api/me/openrouter-key').then((k) => {
+    const box = $('#key-status', el); if (!box) return;
+    const usage = k.error ? `⚠ ${esc(k.error)}` : [k.limit != null ? `limit $${Number(k.limit).toFixed(2)}, $${Number(k.limit_remaining ?? 0).toFixed(2)} left` : 'no spending limit',
+      k.usage != null ? `$${Number(k.usage).toFixed(2)} used` : '', k.free_daily ? `${k.free_daily.remaining} of ${k.free_daily.limit} free-model requests left today` : ''].filter(Boolean).join(' · ');
+    box.innerHTML = k.source === 'personal' ? `✓ Your chats run on your key ••••${esc(k.last4 || '')}. ${usage}`
+      : k.source === 'shared' ? `Your chats run on this app's shared key. ${usage}` : '⚠ No key. Add your OpenRouter key to start chatting.';
+  }).catch(() => {});
+  showKey();
+  $('#key-save', el).onclick = async () => {
+    const input = $('#key-input', el); const btn = $('#key-save', el);
+    $('#key-err', el).textContent = ''; btn.disabled = true; btn.textContent = 'Checking with OpenRouter…';
+    try {
+      S.me = await api('PUT', '/api/me/openrouter-key', { key: input.value });
+      input.value = ''; toast('Key saved. Your chats now run on your OpenRouter account.'); close(); openSettings();
+    } catch (e) { $('#key-err', el).textContent = e.message; btn.disabled = false; btn.textContent = S.me.openrouter_key?.set ? 'Replace key' : 'Save key'; }
+  };
+  const kd = $('#key-del', el);
+  if (kd) kd.onclick = async () => {
+    if (!confirm(S.me.shared_key_available ? 'Remove your key? Chats will go back to the shared key.' : 'Remove your key? You will not be able to chat until you add one again.')) return;
+    try { S.me = await api('DELETE', '/api/me/openrouter-key'); toast('Key removed'); close(); openSettings(); } catch (e) { fail(e); }
+  };
   api('GET', '/api/langfuse/status').then((st) => {
     const box = $('#lf-status', el); if (!box) return;
     box.innerHTML = !st.enabled
@@ -1087,6 +1121,104 @@ function openSettings() {
     if (prompt('Type DELETE to permanently delete your account and all data') !== 'DELETE') return;
     try { await api('DELETE', '/api/me'); close(); S.me = null; S.conv = null; renderAuth('signup'); } catch (e) { fail(e); }
   };
+}
+
+
+// ---------- compare models ----------
+let compareSel = [];
+const fmtMs = (ms) => (ms == null ? '—' : ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`);
+const pct = (x) => (x == null ? '—' : `${Math.round(x * 100)}%`);
+const vendorName = (m) => (m.name.includes(':') ? m.name.split(':')[0] : m.id.split('/')[0]);
+
+function renderCompare() {
+  closeStream();
+  S.conv = null; S.resp = new Map(); renderSidebar(); renderSkills();
+  try { compareSel = JSON.parse(sessionStorage.getItem('compareSel') || '[]'); } catch {}
+  if (!compareSel.length && S.me.preferences.last_models?.length) compareSel = S.me.preferences.last_models.slice(0, 4);
+  $('#main').innerHTML = `${mobileTop('Compare models')}<div class="new-wrap"><div class="new-inner compare">
+    <div><h1>Compare models</h1><p class="muted" style="margin:4px 0 0">Catalog facts side by side, plus how each model has actually done in your own chats.</p></div>
+    <div id="cmp-picker"></div>
+    <div id="cmp-result"></div>
+    <div id="cmp-board"></div>
+  </div></div>`;
+  mountPicker($('#cmp-picker'), { selected: compareSel, max: 4, onChange: (sel) => { compareSel = sel; try { sessionStorage.setItem('compareSel', JSON.stringify(sel)); } catch {} loadCompare(); } });
+  loadCompare();
+}
+
+const loadCompare = debounce(async () => {
+  const box = $('#cmp-result'); if (!box) return;
+  box.innerHTML = compareSel.length ? '<div class="muted">Loading…</div>' : '<div class="muted">Pick up to 4 models above to compare them.</div>';
+  try {
+    const data = await api('GET', `/api/compare?models=${encodeURIComponent(compareSel.join(','))}`);
+    if (compareSel.length) box.innerHTML = compareTableHTML(data); else box.innerHTML = '<div class="muted">Pick up to 4 models above to compare them.</div>';
+    $('#cmp-board').innerHTML = leaderboardHTML(data.leaderboard);
+    const start = $('#cmp-start'); if (start) start.onclick = () => { newState.selected = compareSel.slice(0, S.maxModels); location.hash = '#/new'; };
+    $('#cmp-board').onclick = (e) => { const b = e.target.closest('[data-cmp-add]'); if (b && compareSel.length < 4 && !compareSel.includes(b.dataset.cmpAdd)) { $('#cmp-picker')._setSelected([...compareSel, b.dataset.cmpAdd]); } };
+  } catch (e) { box.innerHTML = `<div class="err-box">${esc(e.message)}</div>`; }
+}, 150);
+
+function compareTableHTML({ models, head_to_head }) {
+  // Each row: label, value per model, numeric value for "best" highlighting, and which direction wins.
+  const C = (m) => m.catalog || {}, U = (m) => m.usage || {};
+  const rows = [
+    ['section', 'Catalog'],
+    ['Provider', (m) => esc(C(m).name ? vendorName(C(m)) : '—')],
+    ['Price per 1M tokens', (m) => (C(m).free ? '<span class="tag free">FREE</span>' : C(m).prompt_price != null ? `$${perM(C(m).prompt_price)} in · $${perM(C(m).completion_price)} out` : '—'),
+      (m) => (C(m).prompt_price != null ? C(m).prompt_price + C(m).completion_price : null), 'low'],
+    ['Context window', (m) => (C(m).context_length ? `${fmtTokens(C(m).context_length)} tokens` : '—'), (m) => C(m).context_length, 'high'],
+    ['Max answer length', (m) => (C(m).max_output ? `${fmtTokens(C(m).max_output)} tokens` : '—'), (m) => C(m).max_output, 'high'],
+    ['Strengths', (m) => (C(m).tags || []).filter((t) => t !== 'free').map((t) => `<span class="tag">${t}</span>`).join(' ') || '—'],
+    ['Estimated rank among free models', (m) => (C(m).free_rank ? `#${C(m).free_rank}` : C(m).free ? '—' : 'paid'), (m) => C(m).free_rank, 'low'],
+    ['Right now', (m) => ({ ok: '<span class="tag ok">responding</span>', busy: '<span class="tag busy">busy</span>', blocked: '<span class="tag busy">unavailable</span>' }[C(m).health] || '<span class="muted">not checked</span>')],
+    ['section', 'In your chats'],
+    ['Answers', (m) => U(m).answers ?? 0],
+    ['Picked when compared', (m) => (U(m).shown_in_comparisons ? `${pct(U(m).pick_rate)} <span class="muted small">(${U(m).chosen} of ${U(m).shown_in_comparisons})</span>` : '<span class="muted">no data</span>'),
+      (m) => (U(m).shown_in_comparisons >= 3 ? U(m).pick_rate : null), 'high'],
+    ['Average response time', (m) => fmtMs(U(m).avg_latency_ms), (m) => U(m).avg_latency_ms, 'low'],
+    ['Time to first token', (m) => fmtMs(U(m).avg_first_token_ms), (m) => U(m).avg_first_token_ms, 'low'],
+    ['Average answer length', (m) => (U(m).avg_output_tokens != null ? `${fmtTokens(Math.round(U(m).avg_output_tokens))} tokens` : '—')],
+    ['Average cost per answer', (m) => fmtCost(U(m).avg_cost), (m) => U(m).avg_cost, 'low'],
+    ['Total spent', (m) => fmtCost(U(m).total_cost ?? null)],
+    ['Failed or rate limited', (m) => (U(m).answers ? `${pct(U(m).failure_rate)} <span class="muted small">(${(U(m).failed || 0) + (U(m).rate_limited || 0)} of ${U(m).answers})</span>` : '—'),
+      (m) => (U(m).answers ? U(m).failure_rate : null), 'low'],
+  ];
+  const head = `<tr><th></th>${models.map((m) => `<th><span class="dot" style="background:var(--lane-${compareSel.indexOf(m.id) % 6})"></span> ${esc(shortName(m.id))}<div class="model-id">${esc(m.id)}</div></th>`).join('')}</tr>`;
+  const body = rows.map((r) => {
+    if (r[0] === 'section') return `<tr class="sec"><td colspan="${models.length + 1}">${r[1]}</td></tr>`;
+    const [label, fmt, val, dir] = r;
+    let best = null;
+    if (val && models.length > 1) {
+      const nums = models.map(val).filter((v) => v != null && !Number.isNaN(v));
+      if (nums.length > 1 && new Set(nums).size > 1) best = dir === 'low' ? Math.min(...nums) : Math.max(...nums);
+    }
+    return `<tr><th scope="row">${label}</th>${models.map((m) => `<td class="${best != null && val(m) === best ? 'best' : ''}">${fmt(m)}</td>`).join('')}</tr>`;
+  }).join('');
+  const h2h = head_to_head.filter((p) => p.together);
+  const h2hHTML = models.length < 2 ? '' : `<h2 class="cmp-h">Head to head</h2>
+    <p class="muted small" style="margin:0 0 8px">Questions where both models answered, and whose answer you picked (Use as context, Continue, Save or Final).</p>
+    ${h2h.length ? `<div class="h2h">${h2h.map((p) => {
+      const total = p.a_wins + p.b_wins || 1;
+      return `<div class="h2h-row"><span class="h2h-name">${esc(shortName(p.a))}</span>
+        <div class="h2h-bar" title="${p.a_wins} vs ${p.b_wins}"><i style="width:${(p.a_wins / total) * 100}%;background:var(--lane-${compareSel.indexOf(p.a) % 6})"></i><i style="width:${(p.b_wins / total) * 100}%;background:var(--lane-${compareSel.indexOf(p.b) % 6})"></i></div>
+        <span class="h2h-name r">${esc(shortName(p.b))}</span>
+        <span class="h2h-score"><b>${p.a_wins}</b> – <b>${p.b_wins}</b> <span class="muted small">· ${p.both_picked} both · ${p.neither_picked} neither · ${p.together} together</span></span></div>`;
+    }).join('')}</div>` : '<p class="muted">These models have not answered the same question in your chats yet. Start a chat with them to build up a comparison.</p>'}`;
+  return `<div class="cmp-wrap"><table class="cmp"><thead>${head}</thead><tbody>${body}</tbody></table></div>
+    <p class="muted small">Green marks the best value in a row. "Picked when compared" needs at least 3 comparisons before it is highlighted. The rank is an estimate from size, reasoning support, context, recency and live health.</p>
+    ${h2hHTML}
+    <div style="display:flex;justify-content:flex-end;margin-top:10px"><button class="btn primary" id="cmp-start" ${models.length ? '' : 'disabled'}>Start a chat with ${models.length > S.maxModels ? `the first ${S.maxModels}` : 'these models'}</button></div>`;
+}
+
+function leaderboardHTML(board) {
+  if (!board.length) return `<h2 class="cmp-h">Your leaderboard</h2><p class="muted">Once you use models in chats, they are ranked here by how often you pick their answers.</p>`;
+  return `<h2 class="cmp-h">Your leaderboard</h2>
+    <p class="muted small" style="margin:0 0 8px">Every model you have used, ranked by how often you picked its answer when it was shown next to others. Models with fewer than 3 comparisons are listed after the ranked ones.</p>
+    <div class="cmp-wrap"><table class="cmp board"><thead><tr><th>#</th><th>Model</th><th>Picked when compared</th><th>Answers</th><th>Avg time</th><th>Failed</th><th></th></tr></thead><tbody>
+    ${board.map((u, i) => `<tr><td>${u.shown_in_comparisons >= 3 ? i + 1 : '–'}</td><td><b>${esc(shortName(u.model_id))}</b><div class="model-id">${esc(u.model_id)}</div></td>
+      <td>${u.shown_in_comparisons ? `<div class="meter"><i style="width:${Math.round((u.pick_rate || 0) * 100)}%"></i></div>${pct(u.pick_rate)} <span class="muted small">(${u.chosen}/${u.shown_in_comparisons})</span>` : '<span class="muted">—</span>'}</td>
+      <td>${u.answers}</td><td>${fmtMs(u.avg_latency_ms)}</td><td>${pct(u.failure_rate)}</td>
+      <td>${compareSel.includes(u.model_id) ? '' : `<button class="btn small ghost" data-cmp-add="${esc(u.model_id)}">+ Compare</button>`}</td></tr>`).join('')}
+    </tbody></table></div>`;
 }
 
 // ---------- keyboard shortcuts ----------

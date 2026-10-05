@@ -122,3 +122,19 @@ test('title cleanup', () => {
   assert.equal(cleanTitle('Title: Planning A Research Agent\nextra'), 'Planning A Research Agent');
   assert.equal(cleanTitle('Hi'), null);
 });
+
+import { initSecrets, encrypt, decrypt } from '../lib/secrets.js';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+
+test('personal keys are encrypted at rest and tamper-evident', () => {
+  initSecrets(mkdtempSync(path.join(tmpdir(), 'mmw-')));
+  const key = 'sk-or-v1-' + 'a'.repeat(64);
+  const blob = encrypt(key);
+  assert.ok(!blob.includes(key) && blob.startsWith('v1:'));
+  assert.notEqual(encrypt(key), blob);                  // random IV every time
+  assert.equal(decrypt(blob), key);
+  const parts = blob.split(':'); parts[3] = Buffer.from('tampered').toString('base64');
+  assert.throws(() => decrypt(parts.join(':')));       // GCM auth tag rejects edits
+});

@@ -9,7 +9,8 @@ import { getCatalog, getModel, qualityScore, NOT_CHAT } from './lib/models.js';
 import { healthOf, recordOk, recordLimited, recordBlocked } from './lib/health.js';
 import * as lf from './lib/langfuse.js';
 import { buildContext } from './lib/context.js';
-import { streamCompletion, ModelError, probeModel, complete } from './lib/openrouter.js';
+import { streamCompletion, ModelError, probeModel, complete, keyInfo } from './lib/openrouter.js';
+import { initSecrets, encrypt, decrypt } from './lib/secrets.js';
 import { titlePrompt, cleanTitle, summaryPlan, summaryPrompt } from './lib/memory.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -25,9 +26,30 @@ const MAX_AUTO_SWITCHES = 2; // per lane per turn
 // Exponential backoff with jitter: about 3s, 6s, 11s, 18s (~40s total) before giving up.
 const backoffMs = (attempt) => Math.round([3000, 6000, 11000, 18000][Math.min(attempt, 3)] * (0.85 + Math.random() * 0.3));
 const API_KEY = process.env.OPENROUTER_API_KEY;
-if (!API_KEY) console.warn('WARNING: OPENROUTER_API_KEY is not set. Model calls will fail.');
+if (!API_KEY) console.warn('Note: OPENROUTER_API_KEY is not set. Only users who add their own key in Settings can chat.');
 
-const db = openDb(process.env.DB_PATH || path.join(ROOT, 'data', 'app.db'));
+const DB_FILE = process.env.DB_PATH || path.join(ROOT, 'data', 'app.db');
+const db = openDb(DB_FILE);
+initSecrets(path.dirname(DB_FILE));
+
+// ---------- per-user OpenRouter keys ----------
+const keyCache = new Map(); // user id -> { blob, key }
+function personalKey(user) {
+  if (!user?.openrouter_key_enc) return null;
+  const hit = keyCache.get(user.id);
+  if (hit?.blob === user.openrouter_key_enc) return hit.key;
+  try { const key = decrypt(user.openrouter_key_enc); keyCache.set(user.id, { blob: user.openrouter_key_enc, key }); return key; }
+  catch { console.warn(`[keys] could not decrypt the key for user ${user.id}. Was data/secret.key or APP_SECRET changed?`); return null; }
+}
+/** The key a user's requests run on: their own if they added one, else the shared server key. */
+function keyFor(user) {
+  const fresh = user?.id ? db.prepare('SELECT id, openrouter_key_enc FROM users WHERE id=?').get(user.id) : null;
+  const own = personalKey(fresh || user);
+  if (own) return { key: own, source: 'personal' };
+  if (API_KEY) return { key: API_KEY, source: 'shared' };
+  throw new ModelError('no_key', 'No OpenRouter key is available. Add your own key in Settings.');
+}
+const userById = (id) => db.prepare('SELECT * FROM users WHERE id=?').get(id);
 let lfProject = null; // Langfuse project URL, for deep links
 if (lf.enabled()) lf.projectUrl().then((u) => { lfProject = u; console.log(u ? `Langfuse tracing on: ${u}` : 'Langfuse keys set, but the project lookup failed. Check LANGFUSE_HOST and keys.'); });
 const running = new Map(); // response_id -> { ctl, convId, content, reasoning, retrying, switching }
@@ -59,7 +81,9 @@ async function readJson(req) {
 }
 
 const prefsOf = (user) => ({ ...DEFAULT_PREFS, ...JSON.parse(user.preferences || '{}') });
-const publicUser = (u) => ({ id: u.id, name: u.name, email: u.email, plan: u.plan, created_at: u.created_at, preferences: prefsOf(u) });
+const publicUser = (u) => ({ id: u.id, name: u.name, email: u.email, plan: u.plan, created_at: u.created_at, preferences: prefsOf(u),
+  openrouter_key: u.openrouter_key_enc ? { set: true, last4: u.openrouter_key_last4, added_at: u.openrouter_key_added_at } : { set: false },
+  shared_key_available: !!API_KEY });
 
 // Every lookup is scoped by the authenticated user_id (PRD section 25).
 function ownConversation(user, id) {
@@ -77,7 +101,7 @@ const touch = (convId) => db.prepare('UPDATE conversations SET updated_at=? WHER
 
 const RESPONSE_COLS = `id, turn_id, conversation_id, model_id, served_model, provider, display_position, content, reasoning,
   status, error_kind, error, finish_reason, latency_ms, first_token_ms, prompt_tokens, completion_tokens, cost,
-  saved, final, attempts, replaced_by, stands_in_for, auto_switched, trace_span_id, created_at, finished_at,
+  saved, final, attempts, replaced_by, stands_in_for, auto_switched, trace_span_id, key_source, created_at, finished_at,
   json_array_length(versions) AS version_count`;
 const getResponseRow = (id) => db.prepare(`SELECT ${RESPONSE_COLS} FROM responses WHERE id=?`).get(id);
 
@@ -241,10 +265,10 @@ function standInDepth(id) {
 }
 
 // Pick the best alternative that is actually answering right now (checked with a tiny request).
-async function pickStandIn(r) {
+async function pickStandIn(r, apiKey) {
   const candidates = (await rankAlternatives({ ...r, status: 'rate_limited', error_kind: 'rate_limit' })).slice(0, 4);
   if (!candidates.length) return null;
-  const results = await Promise.all(candidates.map((m) => probeModel(API_KEY, m.id)));
+  const results = await Promise.all(candidates.map((m) => probeModel(apiKey, m.id)));
   results.forEach((x) => (x.health === 'ok' ? recordOk(x.model) : x.health === 'busy' ? recordLimited(x.model) : x.health === 'blocked' ? recordBlocked(x.model) : null));
   return candidates.find((m, i) => results[i].health === 'ok') || null;
 }
@@ -316,13 +340,14 @@ async function runResponse(user, resp) {
   };
 
   try {
+    const auth = keyFor(user); // throws a clear error if neither a personal nor a shared key exists
     const model = await getModel(resp.model_id);
     maxOut = maxOutFor(user, model);
     ({ messages } = buildContext(db, turn, resp.model_id, model, maxOut, pinsFor(turn.conversation_id, turn.id),
       skillsFor(turn.conversation_id), { summary: summaryOf(turn.conversation_id) }));
     db.prepare(`UPDATE responses SET status='generating', content='', reasoning='', error=NULL, error_kind=NULL, finish_reason=NULL,
                 latency_ms=NULL, first_token_ms=NULL, prompt_tokens=NULL, completion_tokens=NULL, cost=NULL, replaced_by=NULL,
-                attempts=attempts+1, context_snapshot=?, finished_at=NULL WHERE id=?`).run(JSON.stringify(messages), resp.id);
+                attempts=attempts+1, context_snapshot=?, key_source=?, finished_at=NULL WHERE id=?`).run(JSON.stringify(messages), auth.source, resp.id);
     started = now();
     emit({ type: 'start', response: getResponseRow(resp.id) });
 
@@ -331,7 +356,7 @@ async function runResponse(user, resp) {
     for (let attempt = 0; ; attempt++) {
       try {
         stats = await streamCompletion({
-          apiKey: API_KEY, model: resp.model_id, messages, maxTokens: maxOut, signal: ctl.signal,
+          apiKey: auth.key, model: resp.model_id, messages, maxTokens: maxOut, signal: ctl.signal,
           onDelta: (t) => { content += t; state.content = content; state.retrying = null; emit({ type: 'delta', content: t }); flush(); },
           onReasoning: (t) => { reasoning += t; state.reasoning = reasoning; state.retrying = null; emit({ type: 'reasoning', content: t }); flush(); },
         });
@@ -386,7 +411,7 @@ async function runResponse(user, resp) {
       emit({ type: 'switching' });
       events.push({ name: 'auto_switch_started', time: now() });
       try {
-        const alt = await pickStandIn(getResponseRow(resp.id));
+        const alt = await pickStandIn(getResponseRow(resp.id), keyFor(user).key);
         if (alt) {
           const newId = swapLane(getResponseRow(resp.id), alt.id, true);
           events.push({ name: 'auto_switched', time: now(), attributes: { from: resp.model_id, to: alt.id, new_response_id: newId } });
@@ -437,7 +462,7 @@ async function maybeTitle(convId) {
   try {
     for (const m of await backgroundModels([answer.model_id])) {
       try {
-        const title = cleanTitle(await complete({ apiKey: API_KEY, model: m.id, messages: titlePrompt(first.user_message, answer.content), maxTokens: 400, timeoutMs: 30_000 }));
+        const title = cleanTitle(await complete({ apiKey: keyFor(userById(conv.user_id)).key, model: m.id, messages: titlePrompt(first.user_message, answer.content), maxTokens: 400, timeoutMs: 30_000 }));
         if (!title) continue;
         const cur = db.prepare('SELECT title_source FROM conversations WHERE id=?').get(convId);
         if (cur?.title_source !== 'auto') return; // the user renamed it meanwhile
@@ -463,7 +488,7 @@ async function maybeSummarize(convId) {
   try {
     for (const m of await backgroundModels()) {
       try {
-        const text = await complete({ apiKey: API_KEY, model: m.id, messages: summaryPrompt(conv.conversation_summary, plan.fold, decisions), maxTokens: 2500, timeoutMs: 90_000 });
+        const text = await complete({ apiKey: keyFor(userById(conv.user_id)).key, model: m.id, messages: summaryPrompt(conv.conversation_summary, plan.fold, decisions), maxTokens: 2500, timeoutMs: 90_000 });
         if (text.length < 40) continue;
         db.prepare('UPDATE conversations SET conversation_summary=?, summary_upto=? WHERE id=?').run(text, plan.upto, convId);
         publish(convId, { type: 'summary', upto: plan.upto });
@@ -507,6 +532,33 @@ route('POST', '/api/logout', async (req, res) => {
 }, { auth: false });
 
 route('GET', '/api/me', async (req, res, { user }) => send(res, 200, publicUser(user)));
+
+// ---------- personal OpenRouter key (encrypted at rest, never returned to the browser) ----------
+route('PUT', '/api/me/openrouter-key', async (req, res, { user }) => {
+  const key = String((await readJson(req)).key || '').trim();
+  if (!/^sk-or-[A-Za-z0-9_-]{20,}$/.test(key)) throw new HttpError(400, 'That does not look like an OpenRouter key. It should start with sk-or-.');
+  let info;
+  try { info = await keyInfo(key); }
+  catch (e) { throw new HttpError(400, e.kind === 'invalid_key' ? 'OpenRouter rejected this key. Check it and try again.' : e.message); }
+  db.prepare('UPDATE users SET openrouter_key_enc=?, openrouter_key_last4=?, openrouter_key_added_at=? WHERE id=?')
+    .run(encrypt(key), key.slice(-4), now(), user.id);
+  keyCache.delete(user.id);
+  send(res, 200, { ...publicUser(userById(user.id)), key_info: info });
+});
+
+route('GET', '/api/me/openrouter-key', async (req, res, { user }) => {
+  const own = personalKey(user);
+  const target = own || API_KEY;
+  if (!target) return send(res, 200, { source: 'none' });
+  try { send(res, 200, { source: own ? 'personal' : 'shared', last4: own ? user.openrouter_key_last4 : null, ...(await keyInfo(target)) }); }
+  catch (e) { send(res, 200, { source: own ? 'personal' : 'shared', error: e.message }); }
+});
+
+route('DELETE', '/api/me/openrouter-key', async (req, res, { user }) => {
+  db.prepare('UPDATE users SET openrouter_key_enc=NULL, openrouter_key_last4=NULL, openrouter_key_added_at=NULL WHERE id=?').run(user.id);
+  keyCache.delete(user.id);
+  send(res, 200, publicUser(userById(user.id)));
+});
 
 route('PATCH', '/api/me', async (req, res, { user }) => {
   const body = await readJson(req);
@@ -579,17 +631,88 @@ route('DELETE', '/api/conversations/:id/skills/:skill', async (req, res, { user,
 });
 
 // Checks up to 8 models in parallel with a tiny request and records their health.
-route('POST', '/api/models/probe', async (req, res) => {
+route('POST', '/api/models/probe', async (req, res, { user }) => {
   const { ids = [] } = await readJson(req);
   const list = [...new Set(ids.map(String))].slice(0, 8);
   for (const id of list) if (!(await getModel(id))) throw new HttpError(400, `Unknown model: ${id}`);
-  const results = await Promise.all(list.map((id) => probeModel(API_KEY, id)));
+  const apiKey = keyFor(user).key;
+  const results = await Promise.all(list.map((id) => probeModel(apiKey, id)));
   for (const r of results) {
     if (r.health === 'ok') recordOk(r.model);
     else if (r.health === 'busy') recordLimited(r.model);
     else if (r.health === 'blocked') recordBlocked(r.model);
   }
   send(res, 200, { results });
+});
+
+// ---------- model comparison: catalog facts + the user's own usage data ----------
+const PICK_EVENTS = `('use_as_context','continue','final','save')`;
+function usageStats(userId, modelIds = null) {
+  const filter = modelIds ? `AND r.model_id IN (${modelIds.map(() => '?').join(',')})` : '';
+  const args = modelIds ? [userId, ...modelIds] : [userId];
+  const base = db.prepare(`SELECT r.model_id,
+      COUNT(*) AS answers,
+      SUM(r.status='completed') AS completed,
+      SUM(r.status='failed') AS failed,
+      SUM(r.status='rate_limited') AS rate_limited,
+      AVG(CASE WHEN r.status='completed' THEN r.latency_ms END) AS avg_latency_ms,
+      AVG(CASE WHEN r.status='completed' THEN r.first_token_ms END) AS avg_first_token_ms,
+      AVG(CASE WHEN r.status='completed' THEN r.completion_tokens END) AS avg_output_tokens,
+      AVG(CASE WHEN r.status='completed' THEN r.cost END) AS avg_cost,
+      SUM(COALESCE(r.cost, 0)) AS total_cost,
+      MAX(r.created_at) AS last_used
+    FROM responses r JOIN conversations c ON c.id=r.conversation_id
+    WHERE c.user_id=? AND r.status NOT IN ('pending','generating') ${filter}
+    GROUP BY r.model_id`).all(...args);
+  // "Comparable situations": the answer was shown next to at least one other completed answer.
+  const picks = db.prepare(`WITH multi AS (
+        SELECT r.turn_id FROM responses r JOIN conversations c ON c.id=r.conversation_id
+        WHERE c.user_id=? AND r.status='completed' GROUP BY r.turn_id HAVING COUNT(*) >= 2),
+      picked AS (SELECT DISTINCT winning_response AS id FROM preference_events WHERE user_id=? AND event_type IN ${PICK_EVENTS})
+    SELECT r.model_id, COUNT(*) AS shown, SUM(r.id IN (SELECT id FROM picked)) AS chosen
+    FROM responses r WHERE r.status='completed' AND r.turn_id IN (SELECT turn_id FROM multi) ${filter.replace('AND r.', 'AND r.')}
+    GROUP BY r.model_id`).all(userId, userId, ...(modelIds || []));
+  const pickBy = new Map(picks.map((p) => [p.model_id, p]));
+  return base.map((b) => {
+    const p = pickBy.get(b.model_id) || { shown: 0, chosen: 0 };
+    return { ...b, shown_in_comparisons: p.shown, chosen: p.chosen, pick_rate: p.shown ? p.chosen / p.shown : null,
+      failure_rate: b.answers ? (b.failed + b.rate_limited) / b.answers : null };
+  });
+}
+
+function headToHead(userId, ids) {
+  const rows = db.prepare(`SELECT r.turn_id, r.model_id, r.id IN (SELECT winning_response FROM preference_events WHERE user_id=? AND event_type IN ${PICK_EVENTS}) AS picked
+    FROM responses r JOIN conversations c ON c.id=r.conversation_id
+    WHERE c.user_id=? AND r.status='completed' AND r.model_id IN (${ids.map(() => '?').join(',')})`).all(userId, userId, ...ids);
+  const byTurn = new Map();
+  for (const r of rows) { if (!byTurn.has(r.turn_id)) byTurn.set(r.turn_id, new Map()); byTurn.get(r.turn_id).set(r.model_id, !!r.picked); }
+  const pairs = [];
+  for (let i = 0; i < ids.length; i++) for (let j = i + 1; j < ids.length; j++) {
+    const a = ids[i], b = ids[j]; let aw = 0, bw = 0, both = 0, neither = 0;
+    for (const t of byTurn.values()) {
+      if (!t.has(a) || !t.has(b)) continue;
+      const pa = t.get(a), pb = t.get(b);
+      if (pa && !pb) aw++; else if (pb && !pa) bw++; else if (pa && pb) both++; else neither++;
+    }
+    pairs.push({ a, b, a_wins: aw, b_wins: bw, both_picked: both, neither_picked: neither, together: aw + bw + both + neither });
+  }
+  return pairs;
+}
+
+route('GET', '/api/compare', async (req, res, { user }) => {
+  const ids = [...new Set((new URL(req.url, 'http://x').searchParams.get('models') || '').split(',').map((x) => x.trim()).filter(Boolean))].slice(0, 4);
+  const catalog = await getCatalog();
+  const freeRank = new Map(catalog.filter((m) => m.free && !NOT_CHAT.test(m.id) && healthOf(m.id) !== 'blocked')
+    .map((m) => [m.id, qualityScore(m, { health: healthOf(m.id) })]).sort((a, b) => b[1] - a[1]).map(([id], i) => [id, i + 1]));
+  const usage = new Map(usageStats(user.id, ids.length ? ids : null).map((u) => [u.model_id, u]));
+  const models = ids.map((id) => {
+    const m = catalog.find((x) => x.id === id);
+    return { id, catalog: m ? { ...m, health: healthOf(id), quality: qualityScore(m, { health: healthOf(id) }), free_rank: freeRank.get(id) || null } : null, usage: usage.get(id) || null };
+  });
+  // Leaderboard: every model this user has used, best pick rate first (needs a few comparisons to rank).
+  const leaderboard = usageStats(user.id).map((u) => ({ ...u, name: catalog.find((m) => m.id === u.model_id)?.name || u.model_id }))
+    .sort((a, b) => ((b.shown_in_comparisons >= 3) - (a.shown_in_comparisons >= 3)) || ((b.pick_rate ?? -1) - (a.pick_rate ?? -1)) || b.answers - a.answers);
+  send(res, 200, { models, head_to_head: ids.length >= 2 ? headToHead(user.id, ids) : [], leaderboard });
 });
 
 route('GET', '/api/conversations', async (req, res, { user }) => {
