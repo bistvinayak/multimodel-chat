@@ -1,0 +1,13 @@
+{ "description": "Read the current product price from page HTML. Structured cases test the deterministic parser; text-only cases test the AI fallback.",
+  "cases": [
+    { "id": "jsonld-offer", "html": "<title>Kettle</title><script type=\"application/ld+json\">{\"@context\":\"https://schema.org\",\"@type\":\"Product\",\"name\":\"Kettle\",\"offers\":{\"@type\":\"Offer\",\"price\":\"39.99\",\"priceCurrency\":\"USD\"}}</script>", "price": 39.99, "currency": "USD" },
+    { "id": "jsonld-graph", "html": "<script type=\"application/ld+json\">{\"@graph\":[{\"@type\":\"WebPage\"},{\"@type\":\"Product\",\"name\":\"Mug\",\"offers\":[{\"@type\":\"Offer\",\"price\":12.5,\"priceCurrency\":\"GBP\"}]}]}</script>", "price": 12.5, "currency": "GBP" },
+    { "id": "jsonld-aggregate", "html": "<script type=\"application/ld+json\">{\"@type\":\"Product\",\"name\":\"Phone\",\"offers\":{\"@type\":\"AggregateOffer\",\"lowPrice\":899,\"highPrice\":1129,\"priceCurrency\":\"USD\"}}</script>", "price": 899, "currency": "USD" },
+    { "id": "og-meta", "html": "<meta property=\"product:price:amount\" content=\"1299.00\"><meta property=\"product:price:currency\" content=\"EUR\"><title>Sofa</title>", "price": 1299, "currency": "EUR" },
+    { "id": "microdata", "html": "<div itemscope itemtype=\"https://schema.org/Product\"><h1 itemprop=\"name\">Desk</h1><span itemprop=\"price\" content=\"249.00\">$249.00</span><meta itemprop=\"priceCurrency\" content=\"USD\"></div>", "price": 249, "currency": "USD" },
+    { "id": "amazon-style", "html": "<span id=\"productTitle\">CAROTE Pan Set</span><div id=\"corePrice_feature_div\"><span class=\"a-price\"><span class=\"a-offscreen\">MXN1,089.31</span></span></div>", "price": 1089.31, "currency": "MXN" },
+    { "id": "text-sale", "html": "<h1>Acme Desk Lamp</h1><p>Was $44.38</p><p class=\"price\">Now only $35.50</p><p>Free shipping on orders over $50</p>", "price": 35.5, "currency": "USD", "needs_ai": true },
+    { "id": "text-gbp", "html": "<h1>A Light in the Attic</h1><p class=\"price_color\">£51.77</p><p>In stock (22 available)</p>", "price": 51.77, "currency": "GBP", "needs_ai": true },
+    { "id": "text-related-noise", "html": "<h1>Trail Backpack 30L</h1><div class=price>€89,95</div><h2>Customers also bought</h2><ul><li>Water bottle €12,00</li><li>Rain cover €19,95</li></ul>", "price": 89.95, "currency": "EUR", "needs_ai": true },
+    { "id": "text-inr", "html": "<h1>boAt Rockerz 450</h1><span>M.R.P.: ₹3,990</span><span>Deal price: ₹1,499</span><span>You save ₹2,491 (62%)</span>", "price": 1499, "currency": "INR", "needs_ai": true }
+  ] }

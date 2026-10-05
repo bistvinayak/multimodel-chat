@@ -37,4 +37,4 @@ http.createServer((req, res) => {
   res.end(`<!doctype html><html><head><meta charset="utf-8"><title>${esc(p.name)} | Demo Shop</title>
     ${p.textOnly ? '' : `<script type="application/ld+json">${JSON.stringify({ '@context': 'https://schema.org', '@type': 'Product', name: p.name, offers: { '@type': 'Offer', price: p.price.toFixed(2), priceCurrency: p.currency, availability: 'https://schema.org/InStock' } })}</script>`}
     </head><body><h1>${esc(p.name)}</h1><p class="price">Now only $${p.price.toFixed(2)}</p><p>Was $${(p.price * 1.25).toFixed(2)}. Free shipping over $50.</p></body></html>`);
-}).listen(4330, '127.0.0.1', () => console.log('Demo shop: http://127.0.0.1:4330/admin'));
+}).listen(Number(process.env.DEMO_SHOP_PORT || 4330), '127.0.0.1', () => console.log(`Demo shop: http://127.0.0.1:${process.env.DEMO_SHOP_PORT || 4330}/admin`));

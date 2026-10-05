@@ -3,6 +3,11 @@ const $ = (s, el = document) => el.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const app = $('#app');
 
+// Recent client-side errors, attached to feedback so bug reports carry evidence.
+const recentErrors = [];
+window.addEventListener('error', (e) => { recentErrors.push({ at: Date.now(), msg: String(e.message).slice(0, 300), src: `${e.filename || ''}:${e.lineno || ''}` }); recentErrors.splice(0, recentErrors.length - 10); });
+window.addEventListener('unhandledrejection', (e) => { recentErrors.push({ at: Date.now(), msg: String(e.reason?.message || e.reason).slice(0, 300) }); recentErrors.splice(0, recentErrors.length - 10); });
+
 const S = {
   get ctxOpen() { return !!window.__ctxOpen; },
   me: null,
@@ -39,6 +44,7 @@ const ERROR_HINT = {
 
 // ---------- utils ----------
 async function api(method, url, body) {
+  // Errors keep any extra fields the server sent (for example suggested links).
   const r = await fetch(url, { method, headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
   const data = await r.json().catch(() => null);
   if (r.status === 401 && !url.startsWith('/api/login') && !url.startsWith('/api/signup')) {
@@ -47,7 +53,10 @@ async function api(method, url, body) {
     renderAuth('login', wasSignedIn ? 'Your session ended. Sign in again and you will be back in this conversation, with any unsent message kept.' : '');
     throw new Error('Please sign in');
   }
-  if (!r.ok) throw new Error(data?.error || `${r.status} ${r.statusText}`);
+  if (!r.ok) {
+    if (r.status >= 500) { recentErrors.push({ at: Date.now(), msg: `${method} ${url} -> ${r.status} ${data?.error || ''}`.slice(0, 300) }); recentErrors.splice(0, recentErrors.length - 10); }
+    throw Object.assign(new Error(data?.error || `${r.status} ${r.statusText}`), { data });
+  }
   return data;
 }
 let toastTimer;
@@ -117,12 +126,13 @@ function renderShell() {
         <div class="brand"><span class="brand-mark"><i style="background:var(--lane-0)"></i><i style="background:var(--lane-1)"></i><i style="background:var(--lane-2)"></i></span>Multi-Model Workspace</div>
         <button class="btn primary" id="new-btn">+ New conversation</button>
         <div class="nav-row"><button class="btn" id="compare-btn">⚖ Compare</button><button class="btn" id="metrics-btn">📊 Metrics</button></div>
-        <button class="btn" id="watches-btn">🔔 Price watches <span class="count-badge" id="w-badge" hidden>0</span></button>
+        <button class="btn" id="watches-btn">🔔 Agents <span class="count-badge" id="w-badge" hidden>0</span></button>
       </div>
       <div class="search-wrap"><input class="input" id="conv-search" placeholder="Search chats  (/)" aria-label="Search chats"></div>
       <nav class="conv-list" id="conv-list"></nav>
       <section class="skills" id="skills"></section>
-      <div class="sidebar-foot"><span class="who" title="${esc(S.me.email)}">${esc(S.me.name)}</span>
+      <div class="sidebar-foot"><span class="who" title="${esc(S.me.email)}"><span class="avatar">${esc((S.me.name || '?').slice(0, 1).toUpperCase())}</span>${esc(S.me.name)}</span>
+        <button class="btn small ghost" id="feedback-btn" title="Report a bug, suggest an idea, or ask a question" aria-label="Send feedback">💬</button>
         <button class="btn small ghost" id="settings-btn">Settings</button>
         <button class="btn small ghost" id="logout-btn">Sign out</button></div>
     </aside>
@@ -131,10 +141,11 @@ function renderShell() {
   $('#new-btn').onclick = () => { location.hash = '#/new'; closeNav(); };
   $('#compare-btn').onclick = () => { location.hash = '#/compare'; closeNav(); };
   $('#metrics-btn').onclick = () => { location.hash = '#/metrics'; closeNav(); };
-  $('#watches-btn').onclick = () => { location.hash = '#/watches'; closeNav(); };
+  $('#watches-btn').onclick = () => { location.hash = '#/agents'; closeNav(); };
   pollNotifications();
   $('#logout-btn').onclick = async () => { await api('POST', '/api/logout').catch(() => {}); S.me = null; renderAuth('login'); };
   $('#settings-btn').onclick = openSettings;
+  $('#feedback-btn').onclick = () => openFeedback();
   $('#conv-search').oninput = searchConvs;
   wireAttachments($('#main'));
   $('#layout').addEventListener('click', (e) => { if (S.navOpen && !e.target.closest('.sidebar') && !e.target.closest('[data-nav]')) closeNav(); });
@@ -289,7 +300,8 @@ function route() {
   if (m) openConversation(m[1]);
   else if (location.hash.startsWith('#/compare')) renderCompare();
   else if (location.hash.startsWith('#/metrics')) renderMetrics();
-  else if (location.hash.startsWith('#/watches')) renderWatches();
+  else if (location.hash.startsWith('#/watches')) { S.agentTab = 'prices'; location.replace('#/agents'); }
+  else if (location.hash.startsWith('#/agents')) renderAgents();
   else renderNew();
 }
 window.addEventListener('hashchange', () => S.me && route());
@@ -689,6 +701,8 @@ function cardHTML(r, tabActive) {
         <button class="btn small" data-act="reply" data-id="${r.id}" title="Reply to this answer. Highlight part of it first to quote just that part.">↩ Reply</button>
         <button class="btn small ghost" data-act="ask" data-id="${r.id}" title="Send the next message only to this model">Ask this model</button>
         <button class="btn small ghost" data-act="copy" data-id="${r.id}">Copy</button>
+        <button class="btn small ghost ${r.rating === 1 ? 'on' : ''}" data-act="rate" data-v="1" data-id="${r.id}" title="Good answer">👍</button>
+        <button class="btn small ghost ${r.rating === -1 ? 'on' : ''}" data-act="rate" data-v="-1" data-id="${r.id}" title="Bad answer. Tell us why with 💬 Feedback">👎</button>
         <button class="btn small ghost ${r.saved ? 'on' : ''}" data-act="save" data-id="${r.id}">${r.saved ? 'Saved' : 'Save'}</button>
         <button class="btn small ghost ${r.final ? 'on' : ''}" data-act="final" data-id="${r.id}">${r.final ? 'Final ✓' : 'Use as final'}</button>` : ''}
       ${r.attempts ? `<button class="btn small ghost" data-act="context" data-id="${r.id}" title="See exactly what was sent to this model">Context sent</button>` : ''}
@@ -789,20 +803,27 @@ function renderCard(id) {
   }, 50);
 }
 
+const AGENT_INTENT = /\b(notify me|alert me|let me know|keep me (?:posted|updated)|tell me when|track|monitor|watch for)\b/i;
 function suggestWatch(text) {
   const box = $('#watch-suggest'); if (!box) return;
   const url = (text.match(URL_RE) || [])[0];
-  box.innerHTML = url && WATCH_INTENT.test(text.replace(url, '')) ? `<button class="btn small watch-chip" id="ws-go">🔔 Watch the price of this link and alert me when it drops</button>` : '';
-  const b = $('#ws-go'); if (b) b.onclick = () => openWatchModal({ url, target: parsePriceHint(text), conversationId: S.conv?.conversation.id });
+  const priceLink = url && WATCH_INTENT.test(text.replace(url, '')) && /\b(price|cheaper|below|under|drops?|deal|\$|£|€)/i.test(text);
+  if (!priceLink && AGENT_INTENT.test(text) && text.length > 15) {
+    box.innerHTML = `<button class="btn small watch-chip" id="ag-go">🤖 Create an agent for this</button>`;
+    $('#ag-go').onclick = () => { S.agentPrefill = text; location.hash = '#/agents'; };
+    return;
+  }
+  box.innerHTML = priceLink ? `<button class="btn small watch-chip" id="ws-go">🔔 Watch the price of this link and alert me when it drops</button>` : '';
+  const b = $('#ws-go'); if (b) b.onclick = () => openWatchModal({ url, target: parsePriceHint(text), interval: parseFrequency(text), conversationId: S.conv?.conversation.id });
 }
-const parsePriceHint = (t) => { const m = t.match(/(?:below|under|less than|drops? to|<)\s*[$£€₹]?\s*(\d[\d,]*(?:\.\d+)?)/i); return m ? Number(m[1].replace(/,/g, '')) : null; };
+const parsePriceHint = (t) => { const m = t.match(/(?:below|under|less than|falls? (?:below|under|to)|drops? (?:below|under|to)|<)\s*(?:x\s*)?[$£€₹]?\s*(\d[\d,]*(?:\.\d+)?)\s*(?:dollars?|usd|bucks)?/i); return m ? Number(m[1].replace(/,/g, '')) : null; };
 
 async function sendMessage() {
   const msg = $('#msg'); const text = msg.value.trim();
   // "/watch <link> [below 500]" sets up a price watch instead of sending a message.
   if (/^\/watch\b/i.test(text)) {
     const url = (text.match(URL_RE) || [])[0];
-    openWatchModal({ url: url || '', target: parsePriceHint(text), conversationId: S.conv?.conversation.id });
+    openWatchModal({ url: url || '', target: parsePriceHint(text), interval: parseFrequency(text), conversationId: S.conv?.conversation.id });
     msg.value = ''; suggestWatch(''); return;
   }
   if ((!text && !pendingIds().length) || !S.conv) return;
@@ -1016,6 +1037,12 @@ async function onThreadClick(e) {
         toast(`Next message goes only to ${shortName(r.model_id)}`);
         break;
       case 'copy': await navigator.clipboard.writeText(r.content); toast('Copied'); break;
+      case 'rate': {
+        const v = Number(b.dataset.v); const next = r.rating === v ? 0 : v;
+        Object.assign(r, await api('POST', `/api/responses/${id}/rate`, { value: next })); renderCard(id);
+        if (next === -1) toast('Thanks. Want to say what was wrong? Use 💬 Feedback.', 4000);
+        break;
+      }
       case 'save': case 'final': {
         const row = await api('POST', `/api/responses/${id}/${act}`);
         Object.assign(r, row); renderCard(id);
@@ -1504,7 +1531,13 @@ function tile(label, value, sub = '') { return `<div class="tile"><div class="ti
 
 function drawMetrics() {
   const d = metricsData, s = d.summary, body = $('#m-body');
-  if (!s.answers) { body.innerHTML = '<div class="empty-thread"><h2>No data yet</h2><p>Metrics appear once models have answered in this time range.</p></div>'; return; }
+  if (!s.answers) {
+    body.innerHTML = `<div class="empty-thread"><h2>No chat data yet</h2><p>Usage metrics appear once models have answered in this time range.</p></div>
+      <section class="m-card" id="evals-card"><div class="m-card-head"><h2>AI quality: agent eval suite</h2><button class="btn small" id="eval-run-btn">Run evals</button></div><div id="evals-body" class="muted small">Loading…</div></section>
+      <section class="m-card" id="checks-card"><div class="m-card-head"><h2>App health check</h2><button class="btn small" id="check-run-btn">Run check</button></div><div id="checks-body" class="muted small">Loading…</div></section>
+      <section class="m-card"><div class="m-card-head"><h2>Feedback</h2><button class="btn small ghost" id="fb-new">+ New</button></div><div id="fb-body" class="small muted">Loading…</div></section>`;
+    loadEvals(); loadChecks(); loadFeedbackInbox(); $('#fb-new').onclick = () => openFeedback(); return;
+  }
   const failRate = s.answers ? (s.failed + s.rate_limited) / s.answers : null;
   body.innerHTML = `
     <section class="tiles">
@@ -1516,7 +1549,7 @@ function drawMetrics() {
       ${tile('Time to first token', fmtMs(s.ttft_p50), `p50 · p95 ${fmtMs(s.ttft_p95)}`)}
       ${tile('Output speed', s.throughput ? `${Math.round(s.throughput)} tok/s` : '—', 'while streaming')}
       ${tile('Failure rate', pct(failRate), `${s.rate_limited} rate limited · ${s.failed} failed · ${s.auto_switches} auto-switched`)}
-      ${tile('Picks', fmtNum(s.picks), 'use as context, continue, save, final')}
+      ${tile('Picks', fmtNum(s.picks), `use as context, continue, save, final · ${s.thumbs_up} 👍 ${s.thumbs_down} 👎`)}
       ${tile('Evaluator agreement', s.evaluator_agreement != null ? pct(s.evaluator_agreement) : '—', s.evaluator_agreement_n ? `${s.evaluations} evaluations, ${s.evaluator_agreement_n} with your pick` : `${s.evaluations} evaluations`)}
     </section>
     <section class="m-card"><div class="m-card-head"><h2>Tokens per day</h2><div class="legend"><span><i style="background:var(--series-1)"></i>Input</span><span><i style="background:var(--series-2)"></i>Output</span></div>
@@ -1528,11 +1561,47 @@ function drawMetrics() {
       <p class="muted small">Pick rate counts only answers shown next to another finished answer. Output speed is tokens per second after the first token.</p></section>
     <section class="m-card"><div class="m-card-head"><h2>Evaluator scores by model</h2><span class="muted small">${d.evaluator === 'jev' ? 'Jev' : 'Fallback judge'} · average score, 0 to 4</span></div>
       <div id="ch-heat">${heatmapHTML(d.eval_matrix)}</div></section>
-    ${d.errors.length ? `<section class="m-card"><div class="m-card-head"><h2>Why answers failed</h2></div><div class="chart" id="ch-errors"></div></section>` : ''}`;
+    ${d.errors.length ? `<section class="m-card"><div class="m-card-head"><h2>Why answers failed</h2></div><div class="chart" id="ch-errors"></div></section>` : ''}
+    <section class="m-card" id="evals-card"><div class="m-card-head"><h2>AI quality: agent eval suite</h2><button class="btn small" id="eval-run-btn">Run evals</button></div><div id="evals-body" class="muted small">Loading…</div></section>
+    <section class="m-card" id="checks-card"><div class="m-card-head"><h2>App health check</h2><button class="btn small" id="check-run-btn">Run check</button></div><div id="checks-body" class="muted small">Loading…</div></section>
+    <section class="m-card"><div class="m-card-head"><h2>Feedback</h2><button class="btn small ghost" id="fb-new">+ New</button></div><div id="fb-body" class="small muted">Loading…</div></section>`;
+  loadEvals(); loadChecks(); loadFeedbackInbox(); $('#fb-new').onclick = () => openFeedback();
   drawDaily(d.daily); drawLatency(d.per_model); if (d.errors.length) drawErrors(d.errors);
   body.querySelector('[data-table="daily"]').onclick = (e) => { const t = $('#tb-daily'); t.hidden = !t.hidden; $('#ch-daily').hidden = !t.hidden; e.target.textContent = t.hidden ? 'Table' : 'Chart'; };
   $('#tb-daily').innerHTML = `<table class="cmp"><thead><tr><th>Day</th><th>Answers</th><th>Input tokens</th><th>Output tokens</th><th>Failures</th><th>Cost</th></tr></thead><tbody>${d.daily.filter((x) => x.answers).map((x) => `<tr><td>${x.day}</td><td>${x.answers}</td><td>${fmtNum(x.tokens_in)}</td><td>${fmtNum(x.tokens_out)}</td><td>${x.failures}</td><td>${fmtCost(x.cost)}</td></tr>`).join('')}</tbody></table>`;
   $('#csv').onclick = () => downloadCSV(d.per_model);
+}
+
+const SUITE_INFO = {
+  planner: ['Planner', 'Turns plain-English requests into the right tracker'],
+  relevance: ['Relevance screener', 'Keeps matching jobs and news, drops the rest (includes your 👍/👎)'],
+  page: ['Page judge', 'Decides if a condition is true on a page'],
+  price: ['Price reader', 'Finds the current price on a product page'],
+};
+let evalPoll = null;
+async function loadEvals() {
+  const box = $('#evals-body'); if (!box) return;
+  try {
+    const d = await api('GET', '/api/evals');
+    const btn = $('#eval-run-btn');
+    btn.disabled = !!d.running; btn.textContent = d.running ? 'Running…' : 'Run evals';
+    btn.onclick = async () => { try { await api('POST', '/api/evals/run'); toast('Evaluation started. It takes about 2 minutes.'); loadEvals(); } catch (e) { fail(e); } };
+    clearTimeout(evalPoll); if (d.running) evalPoll = setTimeout(loadEvals, 5000);
+    const run = d.latest?.runs?.[0];
+    if (!run) { box.innerHTML = `No eval results yet. Run the suite to measure the agents' AI steps against labeled test cases.${d.running ? `<pre class="eval-log">${esc(d.running.log.join('\n'))}</pre>` : ''}`; return; }
+    const fmtV = (k, v) => (v == null ? '—' : /rate|accuracy|precision|recall|f1/.test(k) ? pct(v) : typeof v === 'number' && !Number.isInteger(v) ? v.toFixed(2) : v);
+    box.className = '';
+    box.innerHTML = `<div class="small muted" style="margin-bottom:6px">Last run ${ago(d.latest.run_at)} · ${esc(run.label)} · ${d.feedback_cases} cases from your feedback · ${d.latest.passed ? '<span class="good">✓ all gates passed</span>' : '<span class="bad">✗ a gate failed</span>'}</div>
+      <div class="cmp-wrap"><table class="cmp"><thead><tr><th>AI step</th><th>Key metric</th><th>Gate</th><th>Other metrics</th><th>Failures</th></tr></thead><tbody>
+      ${Object.entries(run.suites).map(([k, v]) => `<tr><td><b>${SUITE_INFO[k]?.[0] || k}</b><div class="muted small">${SUITE_INFO[k]?.[1] || ''}</div></td>
+        <td class="${v.gate?.passed ? 'best' : ''}"><b>${fmtV(v.gate?.metric, v.gate?.value)}</b> <span class="muted small">${esc(v.gate?.metric || '')}</span></td>
+        <td>${v.gate?.passed ? '<span class="good">✓ pass</span>' : '<span class="bad">✗ fail</span>'} <span class="muted small">≥ ${fmtV(v.gate?.metric, v.gate?.min)}</span></td>
+        <td class="small">${Object.entries(v.metrics || {}).filter(([m]) => m !== v.gate?.metric && !/_ms$/.test(m)).map(([m, x]) => `${esc(m.replace(/_/g, ' '))} ${fmtV(m, x)}`).join(' · ')}</td>
+        <td class="small">${(v.failures || []).length ? `<details><summary>${v.failures.length}</summary>${v.failures.slice(0, 8).map((f) => `<div class="muted">✗ ${esc(f.title || f.id || '')} ${f.expected !== undefined ? `(expected ${esc(String(f.expected))}, got ${esc(String(f.got ?? (f.score != null ? Math.round(f.score * 100) + '%' : '—')))})` : ''}${f.wrong ? ` ${esc(f.wrong.join('; '))}` : ''}</div>`).join('')}</details>` : '0'}</td></tr>`).join('')}
+      </tbody></table></div>
+      ${d.history.length > 1 ? `<div class="small muted" style="margin-top:6px">History: ${d.history.map((h) => `<span title="${new Date(h.run_at).toLocaleString()}">${h.passed ? '🟢' : '🔴'}</span>`).join(' ')} (newest first)</div>` : ''}
+      ${d.running ? `<pre class="eval-log">${esc(d.running.log.join('\n'))}</pre>` : ''}`;
+  } catch (e) { box.innerHTML = `<div class="err-box">${esc(e.message)}</div>`; }
 }
 
 function modelTableHTML(rows) {
@@ -1647,14 +1716,27 @@ function drawErrors(errors) {
 
 
 // ---------- price-watch agent ----------
-const INTERVALS = [[60, 'Every hour'], [180, 'Every 3 hours'], [360, 'Every 6 hours'], [720, 'Every 12 hours'], [1440, 'Once a day']];
+const INTERVALS = [[60, '24 times a day (hourly)'], [120, '12 times a day'], [180, '8 times a day'], [240, '6 times a day'], [288, '5 times a day'], [360, '4 times a day'], [480, '3 times a day'], [720, 'Twice a day'], [1440, 'Once a day']];
+// "5 times a day", "twice daily", "hourly", "every 6 hours" -> the nearest supported interval in minutes.
+function parseFrequency(t) {
+  let perDay = null;
+  const m = t.match(/(\d+)\s*(?:x|times)\s*(?:a|per|each)?\s*day/i); if (m) perDay = Number(m[1]);
+  else if (/\btwice\s+(?:a\s+|per\s+)?day|twice\s+daily\b/i.test(t)) perDay = 2;
+  else if (/\b(?:thrice|three times)\s+(?:a|per)\s+day/i.test(t)) perDay = 3;
+  else if (/\bhourly|every hour\b/i.test(t)) perDay = 24;
+  else if (/\bonce\s+(?:a|per)\s+day|\bdaily\b/i.test(t)) perDay = 1;
+  const h = t.match(/every\s+(\d+)\s*(?:h|hrs?|hours?)\b/i); if (h) perDay = 24 / Number(h[1]);
+  if (!perDay || perDay <= 0) return null;
+  const want = 1440 / perDay;
+  return INTERVALS.map(([v]) => v).reduce((a, b) => (Math.abs(b - want) < Math.abs(a - want) ? b : a));
+}
 const money = (p, c) => (p == null ? '—' : `${c ? `${c} ` : ''}${Number(p).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);
 const ago = (ms) => { if (!ms) return 'never'; const m = Math.round((Date.now() - ms) / 60000); return m < 1 ? 'just now' : m < 60 ? `${m} min ago` : m < 1440 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} d ago`; };
 const until = (ms) => { const m = Math.round((ms - Date.now()) / 60000); return m <= 1 ? 'within a minute' : m < 60 ? `in ${m} min` : `in ${Math.round(m / 60)} h`; };
 const WATCH_INTENT = /\b(price|cheaper|drops?|deal|discount|sale|track|watch|alert|notify|remind)\b/i;
 const URL_RE = /https?:\/\/[^\s<>"')]+/i;
 
-function openWatchModal({ url = '', target = null, conversationId = null } = {}) {
+function openWatchModal({ url = '', target = null, conversationId = null, interval = null } = {}) {
   let preview = null;
   const { el, close } = modal({
     title: 'Watch a price',
@@ -1671,15 +1753,20 @@ function openWatchModal({ url = '', target = null, conversationId = null } = {})
       preview = await api('POST', '/api/watches/preview', { url: u });
       const t = target ?? Math.floor(preview.price * 0.9 * 100) / 100;
       out.innerHTML = `<div class="w-preview"><div class="w-title">${esc(preview.title || new URL(preview.final_url).hostname)}</div>
-          <div class="w-price">${money(preview.price, preview.currency)}</div>
+          <div class="w-price">${preview.price_kind === 'from' ? '<span class="muted small">from </span>' : ''}${money(preview.price, preview.currency)}${preview.high_price ? `<span class="muted small"> to ${money(preview.high_price, preview.currency)} depending on the model</span>` : ''}</div>
+          ${localCurrency() && preview.currency && preview.currency !== localCurrency() ? `<div class="small notice-inline">ℹ The store showed prices in ${esc(preview.currency)}. Stores often pick the currency from your network location (a VPN or proxy can change it). Alerts compare prices in this same currency.</div>` : ''}
           <div class="muted small">${preview.method === 'structured' ? 'Read from the page\'s product data.' : `Read from the page text by ${esc(shortName(preview.model || 'an AI model'))}. Double-check it matches the price you see.`}${preview.in_stock === false ? ' · ⚠ Out of stock' : ''}</div></div>
         <div class="w-cond"><div class="section-title">Alert me when</div>
           <label class="chk"><input type="radio" name="cond" value="below" checked> the price is at or below <input class="input inline" id="w-target" type="number" min="0" step="0.01" value="${t}"> ${esc(preview.currency || '')}</label>
           <label class="chk"><input type="radio" name="cond" value="drop_pct"> it drops by <input class="input inline" id="w-pct" type="number" min="1" max="99" value="10">% or more</label>
           <label class="chk"><input type="radio" name="cond" value="any_drop"> it drops at all</label></div>
-        <label class="small">Check<select class="select" id="w-int">${INTERVALS.map(([v, l]) => `<option value="${v}" ${v === 360 ? 'selected' : ''}>${l}</option>`).join('')}</select></label>`;
+        <label class="small">How often to check<select class="select" id="w-int">${INTERVALS.map(([v, l]) => `<option value="${v}" ${v === (interval || 288) ? 'selected' : ''}>${l}</option>`).join('')}</select></label>`;
       $('#w-create', el).disabled = false;
-    } catch (e) { out.innerHTML = `<div class="err-box">${esc(e.message)}</div>`; }
+    } catch (e) {
+      const sug = e.data?.suggestions || [];
+      out.innerHTML = `<div class="err-box">${esc(e.message)}${sug.length ? `<div class="alts">${sug.map((x) => `<button class="btn small" data-sug="${esc(x.url)}" title="${esc(x.url)}">Use: ${esc(x.text || x.url)}</button>`).join('')}</div>` : ''}</div>`;
+      out.querySelectorAll('[data-sug]').forEach((btn) => { btn.onclick = () => { $('#w-url', el).value = btn.dataset.sug; runPreview(); }; });
+    }
     b.disabled = false; b.textContent = 'Check price';
   };
   $('#w-preview', el).onclick = runPreview;
@@ -1692,12 +1779,15 @@ function openWatchModal({ url = '', target = null, conversationId = null } = {})
       close();
       toast(w.already_met ? 'Watching. It is already at or below your target, so you will be alerted on the next new low.' : `Watching ${w.title || 'the link'}. You will be alerted when the price drops.`, 5000);
       ensureNotifyPermission();
-      if (location.hash.startsWith('#/watches')) loadWatches(); else location.hash = '#/watches';
+      S.agentTab = 'prices'; if (location.hash.startsWith('#/agents')) loadAgents(); else location.hash = '#/agents';
     } catch (e) { out.insertAdjacentHTML('beforeend', `<div class="err-box">${esc(e.message)}</div>`); b.disabled = false; b.textContent = 'Start watching'; }
   };
   if (url) runPreview(); else setTimeout(() => $('#w-url', el)?.focus(), 0);
 }
 
+function localCurrency() {
+  try { const c = new Intl.NumberFormat(navigator.language, { style: 'currency', currency: 'USD' }).resolvedOptions().locale; const region = (new Intl.Locale(c).maximize().region) || ''; return ({ US: 'USD', GB: 'GBP', IN: 'INR', CA: 'CAD', AU: 'AUD', MX: 'MXN', JP: 'JPY', DE: 'EUR', FR: 'EUR', ES: 'EUR', IT: 'EUR', NL: 'EUR', IE: 'EUR' })[region] || null; } catch { return null; }
+}
 function ensureNotifyPermission() { try { if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission(); } catch {} }
 
 function renderWatches() {
@@ -1734,20 +1824,18 @@ function watchCardHTML(w) {
   const host = (() => { try { return new URL(w.url).hostname.replace(/^www\./, ''); } catch { return ''; } })();
   return `<article class="w-card ${w.status}" data-w="${w.id}">
     <div class="w-top"><div style="min-width:0;flex:1"><a class="w-name" href="${esc(w.url)}" target="_blank" rel="noopener noreferrer" title="${esc(w.title || w.url)}">${esc(w.title || host)}</a>
-      <div class="muted small">${esc(host)} · alert on ${cond} · ${esc(INTERVALS.find(([v]) => v === w.interval_minutes)?.[1].toLowerCase() || '')}</div></div>
+      <div class="muted small">${esc(host)} · alert on ${cond}</div></div>
       <span class="badge ${w.status === 'active' ? 'completed' : w.status === 'error' ? 'failed' : ''}">${w.status === 'active' ? 'Watching' : w.status === 'paused' ? 'Paused' : 'Stopped'}</span></div>
     <div class="w-mid"><div><div class="w-price">${money(w.last_price, w.currency)}</div>
       <div class="small">${change == null || Math.abs(change) < 0.0005 ? '<span class="muted">No change since you started</span>' : change < 0 ? `<span class="good">▼ ${pct(-change)} since you started</span>` : `<span class="bad">▲ ${pct(change)} since you started</span>`}</div>
       <div class="muted small">Lowest ${money(w.lowest_price, w.currency)}${w.in_stock === 0 ? ' · ⚠ out of stock' : ''}</div></div>
       <div class="spark" id="spark-${w.id}"></div></div>
     ${w.last_error ? `<div class="err-box small">⚠ ${esc(w.last_error)}</div>` : ''}
-    <div class="muted small">Checked ${ago(w.last_checked_at)}${w.status === 'active' ? ` · next ${until(w.next_check_at)}` : ''} · ${w.method === 'ai' ? 'price read by AI' : 'price from product data'}</div>
+    <div class="muted small" title="${w.method === 'ai' ? 'Price read by AI' : 'Price from product data'}">Checked ${ago(w.last_checked_at)} · ${esc(freqLabel(w.interval_minutes))}</div>
     <div class="card-actions">
       <button class="btn small" data-w-act="check">Check now</button>
-      <button class="btn small ghost" data-w-act="${w.status === 'active' ? 'pause' : 'resume'}">${w.status === 'active' ? 'Pause' : 'Resume'}</button>
-      <button class="btn small ghost" data-w-act="edit">Change alert</button>
-      <button class="btn small ghost" data-w-act="ask" title="Start a chat asking the models about this deal">Ask the models</button>
-      <button class="btn small ghost danger" data-w-act="delete">Delete</button></div></article>`;
+      <button class="btn small ghost" data-w-act="ask" title="Ask the models whether this is a good deal">💬 Ask</button>
+      <button class="btn small ghost" data-w-act="more" style="margin-left:auto" aria-label="More actions">⋯</button></div></article>`;
 }
 
 // Price history: one series, 2px line, end marker, hover tooltip.
@@ -1777,15 +1865,17 @@ document.addEventListener('click', async (e) => {
   const b = e.target.closest('[data-w-act]'); if (!b) return;
   const card = b.closest('[data-w]'); const id = card.dataset.w; const w = watchesData.find((x) => x.id === id);
   try {
-    switch (b.dataset.wAct) {
-      case 'check': { b.disabled = true; b.textContent = 'Checking…'; const r = await api('POST', `/api/watches/${id}/check`); toast(r.ok ? `Now ${money(r.price, r.watch.currency)}${r.alerted ? ' · alert sent' : ''}` : `Check failed: ${r.error}`); loadWatches(); break; }
-      case 'pause': case 'resume': await api('PATCH', `/api/watches/${id}`, { status: b.dataset.wAct === 'pause' ? 'paused' : 'active' }); loadWatches(); break;
-      case 'delete': if (confirm(`Stop watching ${w.title || 'this link'} and delete its history?`)) { await api('DELETE', `/api/watches/${id}`); loadWatches(); } break;
+    let act = b.dataset.wAct;
+    if (act === 'more') act = await openMenu(b, [['edit', 'Change alert'], [w.status === 'active' ? 'pause' : 'resume', w.status === 'active' ? 'Pause' : 'Resume'], ['delete', 'Delete', true]]);
+    switch (act) {
+      case 'check': { b.disabled = true; b.textContent = 'Checking…'; const r = await api('POST', `/api/watches/${id}/check`); toast(r.ok ? `Now ${money(r.price, r.watch.currency)}${r.alerted ? ' · alert sent' : ''}` : `Check failed: ${r.error}`); loadAgents(); break; }
+      case 'pause': case 'resume': await api('PATCH', `/api/watches/${id}`, { status: b.dataset.wAct === 'pause' ? 'paused' : 'active' }); loadAgents(); break;
+      case 'delete': if (confirm(`Stop watching ${w.title || 'this link'} and delete its history?`)) { await api('DELETE', `/api/watches/${id}`); loadAgents(); } break;
       case 'edit': {
         const v = prompt(w.condition === 'drop_pct' ? 'Alert when it drops by what percent?' : `Alert when the price is at or below (${w.currency || ''}):`, w.condition === 'drop_pct' ? w.drop_pct : (w.target_price ?? Math.floor((w.last_price || 0) * 0.9)));
         if (v == null) return;
         await api('PATCH', `/api/watches/${id}`, w.condition === 'drop_pct' ? { condition: 'drop_pct', drop_pct: Number(v) } : { condition: 'below', target_price: Number(v) });
-        toast('Alert updated'); loadWatches(); break;
+        toast('Alert updated'); loadAgents(); break;
       }
       case 'ask':
         newState.text = `Is this a good deal right now? ${w.title || ''}\n${w.url}\nCurrent price: ${money(w.last_price, w.currency)}. Lowest I've seen: ${money(w.lowest_price, w.currency)}. What should I consider before buying, and are there good alternatives?`;
@@ -1806,11 +1896,245 @@ async function pollNotifications() {
       lastNotifAt = Math.max(...fresh.map((x) => x.created_at));
       toast(`🔔 ${fresh[0].title}`, 6000);
       try { if (Notification.permission === 'granted' && document.hidden) for (const x of fresh) new Notification(x.title, { body: x.body || '', tag: x.id }); } catch {}
-      if (location.hash.startsWith('#/watches')) loadWatches();
+      if (location.hash.startsWith('#/agents')) loadAgents();
     }
   } catch {}
 }
 setInterval(pollNotifications, 60_000);
+
+
+// ---------- Agents hub: plain-English trackers (price, jobs, news, page) + alerts ----------
+const AGENT_EXAMPLES = [
+  'Tell me when AirPods Pro fall below $180 at https://www.walmart.com/ip/Apple-AirPods-Pro-2nd-Generation/1752657021, check 5 times a day',
+  'New graduate or AI product manager roles at AI companies, London or remote. No senior roles.',
+  'News about OpenAI and Anthropic product launches',
+  'Alert me when https://example.com changes',
+];
+let agentsData = { monitors: [], watches: [], notes: { items: [], unread: 0 } };
+let catalog = null;
+
+function renderAgents() {
+  closeStream();
+  S.conv = null; S.resp = new Map(); renderSidebar(); renderSkills();
+  const focus = new URLSearchParams(location.hash.split('?')[1] || '').get('m');
+  S.agentTab = focus ? 'trackers' : S.agentTab || 'trackers';
+  S.agentFocus = focus; S.agentOpen = S.agentOpen || new Set(focus ? [focus] : []);
+  $('#main').innerHTML = `${mobileTop('Agents')}<div class="new-wrap"><div class="new-inner agents viz-root">
+    <header class="ag-head"><div><h1>Agents</h1><p class="muted">They check the web on a schedule and alert you when something new shows up.</p></div>
+      <div class="seg ag-tabs" role="tablist">${[['trackers', 'Agents'], ['prices', 'Prices'], ['alerts', 'Alerts']].map(([k, l]) => `<button data-tab="${k}" role="tab">${l}${k === 'alerts' ? '<span class="tab-dot" id="tab-dot" hidden></span>' : ''}</button>`).join('')}</div></header>
+    <div class="ag-new"><span class="ag-new-icon">＋</span><input class="input" id="ag-req" placeholder="New agent: describe what to keep an eye on…" autocomplete="off"><button class="btn primary" id="ag-plan">Set up</button>
+      <div class="ag-suggest" id="ag-suggest" hidden>${AGENT_EXAMPLES.map((x, i) => `<button data-ex="${i}">${esc(x)}</button>`).join('')}</div></div>
+    <div id="ag-body"><div class="muted">Loading…</div></div></div></div>`;
+  const req = $('#ag-req'), sug = $('#ag-suggest');
+  const showSug = () => { sug.hidden = !!req.value; };
+  req.onfocus = showSug; req.oninput = showSug;
+  req.onblur = () => setTimeout(() => { sug.hidden = true; }, 150);
+  req.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); planAgent(); } if (e.key === 'Escape') req.blur(); };
+  sug.onmousedown = (e) => { const b = e.target.closest('[data-ex]'); if (b) { e.preventDefault(); req.value = AGENT_EXAMPLES[b.dataset.ex]; sug.hidden = true; req.focus(); } };
+  $('#ag-plan').onclick = planAgent;
+  $('.ag-tabs').onclick = (e) => { const b = e.target.closest('[data-tab]'); if (b) { S.agentTab = b.dataset.tab; drawAgents(); if (b.dataset.tab === 'alerts') markAlertsRead(); } };
+  if (S.agentPrefill) { req.value = S.agentPrefill; S.agentPrefill = null; planAgent(); }
+  loadAgents();
+}
+
+async function loadAgents() {
+  try {
+    const [monitors, watches, notes, cat] = await Promise.all([api('GET', '/api/monitors'), api('GET', '/api/watches'), api('GET', '/api/notifications'), catalog || api('GET', '/api/agents/catalog')]);
+    catalog = cat; agentsData = { monitors, watches, notes }; watchesData = watches;
+    drawAgents();
+    if (S.agentTab === 'alerts') markAlertsRead();
+  } catch (e) { $('#ag-body').innerHTML = `<div class="err-box">${esc(e.message)}</div>`; }
+}
+async function markAlertsRead() { if (agentsData.notes.unread) { await api('POST', '/api/notifications/read', {}).catch(() => {}); agentsData.notes.unread = 0; pollNotifications(); } }
+
+const dayLabel = (ms) => { const d = new Date(ms), t = new Date(); const diff = Math.floor((new Date(t.toDateString()) - new Date(d.toDateString())) / 86400000); return diff === 0 ? 'Today' : diff === 1 ? 'Yesterday' : 'Earlier'; };
+
+function drawAgents() {
+  const body = $('#ag-body'); if (!body) return;
+  document.querySelectorAll('.ag-tabs button').forEach((b) => b.classList.toggle('on', b.dataset.tab === S.agentTab));
+  const dot = $('#tab-dot'); if (dot) dot.hidden = !agentsData.notes.unread;
+  const { monitors, watches, notes } = agentsData;
+  if (S.agentTab === 'alerts') {
+    if (!notes.items.length) { body.innerHTML = emptyState('🔔', 'No alerts yet', 'When an agent finds something, it shows up here, as a badge in the sidebar, and as a browser notification.'); return; }
+    const groups = {}; for (const n of notes.items) (groups[dayLabel(n.created_at)] ||= []).push(n);
+    body.innerHTML = Object.entries(groups).map(([day, list]) => `<div class="ag-group"><div class="ag-group-label">${day}</div>${list.map((n) => {
+      const inApp = n.url?.startsWith('#');
+      return `<a class="alert-row ${n.read ? '' : 'unread'}" href="${esc(n.url || '#/agents')}" ${inApp || !n.url ? '' : 'target="_blank" rel="noopener noreferrer"'}>
+        <span class="ar-icon">${n.kind === 'price_drop' ? '🏷' : n.kind === 'monitor' ? '📡' : '⚠️'}</span>
+        <span class="ar-main"><span class="ar-title">${esc(n.title)}</span><span class="ar-body">${esc((n.body || '').split('\n')[0])}</span></span>
+        <span class="ar-time">${ago(n.created_at)}</span></a>`; }).join('')}</div>`).join('');
+  } else if (S.agentTab === 'prices') {
+    body.innerHTML = watches.length ? `<div class="w-grid">${watches.map(watchCardHTML).join('')}</div>`
+      : emptyState('🏷', 'No price watches', 'Describe one above, for example "tell me when this drops below $180" with a product link.');
+    watches.forEach(drawSpark);
+  } else {
+    body.innerHTML = monitors.length ? `<div class="ag-list">${monitors.map(agentRowHTML).join('')}</div>`
+      : emptyState('📡', 'No agents yet', 'Describe what you want above, for example new AI PM roles, news about a company, or a page to watch.');
+    if (S.agentFocus) { document.getElementById(`mon-${S.agentFocus}`)?.scrollIntoView({ block: 'start' }); S.agentFocus = null; }
+  }
+}
+const emptyState = (icon, title, text) => `<div class="ag-empty"><div class="ag-empty-icon">${icon}</div><b>${title}</b><p class="muted">${text}</p></div>`;
+
+const KIND_LABEL = { jobs: '💼 Jobs', news: '📰 News', page: '📄 Page', price: '🏷 Price' };
+const KIND_ICON = { jobs: '💼', news: '📰', page: '📄' };
+const freqLabel = (v) => (INTERVALS.find(([x]) => x === v)?.[1] || '').replace(/ \(hourly\)/, '').toLowerCase();
+function agentSummary(m) {
+  if (m.kind === 'page') { let host = m.url; try { host = new URL(m.url).hostname; } catch {} return `${host} · ${m.criteria ? `when: ${m.criteria}` : 'any change'}`; }
+  const q = monTerms(m.query); return `${q.slice(0, 2).join(', ')}${q.length > 2 ? ` +${q.length - 2}` : ''}${m.location ? ` · ${m.location}` : ''}`;
+}
+const monTerms = (q) => String(q || '').split(',').map((t) => t.trim()).filter(Boolean);
+function agentRowHTML(m) {
+  const open = S.agentOpen.has(m.id);
+  const fresh = m.items.filter((it) => it.found_at > (m.last_run_at || 0) - 60_000 && !it.feedback).length;
+  return `<article class="ag-row ${open ? 'open' : ''} ${m.status}" id="mon-${m.id}" data-mon="${m.id}">
+    <div class="ag-row-head" data-toggle>
+      <span class="ag-kind" title="${esc(m.kind)}">${KIND_ICON[m.kind]}</span>
+      <span class="ag-row-main"><span class="ag-row-name">${esc(m.name)}${m.status !== 'active' ? ` <span class="badge">${m.status === 'paused' ? 'Paused' : 'Stopped'}</span>` : ''}</span>
+        <span class="ag-row-sub">${esc(agentSummary(m))}</span></span>
+      ${m.last_error ? '<span class="ag-warn" title="' + esc(m.last_error) + '">⚠</span>' : ''}
+      ${fresh ? `<span class="new-pill">${fresh} new</span>` : m.items.length ? `<span class="ag-count">${m.items.length} found</span>` : ''}
+      <span class="ag-meta" title="Last run ${ago(m.last_run_at)}">${esc(freqLabel(m.interval_minutes))}</span>
+      <button class="btn small ghost ag-menu-btn" data-menu aria-label="More actions">⋯</button>
+      <span class="ag-chev">${open ? '▾' : '▸'}</span></div>
+    ${open ? `<div class="ag-row-body">
+      ${m.last_error ? `<div class="err-box warn small">⚠ ${esc(m.last_error)}</div>` : ''}
+      ${m.items.length ? m.items.map(itemHTML).join('') : `<div class="muted small ag-none">${m.kind === 'page' ? 'Nothing yet. You will be alerted when the condition is met.' : 'No matches yet. New ones will appear here.'}</div>`}
+      <div class="ag-foot muted small">Checks ${esc(freqLabel(m.interval_minutes))} · last run ${ago(m.last_run_at)}${m.status === 'active' ? ` · next ${until(m.next_run_at)}` : ''}${m.kind !== 'page' ? ` · 👍/👎 teach this agent what you want` : ''}</div></div>` : ''}
+  </article>`;
+}
+function itemHTML(it) {
+  const meta = [it.company, it.location, it.published_at && ago(it.published_at)].filter(Boolean).map(esc).join(' · ');
+  return `<div class="mon-item" data-item="${it.id}"><div class="mi-main">
+      <a href="${esc(it.url)}" target="_blank" rel="noopener noreferrer" class="mi-title">${esc(it.title)}</a>
+      ${meta ? `<div class="mi-meta">${meta}</div>` : ''}
+      ${it.reason ? `<div class="mi-reason" title="${it.score != null ? `AI match ${Math.round(it.score * 100)}%` : ''}">${esc(it.reason)}</div>` : ''}</div>
+    <div class="mi-fb"><button class="icon-btn ${it.feedback === 1 ? 'on' : ''}" data-fb="1" title="Useful: more like this">👍</button>
+      <button class="icon-btn" data-fb="-1" title="Not relevant: hide it">👎</button>
+      ${it.source !== 'page' ? `<button class="icon-btn" data-mi-ask title="Open a chat about this">💬</button>` : ''}</div></div>`;
+}
+
+// Small popover menu for row actions.
+function openMenu(anchor, items) {
+  document.querySelector('.pop-menu')?.remove();
+  const r = anchor.getBoundingClientRect();
+  const m = document.createElement('div'); m.className = 'pop-menu';
+  m.innerHTML = items.map(([k, label, danger]) => `<button data-k="${k}" class="${danger ? 'danger' : ''}">${label}</button>`).join('');
+  m.style.top = `${r.bottom + 4}px`; m.style.left = `${Math.max(8, r.right - 170)}px`;
+  document.body.appendChild(m);
+  return new Promise((ok) => {
+    const close = (v) => { m.remove(); document.removeEventListener('mousedown', outside, true); ok(v); };
+    const outside = (e) => { if (!m.contains(e.target)) close(null); };
+    m.onclick = (e) => { const b = e.target.closest('[data-k]'); if (b) close(b.dataset.k); };
+    setTimeout(() => document.addEventListener('mousedown', outside, true));
+  });
+}
+
+async function planAgent() {
+  const input = $('#ag-req'); const req = input.value.trim();
+  if (req.length < 8) { input.focus(); return toast('Describe what to keep an eye on'); }
+  const b = $('#ag-plan'); b.disabled = true; b.textContent = 'Planning…';
+  try {
+    catalog = catalog || await api('GET', '/api/agents/catalog');
+    const p = await api('POST', '/api/agents/plan', { request: req });
+    if (p.type === 'price') { input.value = ''; openWatchModal({ url: p.url, target: Number(p.target_price) || null, interval: p.interval_minutes }); return; }
+    const { el, close } = modal({ title: 'New agent', body: planCardHTML(p) });
+    wirePlanCard(el, p, () => { close(); input.value = ''; });
+  } catch (e) { fail(e); }
+  finally { b.disabled = false; b.textContent = 'Set up'; }
+}
+
+function planCardHTML(p) {
+  const field = (k, label, val, ph = '') => `<label class="small">${label}<input class="input" data-pf="${k}" value="${esc(val ?? '')}" placeholder="${esc(ph)}"></label>`;
+  const ints = INTERVALS.map(([v, l]) => `<option value="${v}" ${v === p.interval_minutes ? 'selected' : ''}>${l}</option>`).join('');
+  let fields = '';
+  if (p.type === 'price') fields = field('url', 'Product link', p.url) + `<div class="pf-row">${field('target_price', 'Alert at or below', p.target_price, 'e.g. 180')}</div>`;
+  if (p.type === 'jobs' || p.type === 'news') fields = field('query', p.type === 'jobs' ? 'Roles (comma-separated, include synonyms)' : 'Topics (comma-separated)', p.query)
+    + (p.type === 'jobs' ? `<div class="pf-row">${field('location', 'Location (optional)', p.location, 'London, Remote')}${field('exclude', 'Leave out titles with', p.exclude, 'Senior, Director')}</div>` : '')
+    + field('criteria', 'What counts (the AI screener uses this)', p.criteria, 'e.g. entry-level PM roles focused on AI products')
+    + `<div class="small"><b>Sources</b><div class="eval-crit">${catalog.sources.filter((x) => x.kind === p.type).map((x) => `<label class="chk"><input type="checkbox" data-src="${x.key}" ${p.type === 'news' || x.key !== 'companies' || p.companies?.length ? 'checked' : ''}> ${esc(x.label)}${x.key === 'companies' ? ` (${catalog.company_presets.length} AI & tech companies)` : ''}</label>`).join('')}</div></div>`;
+  if (p.type === 'page') fields = field('url', 'Page link', p.url) + field('criteria', 'Alert when the page says (leave empty to alert on any change)', p.criteria, 'e.g. applications are open');
+  return `<div class="plan-card"><div class="plan-head"><span class="badge">${KIND_LABEL[p.type]}</span> <input class="input plan-name" data-pf="name" value="${esc(p.name || '')}" aria-label="Name"></div>
+    ${p.summary ? `<div class="small muted">${esc(p.summary)}</div>` : ''}
+    ${fields}
+    <label class="small">How often<select class="select" data-pf="interval_minutes">${ints}</select></label>
+    <div class="plan-actions"><span class="muted small" style="margin-right:auto">Check the details, then create it.${p.planner_model ? ` Planned by ${esc(shortName(p.planner_model))}.` : ''}</span>
+      ${p.type !== 'price' ? '<button class="btn" data-plan="preview">Preview results</button>' : ''}<button class="btn primary" data-plan="create">Create agent</button></div>
+    <div class="plan-preview"></div></div>`;
+}
+
+function wirePlanCard(root, p, done = () => {}) {
+  const read = () => {
+    const v = { ...p };
+    root.querySelectorAll('[data-pf]').forEach((x) => { v[x.dataset.pf] = x.value.trim(); });
+    v.interval_minutes = Number(v.interval_minutes);
+    if (p.type === 'jobs' || p.type === 'news') {
+      v.sources = [...root.querySelectorAll('[data-src]:checked')].map((x) => x.dataset.src);
+      v.companies = v.sources.includes('companies') ? catalog.company_presets : [];
+    }
+    return v;
+  };
+  root.querySelector('[data-plan="create"]').onclick = async (e) => {
+    const v = read(); const b = e.target; b.disabled = true; b.textContent = 'Creating…';
+    try {
+      if (v.type === 'price') {
+        // Price trackers reuse the price-watch flow (it previews the product first).
+        root.innerHTML = ''; openWatchModal({ url: v.url, target: Number(v.target_price) || null, interval: v.interval_minutes });
+        return;
+      }
+      b.textContent = v.type === 'page' ? 'Checking the page…' : 'Searching sources and screening results…';
+      const m = await api('POST', '/api/monitors', { kind: v.type, name: v.name, request: v.request, query: v.query, location: v.location, exclude: v.exclude, criteria: v.criteria, url: v.url, sources: v.sources, companies: v.companies, interval_minutes: v.interval_minutes });
+      done();
+      toast(m.first_run?.ok === false ? `Created, but the first run failed: ${m.first_run.error}` : v.type === 'page' ? 'Agent created. You will be alerted when the page matches.' : `Agent created. First run found ${m.first_run?.new_relevant ?? 0} matches.`, 6000);
+      ensureNotifyPermission(); S.agentTab = 'trackers'; S.agentOpen.add(m.id); loadAgents();
+    } catch (err) { b.disabled = false; b.textContent = 'Create agent'; root.querySelector('.plan-preview').innerHTML = `<div class="err-box">${esc(err.message)}</div>`; }
+  };
+  const pv = root.querySelector('[data-plan="preview"]');
+  if (pv) pv.onclick = async () => {
+    const v = read(); const box = root.querySelector('.plan-preview'); pv.disabled = true; pv.textContent = 'Searching…';
+    box.innerHTML = '<div class="muted small">Searching every source and screening results with AI. This can take up to a minute.</div>';
+    try {
+      const r = await api('POST', '/api/monitors/preview', { kind: v.type, name: v.name, query: v.query, location: v.location, exclude: v.exclude, criteria: v.criteria, url: v.url, sources: v.sources, companies: v.companies, interval_minutes: v.interval_minutes });
+      box.innerHTML = v.type === 'page'
+        ? `<div class="small">${r.verdict ? `Right now the condition is <b>${r.verdict.met ? 'met' : 'not met'}</b>${r.verdict.evidence ? `: “${esc(r.verdict.evidence)}”` : ''}.` : 'The page was read. You will be alerted when it changes.'}</div>`
+        : `<div class="small muted">Scanned ${r.scanned} items, ${r.matched} matched your keywords, ${r.items.filter((x) => x.relevant).length} passed AI screening.${r.errors.length ? ` Some sources failed: ${esc(r.errors.join('; '))}` : ''}</div>
+          <div class="mon-items">${r.items.slice(0, 10).map((it) => `<div class="mon-item ${it.relevant ? '' : 'dim'}"><div style="flex:1;min-width:0"><a class="mi-title" href="${esc(it.url)}" target="_blank" rel="noopener noreferrer">${esc(it.title)}</a>
+            <div class="muted small">${[it.company, it.location].filter(Boolean).map(esc).join(' · ')}</div><div class="small mi-reason">${it.score == null ? '…' : it.relevant ? '✓' : '✗'} ${esc(it.reason || '')}${it.score != null ? ` <span class="muted">(${Math.round(it.score * 100)}%)</span>` : ''}</div></div></div>`).join('') || '<div class="muted small">Nothing right now. The agent will keep checking.</div>'}</div>`;
+    } catch (err) { box.innerHTML = `<div class="err-box">${esc(err.message)}</div>`; }
+    pv.disabled = false; pv.textContent = 'Preview results';
+  };
+}
+
+document.addEventListener('click', async (e) => {
+  const fb = e.target.closest('[data-fb]'), menu = e.target.closest('.ag-row [data-menu]'), ask = e.target.closest('[data-mi-ask]'), toggle = e.target.closest('.ag-row [data-toggle]');
+  if (!fb && !menu && !ask && !toggle) return;
+  const card = e.target.closest('[data-mon]'); const m = agentsData.monitors.find((x) => x.id === card?.dataset.mon);
+  try {
+    if (menu) {
+      e.stopPropagation();
+      const k = await openMenu(menu, [['run', 'Run now'], [m.status === 'active' ? 'pause' : 'resume', m.status === 'active' ? 'Pause' : 'Resume'], ['delete', 'Delete', true]]);
+      if (k === 'run') { toast('Running…'); const r = await api('POST', `/api/monitors/${m.id}/run`); S.agentOpen.add(m.id);
+        toast(r.ok ? (m.kind === 'page' ? (r.met ? 'Condition met' : r.changed ? 'The page changed' : 'No change') : `${r.new_relevant} new matches`) : `Run failed: ${r.error}`); loadAgents(); }
+      if (k === 'pause' || k === 'resume') { await api('PATCH', `/api/monitors/${m.id}`, { status: k === 'pause' ? 'paused' : 'active' }); loadAgents(); }
+      if (k === 'delete' && confirm(`Delete the agent "${m.name}" and its results?`)) { await api('DELETE', `/api/monitors/${m.id}`); loadAgents(); }
+      return;
+    }
+    if (fb) {
+      const row = fb.closest('[data-item]'); const v = Number(fb.dataset.fb);
+      await api('POST', `/api/monitor-items/${row.dataset.item}/feedback`, { value: v });
+      if (v === -1) { row.classList.add('gone'); setTimeout(() => row.remove(), 250); toast('Hidden. This agent will show fewer like it.'); }
+      else { fb.classList.add('on'); toast('Got it. This agent will look for more like this.'); }
+      const it = m?.items.find((x) => x.id === row.dataset.item); if (it) it.feedback = v;
+      return;
+    }
+    if (ask) {
+      const it = m.items.find((x) => x.id === ask.closest('[data-item]').dataset.item);
+      newState.text = m.kind === 'jobs' ? `Help me decide whether to apply for this role and what to highlight:\n${it.title}${it.company ? ` at ${it.company}` : ''}${it.location ? ` (${it.location})` : ''}\n${it.url}`
+        : `Summarize why this matters and what to watch next:\n${it.title}\n${it.url}`;
+      location.hash = '#/new'; return;
+    }
+    if (toggle) { S.agentOpen.has(m.id) ? S.agentOpen.delete(m.id) : S.agentOpen.add(m.id); card.outerHTML = agentRowHTML(m); }
+  } catch (err) { fail(err); }
+});
 
 // ---------- keyboard shortcuts ----------
 document.addEventListener('keydown', (e) => {

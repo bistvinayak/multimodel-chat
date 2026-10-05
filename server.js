@@ -2,7 +2,8 @@ import http from 'node:http';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { readFile, writeFile, mkdir, rm, stat } from 'node:fs/promises';
-import { createReadStream } from 'node:fs';
+import { createReadStream, readdirSync, readFileSync, existsSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { openDb, tx } from './lib/db.js';
 import { hashPassword, verifyPassword, createSession, destroySession, userFromRequest, parseCookies, sessionCookie } from './lib/auth.js';
@@ -13,7 +14,8 @@ import { buildContext } from './lib/context.js';
 import { streamCompletion, ModelError, probeModel, complete, keyInfo } from './lib/openrouter.js';
 import { initSecrets, encrypt, decrypt } from './lib/secrets.js';
 import { evaluateWithJev, evaluateWithJudge, buildBrief, overall, CRITERIA, DEFAULT_CRITERIA } from './lib/evaluator.js';
-import { safeFetch, checkRobots, extractStructured, extractWithAI, conditionMet } from './lib/watch.js';
+import { safeFetch, checkRobots, extractStructured, extractWithAI, conditionMet, buyLinks } from './lib/watch.js';
+import { SOURCES, COMPANY_PRESETS, collect, prefilter, dedupeKey, scoreRelevance, pageDigest, judgePage, planRequest, terms as monTerms } from './lib/monitor.js';
 import { detect, safeName, LIMITS, MAX_PER_MESSAGE, extractPdfText, describeImage, materialize } from './lib/attachments.js';
 import { titlePrompt, cleanTitle, summaryPlan, summaryPrompt } from './lib/memory.js';
 
@@ -79,7 +81,7 @@ const now = () => Date.now();
 const DEFAULT_PREFS = { max_output_tokens: 8192, free_only: true, auto_switch: true };
 
 // ---------- helpers ----------
-class HttpError extends Error { constructor(status, msg) { super(msg); this.status = status; } }
+class HttpError extends Error { constructor(status, msg, extra) { super(msg); this.status = status; this.extra = extra; } }
 
 function send(res, status, data, headers = {}) {
   res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...headers });
@@ -115,7 +117,7 @@ const touch = (convId) => db.prepare('UPDATE conversations SET updated_at=? WHER
 
 const RESPONSE_COLS = `id, turn_id, conversation_id, model_id, served_model, provider, display_position, content, reasoning,
   status, error_kind, error, finish_reason, latency_ms, first_token_ms, prompt_tokens, completion_tokens, cost,
-  saved, final, attempts, replaced_by, stands_in_for, auto_switched, trace_span_id, key_source, created_at, finished_at,
+  saved, final, attempts, replaced_by, stands_in_for, auto_switched, trace_span_id, key_source, rating, created_at, finished_at,
   json_array_length(versions) AS version_count`;
 const getResponseRow = (id) => db.prepare(`SELECT ${RESPONSE_COLS} FROM responses WHERE id=?`).get(id);
 
@@ -990,7 +992,7 @@ route('GET', '/api/metrics', async (req, res, { user }) => {
   const convFilter = q.get('conversation') ? ' AND c.id=?' : '';
   const args = [user.id, since, ...(q.get('conversation') ? [q.get('conversation')] : [])];
   const R = db.prepare(`SELECT r.id, r.model_id, r.status, r.error_kind, r.latency_ms, r.first_token_ms, r.prompt_tokens, r.completion_tokens, r.cost, r.attempts,
-      r.auto_switched, r.stands_in_for, r.key_source, r.turn_id, r.created_at, r.conversation_id
+      r.auto_switched, r.stands_in_for, r.key_source, r.turn_id, r.created_at, r.conversation_id, r.rating
     FROM responses r JOIN conversations c ON c.id=r.conversation_id
     WHERE c.user_id=? AND r.created_at>=? AND r.status NOT IN ('pending','generating')${convFilter}`).all(...args);
   const T = db.prepare(`SELECT t.id, t.mode, t.target_models, t.conversation_id, t.created_at,
@@ -1033,6 +1035,7 @@ route('GET', '/api/metrics', async (req, res, { user }) => {
     avg_models_per_message: mean(T.map((t) => JSON.parse(t.target_models).length)),
     messages_with_files: T.filter((t) => t.files > 0).length,
     picks: [...picks].length,
+    thumbs_up: R.filter((r) => r.rating === 1).length, thumbs_down: R.filter((r) => r.rating === -1).length,
     evaluations: E.length, evaluator_agreement: judged ? agree / judged : null, evaluator_agreement_n: judged,
     personal_key_share: R.length ? R.filter((r) => r.key_source === 'personal').length / R.length : null,
   };
@@ -1068,6 +1071,7 @@ route('GET', '/api/metrics', async (req, res, { user }) => {
       eval_overall: mean(evs.map((x) => x.score)), evaluated: evs.length,
       eval_wins: E.filter((e) => evIds.has(e.id) && db.prepare('SELECT model_id FROM responses WHERE id=?').get(e.recommended_response)?.model_id === id).length,
       stand_in_for_others: rows.filter((r) => r.stands_in_for && r.auto_switched).length,
+      thumbs_up: rows.filter((r) => r.rating === 1).length, thumbs_down: rows.filter((r) => r.rating === -1).length,
     };
   }).sort((a, b) => b.answers - a.answers);
   const crit = [...new Set(ES.map((x) => x.criterion).filter((c) => c !== 'overall'))];
@@ -1080,7 +1084,10 @@ route('GET', '/api/metrics', async (req, res, { user }) => {
 });
 
 // ---------- price-watch agent ----------
-const WATCH_INTERVALS = [60, 180, 360, 720, 1440];
+// Checks per day: 24, 12, 8, 6, 5, 4, 3, 2, 1 (5 a day = every 288 minutes).
+// Manual 'check now' cooldown; the health check's throwaway instance sets it to 0.
+const COOLDOWN_MS = Number(process.env.CHECK_NOW_COOLDOWN_MS ?? 120_000);
+const WATCH_INTERVALS = [60, 120, 180, 240, 288, 360, 480, 720, 1440];
 const MAX_WATCHES = 25;
 const watchFetchOpts = () => ({ allowPrivate: process.env.WATCH_ALLOW_PRIVATE === '1' }); // tests only
 const lastHit = new Map(); // hostname -> last fetch time (politeness)
@@ -1103,7 +1110,12 @@ async function inspectUrlInner(user, url) {
   if (x.price == null) {
     const ai = await extractWithAI({ apiKey: keyFor(user).key, models: (await backgroundModels()).map((m) => m.id), html: page.body, url: page.url });
     x = { ...x, ...ai, title: ai.title || x.title };
-    if (x.price == null) throw new HttpError(400, ai.error || 'Could not find a product price on that page.');
+    if (x.price == null) {
+      const suggestions = buyLinks(page.body, page.url);
+      throw new HttpError(400, suggestions.length
+        ? 'This looks like an overview page without a single product price. Try the store page instead.'
+        : (ai.error || 'Could not find a product price on that page.'), { suggestions });
+    }
   }
   return { ...x, final_url: page.url };
 }
@@ -1168,7 +1180,7 @@ function watchSettings(body, base = {}) {
   if (condition === 'below' && !(out.target_price > 0)) throw new HttpError(400, 'Enter the target price.');
   out.drop_pct = condition === 'drop_pct' ? Number(body.drop_pct ?? base.drop_pct) : null;
   if (condition === 'drop_pct' && !(out.drop_pct > 0 && out.drop_pct < 100)) throw new HttpError(400, 'Enter a drop between 1 and 99 percent.');
-  out.interval_minutes = Number(body.interval_minutes ?? base.interval_minutes ?? 360);
+  out.interval_minutes = Number(body.interval_minutes ?? base.interval_minutes ?? 288);
   if (!WATCH_INTERVALS.includes(out.interval_minutes)) throw new HttpError(400, 'Choose how often to check.');
   return out;
 }
@@ -1222,7 +1234,7 @@ route('DELETE', '/api/watches/:id', async (req, res, { user, params }) => {
 
 route('POST', '/api/watches/:id/check', async (req, res, { user, params }) => {
   const w = ownWatch(user, params.id);
-  if (w.last_checked_at && now() - w.last_checked_at < 120_000) throw new HttpError(429, 'Checked less than 2 minutes ago. Try again shortly.');
+  if (w.last_checked_at && now() - w.last_checked_at < COOLDOWN_MS) throw new HttpError(429, 'Checked less than 2 minutes ago. Try again shortly.');
   const r = await checkWatch(w);
   send(res, 200, { ...r, watch: watchPayload(db.prepare('SELECT * FROM watches WHERE id=?').get(w.id)) });
 });
@@ -1237,6 +1249,284 @@ route('POST', '/api/notifications/read', async (req, res, { user }) => {
   if (Array.isArray(ids) && ids.length) for (const id of ids) db.prepare('UPDATE notifications SET read=1 WHERE id=? AND user_id=?').run(String(id), user.id);
   else db.prepare('UPDATE notifications SET read=1 WHERE user_id=?').run(user.id);
   send(res, 200, { ok: true });
+});
+
+// ---------- tracker agents: jobs, news, page (price watches live above) ----------
+const MON_INTERVALS = [60, 120, 180, 240, 288, 360, 480, 720, 1440];
+const nearestInterval = (v, list = MON_INTERVALS) => list.reduce((a, b) => (Math.abs(b - v) < Math.abs(a - v) ? b : a));
+const MAX_MONITORS = 20;
+const monitorsRunning = new Set();
+const jevCfg = (user) => { const k = jevKeyFor(user); return k ? { key: k.key, base: JEV_BASE } : null; };
+
+function normalizeMonitor(body, base = {}) {
+  const kind = body.kind ?? base.kind;
+  if (!['jobs', 'news', 'page'].includes(kind)) throw new HttpError(400, 'Tracker type must be jobs, news or page');
+  const out = { kind, name: String(body.name ?? base.name ?? '').trim().slice(0, 80) };
+  for (const k of ['query', 'location', 'exclude', 'criteria']) out[k] = String(body[k] ?? base[k] ?? '').trim().slice(0, 500) || null;
+  if (kind !== 'page' && !monTerms(out.query).length) throw new HttpError(400, 'Say what to look for, for example "AI Product Manager, AI PM".');
+  out.url = kind === 'page' ? String(body.url ?? base.url ?? '').trim() : null;
+  if (kind === 'page' && !/^https?:\/\//i.test(out.url || '')) throw new HttpError(400, 'Add the link of the page to watch.');
+  const defaults = kind === 'jobs' ? ['companies', 'hn_hiring', 'remotive', 'remoteok', 'arbeitnow'] : kind === 'news' ? ['google_news', 'hn'] : [];
+  const src = Array.isArray(body.sources) ? body.sources : base.sources ? JSON.parse(base.sources) : defaults;
+  out.sources = JSON.stringify(src.filter((x) => SOURCES[x]?.kind === kind));
+  const comp = Array.isArray(body.companies) ? body.companies : base.companies ? JSON.parse(base.companies) : (kind === 'jobs' ? COMPANY_PRESETS : []);
+  out.companies = JSON.stringify(comp.map(String).filter((c) => /^(greenhouse|ashby|lever):[a-z0-9-]+$/i.test(c)).slice(0, 30));
+  out.interval_minutes = nearestInterval(Number(body.interval_minutes ?? base.interval_minutes ?? (kind === 'news' ? 360 : 720)));
+  if (!out.name) out.name = kind === 'page' ? `Watch ${(() => { try { return new URL(out.url).hostname; } catch { return 'page'; } })()}` : monTerms(out.query)[0];
+  return out;
+}
+
+/** One run: collect -> keyword filter -> drop already seen -> AI screening (+feedback) -> store -> alert. */
+async function runMonitor(m, { preview = false } = {}) {
+  const user = userById(m.user_id) || m._user;
+  if (!user) return { ok: false, error: 'Owner missing' };
+  const apiKey = keyFor(user).key;
+  const models = (await backgroundModels()).map((x) => x.id);
+  if (m.kind === 'page') {
+    if (!(await checkRobots(m.url, watchFetchOpts()))) throw new HttpError(400, "This site's robots.txt does not allow automated checks of that page.");
+    const page = await safeFetch(m.url, watchFetchOpts());
+    if (page.status >= 400) throw new HttpError(400, `The page returned HTTP ${page.status}.`);
+    const { text, hash } = pageDigest(page.body);
+    const state = JSON.parse(m.state || '{}');
+    let event = null, verdict = null;
+    if (m.criteria) {
+      verdict = await judgePage({ text, criteria: m.criteria, url: m.url, jev: jevCfg(user), apiKey, models });
+      if (verdict.met && !state.met) event = { title: `Condition met: ${m.criteria}`, snippet: verdict.evidence || 'The condition is now true on the page.' };
+      state.met = verdict.met;
+    } else if (state.hash && state.hash !== hash) event = { title: 'The page changed', snippet: text.slice(0, 300) };
+    state.hash = hash;
+    if (preview) return { ok: true, preview: true, verdict, text_sample: text.slice(0, 400), event };
+    db.prepare('UPDATE monitors SET state=? WHERE id=?').run(JSON.stringify(state), m.id);
+    if (event) {
+      db.prepare(`INSERT OR IGNORE INTO monitor_items (id, monitor_id, dedupe_key, source, url, title, snippet, found_at, score, relevant) VALUES (?,?,?,?,?,?,?,?,?,1)`)
+        .run(uid(), m.id, `${hash}:${now()}`, 'page', m.url, event.title, event.snippet, now(), verdict?.confidence ?? 1);
+      notify(m.user_id, { kind: 'monitor', title: `${m.name}: ${event.title}`, body: event.snippet, url: `#/agents?m=${m.id}`, watch_id: m.id });
+    }
+    return { ok: true, met: verdict?.met ?? null, changed: !!event };
+  }
+  const { items, errors, scanned } = await collect(m);
+  let candidates = prefilter(m, items);
+  if (!preview) {
+    const seen = new Set(db.prepare('SELECT dedupe_key FROM monitor_items WHERE monitor_id=?').all(m.id).map((r) => r.dedupe_key));
+    candidates = candidates.filter((it) => !seen.has(dedupeKey(it)));
+  }
+  candidates.sort((a, b) => (b.published_at || 0) - (a.published_at || 0));
+  candidates = candidates.slice(0, preview ? 25 : 40);
+  const feedback = preview ? [] : db.prepare('SELECT title, feedback FROM monitor_items WHERE monitor_id=? AND feedback IS NOT NULL ORDER BY feedback_at DESC LIMIT 16').all(m.id);
+  const scores = await scoreRelevance({ m, items: candidates, jev: jevCfg(user), apiKey, models, feedback });
+  const scored = candidates.map((it, i) => ({ ...it, score: scores[i].score, reason: scores[i].reason, by: scores[i].by, relevant: scores[i].score != null && scores[i].score >= 0.5 }));
+  const unscreened = scored.filter((x) => x.score == null).length;
+  if (preview) return { ok: true, scanned, matched: candidates.length, errors, unscreened, items: scored.sort((a, b) => (b.score ?? -1) - (a.score ?? -1)) };
+  if (unscreened) errors.push(`${unscreened} result${unscreened > 1 ? 's' : ''} could not be screened and will be retried next run`);
+  const ins = db.prepare(`INSERT OR IGNORE INTO monitor_items (id, monitor_id, dedupe_key, source, url, title, snippet, company, location, published_at, found_at, score, reason, relevant)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+  for (const it of scored.filter((x) => x.score != null)) ins.run(uid(), m.id, dedupeKey(it), it.source, it.url, it.title, it.snippet, it.company, it.location, it.published_at, now(), it.score, it.reason, it.relevant ? 1 : 0);
+  const fresh = scored.filter((x) => x.relevant).sort((a, b) => b.score - a.score);
+  if (fresh.length) notify(m.user_id, { kind: 'monitor', title: `${fresh.length} new ${fresh.length === 1 ? 'match' : 'matches'}: ${m.name}`,
+    body: fresh.slice(0, 3).map((x) => `${x.title}${x.company ? ` · ${x.company}` : ''}`).join('\n'), url: `#/agents?m=${m.id}`, watch_id: m.id });
+  return { ok: true, scanned, matched: candidates.length, new_relevant: fresh.length, errors };
+}
+
+async function runMonitorScheduled(m) {
+  if (monitorsRunning.has(m.id)) return;
+  monitorsRunning.add(m.id);
+  const t = now();
+  try {
+    const r = await runMonitor(m);
+    db.prepare(`UPDATE monitors SET last_run_at=?, next_run_at=?, failures=0, last_error=? WHERE id=?`)
+      .run(t, t + m.interval_minutes * 60_000 + Math.floor(Math.random() * 5 * 60_000), r.errors?.length ? `Some sources failed: ${r.errors.join('; ').slice(0, 300)}` : null, m.id);
+    return r;
+  } catch (e) {
+    const failures = m.failures + 1;
+    db.prepare('UPDATE monitors SET last_run_at=?, next_run_at=?, failures=?, last_error=?, status=? WHERE id=?')
+      .run(t, t + Math.min(1440, m.interval_minutes * 2 ** failures) * 60_000, failures, e.message, failures >= 8 ? 'error' : m.status, m.id);
+    return { ok: false, error: e.message };
+  } finally { monitorsRunning.delete(m.id); }
+}
+
+setInterval(async () => {
+  for (const m of db.prepare(`SELECT * FROM monitors WHERE status='active' AND next_run_at <= ? ORDER BY next_run_at LIMIT 3`).all(now())) {
+    if (!userById(m.user_id)) { db.prepare(`UPDATE monitors SET status='paused' WHERE id=?`).run(m.id); continue; }
+    await runMonitorScheduled(m).catch((e) => console.warn('[monitor]', e.message));
+  }
+}, 60_000).unref();
+
+const ownMonitor = (user, id) => { const m = db.prepare('SELECT * FROM monitors WHERE id=? AND user_id=?').get(id, user.id); if (!m) throw new HttpError(404, 'Tracker not found'); return m; };
+const monitorPayload = (m) => ({ ...m, sources: JSON.parse(m.sources), companies: JSON.parse(m.companies), state: undefined,
+  counts: db.prepare('SELECT COUNT(*) total, SUM(relevant) relevant, SUM(feedback=1) liked, SUM(feedback=-1) disliked FROM monitor_items WHERE monitor_id=?').get(m.id),
+  items: db.prepare('SELECT * FROM monitor_items WHERE monitor_id=? AND relevant=1 AND dismissed=0 ORDER BY found_at DESC, score DESC LIMIT 25').all(m.id) });
+
+route('GET', '/api/agents/catalog', async (req, res) => {
+  send(res, 200, { sources: Object.entries(SOURCES).map(([key, v]) => ({ key, ...v })), company_presets: COMPANY_PRESETS, intervals: MON_INTERVALS });
+});
+
+// Plain-English request -> a tracker config the user confirms before anything is created.
+route('POST', '/api/agents/plan', async (req, res, { user }) => {
+  const request = String((await readJson(req)).request || '').trim().slice(0, 1500);
+  if (request.length < 8) throw new HttpError(400, 'Describe what you want to track.');
+  let plan;
+  try { plan = await planRequest({ request, apiKey: keyFor(user).key, models: (await backgroundModels()).map((m) => m.id) }); }
+  catch (e) { throw new HttpError(502, e.message); }
+  if (plan.type === 'price') {
+    plan.interval_minutes = nearestInterval(Number(plan.interval_minutes || 288), WATCH_INTERVALS);
+    plan.condition = ['below', 'drop_pct', 'any_drop'].includes(plan.condition) ? plan.condition : plan.target_price ? 'below' : 'any_drop';
+  } else plan.interval_minutes = nearestInterval(Number(plan.interval_minutes || (plan.type === 'news' ? 360 : 720)));
+  if (plan.type === 'jobs') plan.companies = plan.use_company_boards === false ? [] : COMPANY_PRESETS;
+  plan.request = request;
+  send(res, 200, plan);
+});
+
+route('GET', '/api/monitors', async (req, res, { user }) => {
+  send(res, 200, db.prepare('SELECT * FROM monitors WHERE user_id=? ORDER BY created_at DESC').all(user.id).map(monitorPayload));
+});
+
+route('POST', '/api/monitors/preview', async (req, res, { user }) => {
+  const cfg = normalizeMonitor(await readJson(req));
+  send(res, 200, await runMonitor({ ...cfg, id: 'preview', user_id: user.id, _user: user, state: '{}', failures: 0 }, { preview: true }));
+});
+
+route('POST', '/api/monitors', async (req, res, { user }) => {
+  const body = await readJson(req);
+  if (db.prepare(`SELECT COUNT(*) n FROM monitors WHERE user_id=? AND status<>'paused'`).get(user.id).n >= MAX_MONITORS) throw new HttpError(400, `Up to ${MAX_MONITORS} active trackers. Pause or delete one first.`);
+  const cfg = normalizeMonitor(body);
+  const id = uid(), t = now();
+  db.prepare(`INSERT INTO monitors (id, user_id, kind, name, request, query, location, exclude, criteria, url, sources, companies, interval_minutes, next_run_at, created_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, user.id, cfg.kind, cfg.name, body.request ? String(body.request).slice(0, 1500) : null, cfg.query, cfg.location, cfg.exclude, cfg.criteria, cfg.url,
+    cfg.sources, cfg.companies, cfg.interval_minutes, t + cfg.interval_minutes * 60_000, t);
+  const first = await runMonitorScheduled(db.prepare('SELECT * FROM monitors WHERE id=?').get(id)); // first run right away
+  send(res, 201, { ...monitorPayload(db.prepare('SELECT * FROM monitors WHERE id=?').get(id)), first_run: first });
+});
+
+route('PATCH', '/api/monitors/:id', async (req, res, { user, params }) => {
+  const m = ownMonitor(user, params.id);
+  const body = await readJson(req);
+  if (body.status) {
+    if (!['active', 'paused'].includes(body.status)) throw new HttpError(400, 'status must be active or paused');
+    db.prepare('UPDATE monitors SET status=?, failures=0, next_run_at=? WHERE id=?').run(body.status, body.status === 'active' ? now() + 60_000 : m.next_run_at, m.id);
+  }
+  const fields = ['name', 'query', 'location', 'exclude', 'criteria', 'url', 'sources', 'companies', 'interval_minutes'];
+  if (fields.some((f) => body[f] !== undefined)) {
+    const cfg = normalizeMonitor({ ...body, kind: m.kind }, m);
+    db.prepare('UPDATE monitors SET name=?, query=?, location=?, exclude=?, criteria=?, url=?, sources=?, companies=?, interval_minutes=? WHERE id=?')
+      .run(cfg.name, cfg.query, cfg.location, cfg.exclude, cfg.criteria, cfg.url, cfg.sources, cfg.companies, cfg.interval_minutes, m.id);
+  }
+  send(res, 200, monitorPayload(db.prepare('SELECT * FROM monitors WHERE id=?').get(m.id)));
+});
+
+route('DELETE', '/api/monitors/:id', async (req, res, { user, params }) => {
+  db.prepare('DELETE FROM monitors WHERE id=?').run(ownMonitor(user, params.id).id);
+  send(res, 200, { ok: true });
+});
+
+route('POST', '/api/monitors/:id/run', async (req, res, { user, params }) => {
+  const m = ownMonitor(user, params.id);
+  if (m.last_run_at && now() - m.last_run_at < COOLDOWN_MS) throw new HttpError(429, 'Ran less than 2 minutes ago. Try again shortly.');
+  const r = await runMonitorScheduled(m);
+  send(res, 200, { ...r, monitor: monitorPayload(db.prepare('SELECT * FROM monitors WHERE id=?').get(m.id)) });
+});
+
+// User feedback on a result: 1 useful, -1 not relevant, 0 clears. It steers future screening and feeds the eval set.
+route('POST', '/api/monitor-items/:id/feedback', async (req, res, { user, params }) => {
+  const it = db.prepare(`SELECT i.* FROM monitor_items i JOIN monitors m ON m.id=i.monitor_id WHERE i.id=? AND m.user_id=?`).get(params.id, user.id);
+  if (!it) throw new HttpError(404, 'Result not found');
+  const v = Number((await readJson(req)).value);
+  if (![1, -1, 0].includes(v)) throw new HttpError(400, 'value must be 1, -1 or 0');
+  db.prepare('UPDATE monitor_items SET feedback=?, feedback_at=?, dismissed=? WHERE id=?').run(v || null, v ? now() : null, v === -1 ? 1 : 0, it.id);
+  send(res, 200, { ok: true });
+});
+
+// ---------- AI evaluation suite (evals/run.js) ----------
+const EVAL_DIR = path.join(path.dirname(DB_FILE), 'evals');
+let evalRun = null; // { started_at, log: [] }
+let lastEvalStart = 0;
+function evalSummary(file) {
+  try {
+    const r = JSON.parse(readFileSync(path.join(EVAL_DIR, file), 'utf8'));
+    return { file, run_at: r.run_at, passed: r.passed, runs: r.runs.map((x) => ({ label: x.label, passed: x.passed,
+      gates: Object.fromEntries(Object.entries(x.suites).map(([k, v]) => [k, v.gate])) })) };
+  } catch { return null; }
+}
+route('GET', '/api/evals', async (req, res) => {
+  const latest = existsSync(path.join(EVAL_DIR, 'latest.json')) ? JSON.parse(readFileSync(path.join(EVAL_DIR, 'latest.json'), 'utf8')) : null;
+  const history = existsSync(EVAL_DIR) ? readdirSync(EVAL_DIR).filter((f) => /^run-\d+\.json$/.test(f)).sort().reverse().slice(0, 10).map(evalSummary).filter(Boolean) : [];
+  send(res, 200, { latest, history, running: evalRun ? { started_at: evalRun.started_at, log: evalRun.log.slice(-12) } : null,
+    feedback_cases: db.prepare('SELECT COUNT(*) n FROM monitor_items WHERE feedback IS NOT NULL').get().n });
+});
+route('POST', '/api/evals/run', async (req, res) => {
+  if (evalRun) throw new HttpError(409, 'An evaluation run is already in progress.');
+  if (now() - lastEvalStart < 10 * 60_000) throw new HttpError(429, 'The suite ran less than 10 minutes ago. Try again later.');
+  lastEvalStart = now();
+  evalRun = { started_at: now(), log: [] };
+  const child = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', path.join(ROOT, 'evals', 'run.js'), '--db', DB_FILE, '--out', EVAL_DIR], { cwd: ROOT, env: process.env });
+  const onData = (d) => evalRun?.log.push(...String(d).split('\n').filter(Boolean));
+  child.stdout.on('data', onData); child.stderr.on('data', onData);
+  child.on('close', () => { evalRun = null; });
+  send(res, 202, { ok: true });
+});
+
+// ---------- user feedback ----------
+const APP_VERSION = JSON.parse(readFileSync(path.join(ROOT, 'package.json'), 'utf8')).version;
+route('POST', '/api/feedback', async (req, res, { user }) => {
+  const b = await readJson(req);
+  const kind = ['bug', 'idea', 'question', 'praise'].includes(b.kind) ? b.kind : 'idea';
+  const message = String(b.message || '').trim().slice(0, 5000);
+  if (message.length < 3) throw new HttpError(400, 'Tell us a little more.');
+  const shot = typeof b.screenshot === 'string' && /^data:image\/(png|jpeg|webp);base64,/.test(b.screenshot) ? b.screenshot : null;
+  if (shot && shot.length > 3_500_000) throw new HttpError(413, 'The screenshot is too large (max about 2.5 MB).');
+  const ctx = { ...(b.context && typeof b.context === 'object' ? b.context : {}), app_version: APP_VERSION };
+  const id = uid();
+  db.prepare('INSERT INTO feedback (id, user_id, kind, message, route, context, screenshot, created_at) VALUES (?,?,?,?,?,?,?,?)')
+    .run(id, user.id, kind, message, String(b.route || '').slice(0, 200), JSON.stringify(ctx).slice(0, 20000), shot, now());
+  send(res, 201, { id });
+});
+// Note: this workspace is single-tenant, so a user sees the feedback they sent. A team version would add an admin role.
+route('GET', '/api/feedback', async (req, res, { user }) => {
+  send(res, 200, db.prepare('SELECT id, kind, message, route, context, status, created_at, (screenshot IS NOT NULL) AS has_screenshot FROM feedback WHERE user_id=? ORDER BY created_at DESC LIMIT 200').all(user.id)
+    .map((f) => ({ ...f, context: JSON.parse(f.context || '{}') })));
+});
+route('GET', '/api/feedback/:id/screenshot', async (req, res, { user, params }) => {
+  const f = db.prepare('SELECT screenshot FROM feedback WHERE id=? AND user_id=?').get(params.id, user.id);
+  if (!f?.screenshot) throw new HttpError(404, 'No screenshot');
+  const [, mime, b64] = f.screenshot.match(/^data:([^;]+);base64,(.*)$/);
+  res.writeHead(200, { 'Content-Type': mime, 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'private, max-age=3600' }); res.end(Buffer.from(b64, 'base64'));
+});
+route('PATCH', '/api/feedback/:id', async (req, res, { user, params }) => {
+  const st = (await readJson(req)).status;
+  if (!['new', 'triaged', 'done'].includes(st)) throw new HttpError(400, 'status must be new, triaged or done');
+  db.prepare('UPDATE feedback SET status=? WHERE id=? AND user_id=?').run(st, params.id, user.id);
+  send(res, 200, { ok: true });
+});
+
+// 👍/👎 on an answer: a quality signal separate from "picking" an answer.
+route('POST', '/api/responses/:id/rate', async (req, res, { user, params }) => {
+  const r = ownResponse(user, params.id);
+  const v = Number((await readJson(req)).value);
+  if (![1, -1, 0].includes(v)) throw new HttpError(400, 'value must be 1, -1 or 0');
+  db.prepare('UPDATE responses SET rating=? WHERE id=?').run(v || null, r.id);
+  if (v) {
+    db.prepare(`INSERT INTO preference_events (id, user_id, conversation_id, turn_id, event_type, winning_response, winning_model, compared_responses, compared_models, display_position, created_at)
+      VALUES (?,?,?,?,?,?,?,'[]','[]',?,?)`).run(uid(), user.id, r.conversation_id, r.turn_id, v > 0 ? 'thumbs_up' : 'thumbs_down', r.id, r.model_id, r.display_position, now());
+    if (lf.enabled()) { const cur = db.prepare('SELECT trace_span_id FROM responses WHERE id=?').get(r.id); lf.score({ name: 'user_rating', value: v, traceId: lf.traceIdFor(r.turn_id), observationId: cur?.trace_span_id || undefined }); }
+  }
+  send(res, 200, getResponseRow(r.id));
+});
+
+// ---------- app health check (scripts/check.js) ----------
+const CHECK_DIR = path.join(path.dirname(DB_FILE), 'checks');
+let checkRun = null; let lastCheckStart = 0;
+route('GET', '/api/checks', async (req, res) => {
+  const latest = existsSync(path.join(CHECK_DIR, 'latest.json')) ? JSON.parse(readFileSync(path.join(CHECK_DIR, 'latest.json'), 'utf8')) : null;
+  send(res, 200, { latest, running: checkRun ? { started_at: checkRun.started_at, log: checkRun.log.slice(-25) } : null });
+});
+route('POST', '/api/checks/run', async (req, res) => {
+  if (checkRun) throw new HttpError(409, 'A health check is already running.');
+  if (now() - lastCheckStart < 5 * 60_000) throw new HttpError(429, 'The check ran less than 5 minutes ago. Try again shortly.');
+  lastCheckStart = now(); checkRun = { started_at: now(), log: [] };
+  const child = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', path.join(ROOT, 'scripts', 'check.js'), '--out', CHECK_DIR], { cwd: ROOT, env: process.env });
+  const onData = (d) => checkRun?.log.push(...String(d).split('\n').filter(Boolean));
+  child.stdout.on('data', onData); child.stderr.on('data', onData);
+  child.on('close', () => { checkRun = null; });
+  send(res, 202, { ok: true });
 });
 
 route('GET', '/api/conversations', async (req, res, { user }) => {
@@ -1565,7 +1855,7 @@ export const server = http.createServer(async (req, res) => {
     throw new HttpError(404, 'Not found');
   } catch (e) {
     if (!(e instanceof HttpError)) console.error(e);
-    if (!res.headersSent) send(res, e.status || 500, { error: e.status ? e.message : 'Internal error' });
+    if (!res.headersSent) send(res, e.status || 500, { error: e.status ? e.message : 'Internal error', ...(e.status ? e.extra || {} : {}) });
     else res.end();
   }
 });

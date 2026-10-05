@@ -1,0 +1,17 @@
+{ "description": "Plain-English tracking requests -> expected tracker plan. Checks type and the fields the user stated explicitly.",
+  "cases": [
+  { "id": "price-below-5x", "request": "Tell me when these headphones fall below 110 dollars, check 5 times a day: https://shop.example.com/p/headphones", "expect": { "type": "price", "url": "https://shop.example.com/p/headphones", "condition": "below", "target_price": 110, "interval_minutes": 288 } },
+  { "id": "price-any-drop", "request": "Watch https://store.example.com/item/42 and ping me if the price drops at all", "expect": { "type": "price", "condition": "any_drop" } },
+  { "id": "price-pct", "request": "Alert me if https://store.example.com/tv drops by 20%", "expect": { "type": "price", "condition": "drop_pct", "drop_pct": 20 } },
+  { "id": "price-hourly", "request": "check hourly whether https://store.example.com/ps6 is under $450", "expect": { "type": "price", "target_price": 450, "interval_minutes": 60 } },
+  { "id": "jobs-grad-aipm", "request": "Notify me about new graduate or AI product manager roles at AI companies, London or remote. No senior roles.", "expect": { "type": "jobs", "query_any": ["product manager", "pm"], "location_any": ["london"], "exclude_any": ["senior"] } },
+  { "id": "jobs-ds-berlin", "request": "Any new junior data scientist openings in Berlin?", "expect": { "type": "jobs", "query_any": ["data scientist"], "location_any": ["berlin"] } },
+  { "id": "jobs-remote-eng", "request": "keep me posted on remote backend engineer jobs using Go", "expect": { "type": "jobs", "query_any": ["backend", "go"], "location_any": ["remote"] } },
+  { "id": "jobs-intern", "request": "let me know when AI labs open product management internships", "expect": { "type": "jobs", "query_any": ["intern"] } },
+  { "id": "news-launches", "request": "Keep me posted on news about OpenAI and Anthropic product launches", "expect": { "type": "news", "query_any": ["openai", "anthropic"] } },
+  { "id": "news-rates", "request": "Tell me whenever there's news about RBI interest rate decisions", "expect": { "type": "news", "query_any": ["rbi", "interest rate", "repo rate"] } },
+  { "id": "news-competitor", "request": "monitor news mentioning Notion's new AI features, daily", "expect": { "type": "news", "query_any": ["notion"], "interval_minutes": 1440 } },
+  { "id": "page-applications", "request": "Alert me when https://fellowship.example.org/apply says applications are open", "expect": { "type": "page", "url": "https://fellowship.example.org/apply", "criteria_any": ["open"] } },
+  { "id": "page-any-change", "request": "let me know when this page changes https://example.com/status", "expect": { "type": "page", "url": "https://example.com/status" } },
+  { "id": "page-tickets", "request": "Notify me when tickets go on sale on https://events.example.com/concert-2027", "expect": { "type": "page", "criteria_any": ["ticket", "sale"] } }
+  ] }

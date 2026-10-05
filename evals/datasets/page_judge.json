@@ -1,0 +1,14 @@
+{ "description": "Is the user's condition true on this page right now?",
+  "cases": [
+    { "id": "apps-open", "criteria": "Applications are open", "text": "2027 Fellowship. Applications are now open! Apply by March 1, 2027. Read the eligibility rules.", "met": true },
+    { "id": "apps-closed", "criteria": "Applications are open", "text": "2027 Fellowship. Applications are closed. The next round opens in September 2027. Join the mailing list.", "met": false },
+    { "id": "apps-soon", "criteria": "Applications are open", "text": "Applications open on January 10. Check back then.", "met": false },
+    { "id": "price-under", "criteria": "The lamp costs less than $30", "text": "Acme Desk Lamp. Now only $27.00. Was $33.75. Free shipping over $50.", "met": true },
+    { "id": "price-over", "criteria": "The lamp costs less than $30", "text": "Acme Desk Lamp. Now only $35.50. Was $44.38.", "met": false },
+    { "id": "in-stock", "criteria": "The item is back in stock", "text": "Nimbus Running Shoe. Size 10. In stock. Ships tomorrow. Add to cart.", "met": true },
+    { "id": "out-of-stock", "criteria": "The item is back in stock", "text": "Nimbus Running Shoe. Currently unavailable. We don't know when or if this item will be back in stock.", "met": false },
+    { "id": "tickets-on-sale", "criteria": "Tickets are on sale", "text": "World Tour 2027 - London O2. Tickets on sale now from £65. Buy tickets.", "met": true },
+    { "id": "tickets-presale", "criteria": "Tickets are on sale to the general public", "text": "Fan presale Thursday 10am for registered fans only. General sale starts Friday 10am.", "met": false },
+    { "id": "status-incident", "criteria": "There is an ongoing incident", "text": "All Systems Operational. API: Operational. Dashboard: Operational. No incidents reported today.", "met": false },
+    { "id": "status-down", "criteria": "There is an ongoing incident", "text": "Investigating - We are seeing elevated error rates on the API. Updates to follow. Posted 4 minutes ago.", "met": true }
+  ] }

@@ -1,0 +1,27 @@
+{ "description": "Does a search result match what the user asked for? Labeled by hand. Hard negatives included (wrong seniority, wrong function, wrong location, off-topic news).",
+  "monitors": {
+    "grad_ai_pm": { "kind": "jobs", "query": "AI Product Manager, AI PM, Associate Product Manager, Graduate Product Manager", "location": "London, Remote", "exclude": "", "criteria": "Entry-level, graduate or associate product manager roles working on AI/ML products. Not senior or leadership roles. Not marketing, sales or engineering roles." },
+    "launch_news": { "kind": "news", "query": "OpenAI launch, Anthropic launch, Claude, ChatGPT", "criteria": "Product or model launches by OpenAI or Anthropic. Not funding, lawsuits or opinion pieces." }
+  },
+  "cases": [
+    { "monitor": "grad_ai_pm", "item": { "title": "Associate Product Manager, AI Assistant", "company": "Cohere", "location": "London, UK" }, "relevant": true },
+    { "monitor": "grad_ai_pm", "item": { "title": "Graduate Product Manager - Machine Learning Platform", "company": "Monzo", "location": "London" }, "relevant": true },
+    { "monitor": "grad_ai_pm", "item": { "title": "Product Manager I, Generative AI", "company": "Spotify", "location": "Remote (EMEA)" }, "relevant": true },
+    { "monitor": "grad_ai_pm", "item": { "title": "AI Product Manager (New Grad)", "company": "Harvey", "location": "Remote" }, "relevant": true },
+    { "monitor": "grad_ai_pm", "item": { "title": "Junior Product Manager, LLM Evaluations", "company": "Scale AI", "location": "London" }, "relevant": true },
+    { "monitor": "grad_ai_pm", "item": { "title": "Senior Director of Product, AI", "company": "Databricks", "location": "London" }, "relevant": false },
+    { "monitor": "grad_ai_pm", "item": { "title": "Group Product Manager, Agents", "company": "OpenAI", "location": "Remote" }, "relevant": false },
+    { "monitor": "grad_ai_pm", "item": { "title": "Product Marketing Manager, Claude", "company": "Anthropic", "location": "London" }, "relevant": false },
+    { "monitor": "grad_ai_pm", "item": { "title": "Machine Learning Engineer, Inference", "company": "Perplexity", "location": "Remote" }, "relevant": false },
+    { "monitor": "grad_ai_pm", "item": { "title": "Account Executive, AI Native", "company": "Anthropic", "location": "London" }, "relevant": false },
+    { "monitor": "grad_ai_pm", "item": { "title": "Product Manager, Payments Risk", "company": "Stripe", "location": "Dublin" }, "relevant": false },
+    { "monitor": "grad_ai_pm", "item": { "title": "Head of AI Product", "company": "Ramp", "location": "Remote" }, "relevant": false },
+    { "monitor": "launch_news", "item": { "title": "OpenAI launches GPT-6.1 with faster reasoning for ChatGPT users", "company": "The Verge" }, "relevant": true },
+    { "monitor": "launch_news", "item": { "title": "Anthropic releases Claude for Chrome to all paid users", "company": "TechCrunch" }, "relevant": true },
+    { "monitor": "launch_news", "item": { "title": "ChatGPT gets a new shopping agent in the US", "company": "Reuters" }, "relevant": true },
+    { "monitor": "launch_news", "item": { "title": "Anthropic introduces Claude Fable 5.1, its most capable model", "company": "Bloomberg" }, "relevant": true },
+    { "monitor": "launch_news", "item": { "title": "OpenAI raises $40B at a $500B valuation", "company": "WSJ" }, "relevant": false },
+    { "monitor": "launch_news", "item": { "title": "Authors sue Anthropic over training data", "company": "NYT" }, "relevant": false },
+    { "monitor": "launch_news", "item": { "title": "Opinion: The AI hype cycle is cooling", "company": "Forbes" }, "relevant": false },
+    { "monitor": "launch_news", "item": { "title": "Google launches Gemini 3.8 Flash", "company": "The Verge" }, "relevant": false }
+  ] }
