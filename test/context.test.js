@@ -182,3 +182,26 @@ test('evaluation: overall score, default rubric, blind brief', () => {
   const brief = buildBrief({ question: 'How do I cut churn?', context: 'Decision: focus on onboarding' });
   assert.match(brief, /USER REQUEST:[\s\S]*cut churn[\s\S]*onboarding/);
 });
+
+import { conditionMet, parsePrice, extractStructured, parseRobots, robotsAllows } from '../lib/watch.js';
+
+test('price watch: parsing, structured extraction, robots and alert conditions', () => {
+  assert.equal(parsePrice('£1,299.50'), 1299.5);
+  assert.equal(parsePrice('1.299,50 €'), 1299.5);
+  assert.equal(parsePrice('12,99'), 12.99);
+  assert.equal(parsePrice('Rs. 45,999'), 45999);
+  const ld = '<title>x</title><script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"Product","name":"Kettle","offers":{"@type":"Offer","price":"39.99","priceCurrency":"USD","availability":"https://schema.org/InStock"}}]}</script>';
+  assert.deepEqual([extractStructured(ld).price, extractStructured(ld).currency, extractStructured(ld).title, extractStructured(ld).in_stock], [39.99, 'USD', 'Kettle', true]);
+  assert.equal(extractStructured('<meta property="product:price:amount" content="19.00"><meta property="product:price:currency" content="EUR">').price, 19);
+  const rules = parseRobots('User-agent: *\nDisallow: /cart\nDisallow: /*?add-to-cart=\nAllow: /cart/public\n');
+  assert.equal(robotsAllows(rules, '/shop/kettle'), true);
+  assert.equal(robotsAllows(rules, '/cart/checkout'), false);
+  assert.equal(robotsAllows(rules, '/cart/public/x'), true);
+  assert.equal(robotsAllows(rules, '/shop?add-to-cart=5'), false);
+  const money = (p) => `$${p.toFixed(2)}`;
+  assert.match(conditionMet({ condition: 'below', target_price: 50 }, 45, money), /\$45\.00.*\$50\.00/);
+  assert.equal(conditionMet({ condition: 'below', target_price: 50, last_notified_price: 45 }, 46), null); // no repeat alert unless a new low
+  assert.match(conditionMet({ condition: 'drop_pct', drop_pct: 10, baseline_price: 100 }, 85, money), /dropped 15% to \$85\.00/);
+  assert.equal(conditionMet({ condition: 'drop_pct', drop_pct: 10, baseline_price: 100 }, 95), null);
+  assert.match(conditionMet({ condition: 'any_drop', last_price: 20 }, 19), /from 20 to 19/);
+});

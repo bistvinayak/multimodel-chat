@@ -13,6 +13,7 @@ import { buildContext } from './lib/context.js';
 import { streamCompletion, ModelError, probeModel, complete, keyInfo } from './lib/openrouter.js';
 import { initSecrets, encrypt, decrypt } from './lib/secrets.js';
 import { evaluateWithJev, evaluateWithJudge, buildBrief, overall, CRITERIA, DEFAULT_CRITERIA } from './lib/evaluator.js';
+import { safeFetch, checkRobots, extractStructured, extractWithAI, conditionMet } from './lib/watch.js';
 import { detect, safeName, LIMITS, MAX_PER_MESSAGE, extractPdfText, describeImage, materialize } from './lib/attachments.js';
 import { titlePrompt, cleanTitle, summaryPlan, summaryPrompt } from './lib/memory.js';
 
@@ -1076,6 +1077,160 @@ route('GET', '/api/metrics', async (req, res, { user }) => {
   const errors = Object.entries(R.filter((r) => r.error_kind && r.status !== 'completed').reduce((m, r) => ((m[r.error_kind] = (m[r.error_kind] || 0) + 1), m), {})).map(([kind, n]) => ({ kind, n })).sort((a, b) => b.n - a.n);
   send(res, 200, { days, summary, daily: [...daily.values()].sort((a, b) => a.day.localeCompare(b.day)), per_model, eval_matrix, errors,
     evaluator: jevKeyFor(user) ? 'jev' : 'llm-judge' });
+});
+
+// ---------- price-watch agent ----------
+const WATCH_INTERVALS = [60, 180, 360, 720, 1440];
+const MAX_WATCHES = 25;
+const watchFetchOpts = () => ({ allowPrivate: process.env.WATCH_ALLOW_PRIVATE === '1' }); // tests only
+const lastHit = new Map(); // hostname -> last fetch time (politeness)
+const checking = new Set();
+
+async function inspectUrl(user, url) {
+  const opts = watchFetchOpts();
+  if (!(await checkRobots(url, opts))) throw new HttpError(400, "This site's robots.txt does not allow automated checks of that page, so it can't be watched.");
+  lastHit.set(new URL(url).hostname, now());
+  const page = await safeFetch(url, opts);
+  if ([401, 403, 429, 503].includes(page.status)) throw new HttpError(400, `The site blocked the automated check (HTTP ${page.status}). Some stores don't allow price tracking.`);
+  if (page.status >= 400) throw new HttpError(400, `The page returned HTTP ${page.status}. Check the link.`);
+  if (!/html|xml/i.test(page.contentType)) throw new HttpError(400, 'That link is not a web page.');
+  let x = extractStructured(page.body);
+  if (x.price == null) {
+    const ai = await extractWithAI({ apiKey: keyFor(user).key, models: (await backgroundModels()).map((m) => m.id), html: page.body, url: page.url });
+    x = { ...x, ...ai, title: ai.title || x.title };
+    if (x.price == null) throw new HttpError(400, ai.error || 'Could not find a product price on that page.');
+  }
+  return { ...x, final_url: page.url };
+}
+
+function notify(userId, n) {
+  const id = uid();
+  db.prepare('INSERT INTO notifications (id, user_id, kind, title, body, url, watch_id, created_at) VALUES (?,?,?,?,?,?,?,?)')
+    .run(id, userId, n.kind, n.title, n.body || null, n.url || null, n.watch_id || null, now());
+  return id;
+}
+
+const fmtMoney = (p, c) => (p == null ? '?' : `${c ? `${c} ` : ''}${Number(p).toFixed(2)}`);
+
+async function checkWatch(w) {
+  if (checking.has(w.id)) return;
+  checking.add(w.id);
+  const user = userById(w.user_id);
+  const t = now();
+  try {
+    const x = await inspectUrl(user, w.url);
+    db.prepare('INSERT INTO watch_checks (id, watch_id, checked_at, price, currency, in_stock, ok, method, model) VALUES (?,?,?,?,?,?,1,?,?)')
+      .run(uid(), w.id, t, x.price, x.currency || w.currency, x.in_stock == null ? null : x.in_stock ? 1 : 0, x.method, x.model || null);
+    const cur = x.currency || w.currency;
+    const msg = conditionMet(w, x.price, (p) => fmtMoney(p, cur));
+    const jitter = Math.floor(Math.random() * 5 * 60_000);
+    db.prepare(`UPDATE watches SET last_price=?, lowest_price=MIN(COALESCE(lowest_price, ?), ?), currency=COALESCE(?, currency), in_stock=?, method=?, title=COALESCE(title, ?),
+      failures=0, last_error=NULL, status=CASE WHEN status='error' THEN 'active' ELSE status END, last_checked_at=?, next_check_at=?${msg ? ', last_notified_price=?' : ''} WHERE id=?`)
+      .run(x.price, x.price, x.price, x.currency || null, x.in_stock == null ? null : x.in_stock ? 1 : 0, x.method, x.title || null, t, t + w.interval_minutes * 60_000 + jitter, ...(msg ? [x.price] : []), w.id);
+    if (msg) notify(w.user_id, { kind: 'price_drop', title: `Price drop: ${w.title || new URL(w.url).hostname}`, body: `${w.title || 'The item'} ${msg}.`, url: w.url, watch_id: w.id });
+    return { ok: true, price: x.price, alerted: !!msg };
+  } catch (e) {
+    const failures = w.failures + 1;
+    // Back off: 2x the interval per consecutive failure, at most a day. Stop after 8 failures in a row.
+    const next = t + Math.min(24 * 60, w.interval_minutes * 2 ** failures) * 60_000;
+    db.prepare('INSERT INTO watch_checks (id, watch_id, checked_at, ok, error) VALUES (?,?,?,0,?)').run(uid(), w.id, t, e.message);
+    db.prepare(`UPDATE watches SET failures=?, last_error=?, last_checked_at=?, next_check_at=?, status=? WHERE id=?`)
+      .run(failures, e.message, t, next, failures >= 8 ? 'error' : w.status, w.id);
+    if (failures === 3) notify(w.user_id, { kind: 'watch_error', title: `Can't check ${w.title || new URL(w.url).hostname}`, body: `The last 3 checks failed: ${e.message}`, url: w.url, watch_id: w.id });
+    return { ok: false, error: e.message };
+  } finally { checking.delete(w.id); }
+}
+
+// Scheduler: due watches, one at a time, at least 10s apart per site.
+setInterval(async () => {
+  const due = db.prepare(`SELECT * FROM watches WHERE status='active' AND next_check_at <= ? ORDER BY next_check_at LIMIT 10`).all(now());
+  for (const w of due) {
+    const host = new URL(w.url).hostname;
+    if (now() - (lastHit.get(host) || 0) < 10_000) continue; // picked up on a later tick
+    await checkWatch(w).catch((e) => console.warn('[watch]', e.message));
+  }
+}, 60_000).unref();
+
+const watchPayload = (w) => ({ ...w, history: db.prepare('SELECT checked_at, price, ok, error FROM watch_checks WHERE watch_id=? ORDER BY checked_at DESC LIMIT 60').all(w.id).reverse() });
+const ownWatch = (user, id) => { const w = db.prepare('SELECT * FROM watches WHERE id=? AND user_id=?').get(id, user.id); if (!w) throw new HttpError(404, 'Watch not found'); return w; };
+function watchSettings(body, base = {}) {
+  const out = {};
+  const condition = body.condition ?? base.condition;
+  if (!['below', 'drop_pct', 'any_drop'].includes(condition)) throw new HttpError(400, 'Choose when to alert you: below a price, a percentage drop, or any drop.');
+  out.condition = condition;
+  out.target_price = condition === 'below' ? Number(body.target_price ?? base.target_price) : null;
+  if (condition === 'below' && !(out.target_price > 0)) throw new HttpError(400, 'Enter the target price.');
+  out.drop_pct = condition === 'drop_pct' ? Number(body.drop_pct ?? base.drop_pct) : null;
+  if (condition === 'drop_pct' && !(out.drop_pct > 0 && out.drop_pct < 100)) throw new HttpError(400, 'Enter a drop between 1 and 99 percent.');
+  out.interval_minutes = Number(body.interval_minutes ?? base.interval_minutes ?? 360);
+  if (!WATCH_INTERVALS.includes(out.interval_minutes)) throw new HttpError(400, 'Choose how often to check.');
+  return out;
+}
+
+route('POST', '/api/watches/preview', async (req, res, { user }) => {
+  const { url } = await readJson(req);
+  send(res, 200, await inspectUrl(user, String(url || '').trim()));
+});
+
+route('GET', '/api/watches', async (req, res, { user }) => {
+  send(res, 200, db.prepare('SELECT * FROM watches WHERE user_id=? ORDER BY created_at DESC').all(user.id).map(watchPayload));
+});
+
+route('POST', '/api/watches', async (req, res, { user }) => {
+  const body = await readJson(req);
+  const url = String(body.url || '').trim();
+  if (db.prepare(`SELECT COUNT(*) n FROM watches WHERE user_id=? AND status<>'paused'`).get(user.id).n >= MAX_WATCHES) throw new HttpError(400, `You can watch up to ${MAX_WATCHES} links at once. Pause or delete one first.`);
+  const cfg = watchSettings(body);
+  const x = await inspectUrl(user, url);
+  const id = uid(), t = now();
+  const met = conditionMet({ ...cfg, baseline_price: x.price, last_price: null, last_notified_price: null }, x.price);
+  db.prepare(`INSERT INTO watches (id, user_id, url, title, condition, target_price, drop_pct, currency, baseline_price, last_price, lowest_price, last_notified_price, in_stock, method,
+      interval_minutes, last_checked_at, next_check_at, conversation_id, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(id, user.id, x.final_url || url, x.title || null, cfg.condition, cfg.target_price, cfg.drop_pct, x.currency || null, x.price, x.price, x.price,
+      met ? x.price : null, x.in_stock == null ? null : x.in_stock ? 1 : 0, x.method, cfg.interval_minutes, t, t + cfg.interval_minutes * 60_000, body.conversation_id || null, t);
+  db.prepare('INSERT INTO watch_checks (id, watch_id, checked_at, price, currency, in_stock, ok, method, model) VALUES (?,?,?,?,?,?,1,?,?)')
+    .run(uid(), id, t, x.price, x.currency || null, x.in_stock == null ? null : x.in_stock ? 1 : 0, x.method, x.model || null);
+  send(res, 201, { ...watchPayload(db.prepare('SELECT * FROM watches WHERE id=?').get(id)), already_met: !!met });
+});
+
+route('PATCH', '/api/watches/:id', async (req, res, { user, params }) => {
+  const w = ownWatch(user, params.id);
+  const body = await readJson(req);
+  if (body.status) {
+    if (!['active', 'paused'].includes(body.status)) throw new HttpError(400, 'status must be active or paused');
+    db.prepare('UPDATE watches SET status=?, failures=0, next_check_at=? WHERE id=?').run(body.status, body.status === 'active' ? now() + 60_000 : w.next_check_at, w.id);
+  }
+  if (body.condition || body.target_price != null || body.drop_pct != null || body.interval_minutes) {
+    const cfg = watchSettings(body, w);
+    // New target: allow a fresh alert.
+    db.prepare('UPDATE watches SET condition=?, target_price=?, drop_pct=?, interval_minutes=?, last_notified_price=NULL WHERE id=?').run(cfg.condition, cfg.target_price, cfg.drop_pct, cfg.interval_minutes, w.id);
+  }
+  send(res, 200, watchPayload(db.prepare('SELECT * FROM watches WHERE id=?').get(w.id)));
+});
+
+route('DELETE', '/api/watches/:id', async (req, res, { user, params }) => {
+  const w = ownWatch(user, params.id);
+  db.prepare('DELETE FROM watches WHERE id=?').run(w.id);
+  send(res, 200, { ok: true });
+});
+
+route('POST', '/api/watches/:id/check', async (req, res, { user, params }) => {
+  const w = ownWatch(user, params.id);
+  if (w.last_checked_at && now() - w.last_checked_at < 120_000) throw new HttpError(429, 'Checked less than 2 minutes ago. Try again shortly.');
+  const r = await checkWatch(w);
+  send(res, 200, { ...r, watch: watchPayload(db.prepare('SELECT * FROM watches WHERE id=?').get(w.id)) });
+});
+
+route('GET', '/api/notifications', async (req, res, { user }) => {
+  send(res, 200, { unread: db.prepare('SELECT COUNT(*) n FROM notifications WHERE user_id=? AND read=0').get(user.id).n,
+    items: db.prepare('SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 50').all(user.id) });
+});
+
+route('POST', '/api/notifications/read', async (req, res, { user }) => {
+  const { ids } = await readJson(req);
+  if (Array.isArray(ids) && ids.length) for (const id of ids) db.prepare('UPDATE notifications SET read=1 WHERE id=? AND user_id=?').run(String(id), user.id);
+  else db.prepare('UPDATE notifications SET read=1 WHERE user_id=?').run(user.id);
+  send(res, 200, { ok: true });
 });
 
 route('GET', '/api/conversations', async (req, res, { user }) => {

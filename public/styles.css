@@ -402,3 +402,32 @@ table.heat td.hcell.dark { color: #ffffff; }
 .m-card .meter i, .metrics .meter i { background: var(--series-1); }
 .m-card > * { min-width: 0; }
 #ch-heat { overflow-x: auto; }
+
+/* price watches */
+.count-badge { display: inline-block; min-width: 18px; padding: 0 5px; border-radius: 9px; background: var(--err); color: #fff; font-size: 11px; font-weight: 700; line-height: 18px; margin-left: 4px; }
+.w-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
+.w-card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px 0; display: grid; gap: 8px; min-width: 0; }
+.w-card.paused { opacity: .75; }
+.w-card .card-actions { margin: 0 -14px; }
+.w-top { display: flex; gap: 8px; align-items: flex-start; }
+.w-name { font-weight: 600; color: var(--text); text-decoration: none; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.w-name:hover { text-decoration: underline; }
+.w-mid { display: grid; grid-template-columns: auto 1fr; gap: 12px; align-items: center; }
+.w-price { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.good { color: #0ca30c; font-weight: 600; } .bad { color: #d03b3b; font-weight: 600; }
+.spark { min-width: 0; }
+.spark svg { display: block; width: 100%; }
+.spark .line { fill: none; stroke: var(--series-1); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.spark .end { fill: var(--series-1); stroke: var(--panel); stroke-width: 2; }
+.spark .target { stroke: var(--muted); stroke-dasharray: 3 3; stroke-width: 1; }
+.w-preview { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; display: grid; gap: 2px; }
+.w-title { font-weight: 600; }
+.w-cond { display: grid; gap: 6px; }
+.input.inline { width: 110px; display: inline-block; padding: 3px 6px; margin: 0 4px; }
+.notif { display: flex; gap: 10px; padding: 8px 0; border-top: 1px solid var(--border); }
+.notif.unread b::after { content: " •"; color: var(--accent); }
+.n-icon { width: 24px; height: 24px; border-radius: 50%; display: grid; place-items: center; background: var(--panel-2); font-size: 12px; flex: none; }
+.watch-chip { border-color: var(--accent); }
+
+/* The hidden attribute must always win over component display rules. */
+[hidden] { display: none !important; }

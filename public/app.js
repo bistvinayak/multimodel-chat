@@ -117,6 +117,7 @@ function renderShell() {
         <div class="brand"><span class="brand-mark"><i style="background:var(--lane-0)"></i><i style="background:var(--lane-1)"></i><i style="background:var(--lane-2)"></i></span>Multi-Model Workspace</div>
         <button class="btn primary" id="new-btn">+ New conversation</button>
         <div class="nav-row"><button class="btn" id="compare-btn">⚖ Compare</button><button class="btn" id="metrics-btn">📊 Metrics</button></div>
+        <button class="btn" id="watches-btn">🔔 Price watches <span class="count-badge" id="w-badge" hidden>0</span></button>
       </div>
       <div class="search-wrap"><input class="input" id="conv-search" placeholder="Search chats  (/)" aria-label="Search chats"></div>
       <nav class="conv-list" id="conv-list"></nav>
@@ -130,6 +131,8 @@ function renderShell() {
   $('#new-btn').onclick = () => { location.hash = '#/new'; closeNav(); };
   $('#compare-btn').onclick = () => { location.hash = '#/compare'; closeNav(); };
   $('#metrics-btn').onclick = () => { location.hash = '#/metrics'; closeNav(); };
+  $('#watches-btn').onclick = () => { location.hash = '#/watches'; closeNav(); };
+  pollNotifications();
   $('#logout-btn').onclick = async () => { await api('POST', '/api/logout').catch(() => {}); S.me = null; renderAuth('login'); };
   $('#settings-btn').onclick = openSettings;
   $('#conv-search').oninput = searchConvs;
@@ -286,6 +289,7 @@ function route() {
   if (m) openConversation(m[1]);
   else if (location.hash.startsWith('#/compare')) renderCompare();
   else if (location.hash.startsWith('#/metrics')) renderMetrics();
+  else if (location.hash.startsWith('#/watches')) renderWatches();
   else renderNew();
 }
 window.addEventListener('hashchange', () => S.me && route());
@@ -483,6 +487,7 @@ function renderConv() {
       <div id="reply-note"></div>
       <div class="attach-tray" hidden></div>
       <div class="small vision-note" id="vision-note"></div>
+      <div id="watch-suggest"></div>
       <div class="composer-row">
         <button class="btn attach-btn" id="attach-btn" title="Attach images, PDFs or text files (or drag and drop, or paste)">📎</button>
         <input type="file" id="file-input" multiple hidden accept="${ACCEPT}">
@@ -498,6 +503,7 @@ function renderConv() {
   msg.oninput = () => {
     msg.style.height = 'auto'; msg.style.height = Math.min(msg.scrollHeight, 240) + 'px'; estimate();
     try { sessionStorage.setItem(draftKey, msg.value); } catch {}
+    suggestWatch(msg.value);
   };
   msg.onkeydown = (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendMessage(); } };
   $('#send-btn').onclick = sendMessage;
@@ -783,8 +789,22 @@ function renderCard(id) {
   }, 50);
 }
 
+function suggestWatch(text) {
+  const box = $('#watch-suggest'); if (!box) return;
+  const url = (text.match(URL_RE) || [])[0];
+  box.innerHTML = url && WATCH_INTENT.test(text.replace(url, '')) ? `<button class="btn small watch-chip" id="ws-go">🔔 Watch the price of this link and alert me when it drops</button>` : '';
+  const b = $('#ws-go'); if (b) b.onclick = () => openWatchModal({ url, target: parsePriceHint(text), conversationId: S.conv?.conversation.id });
+}
+const parsePriceHint = (t) => { const m = t.match(/(?:below|under|less than|drops? to|<)\s*[$£€₹]?\s*(\d[\d,]*(?:\.\d+)?)/i); return m ? Number(m[1].replace(/,/g, '')) : null; };
+
 async function sendMessage() {
   const msg = $('#msg'); const text = msg.value.trim();
+  // "/watch <link> [below 500]" sets up a price watch instead of sending a message.
+  if (/^\/watch\b/i.test(text)) {
+    const url = (text.match(URL_RE) || [])[0];
+    openWatchModal({ url: url || '', target: parsePriceHint(text), conversationId: S.conv?.conversation.id });
+    msg.value = ''; suggestWatch(''); return;
+  }
   if ((!text && !pendingIds().length) || !S.conv) return;
   if (uploadsBusy()) return toast('Wait for the uploads to finish');
   const btn = $('#send-btn'); btn.disabled = true;
@@ -1624,6 +1644,173 @@ function drawErrors(errors) {
       <path d="M${m.l},${y}H${m.l + w - 4}Q${m.l + w},${y} ${m.l + w},${y + 4}V${y + 12}Q${m.l + w},${y + 16} ${m.l + w - 4},${y + 16}H${m.l}Z" fill="var(--series-1)"><title>${e.n}</title></path>
       <text x="${m.l + w + 8}" y="${y + 12}" class="axis">${e.n}</text>`; }).join('')}</svg>`;
 }
+
+
+// ---------- price-watch agent ----------
+const INTERVALS = [[60, 'Every hour'], [180, 'Every 3 hours'], [360, 'Every 6 hours'], [720, 'Every 12 hours'], [1440, 'Once a day']];
+const money = (p, c) => (p == null ? '—' : `${c ? `${c} ` : ''}${Number(p).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);
+const ago = (ms) => { if (!ms) return 'never'; const m = Math.round((Date.now() - ms) / 60000); return m < 1 ? 'just now' : m < 60 ? `${m} min ago` : m < 1440 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} d ago`; };
+const until = (ms) => { const m = Math.round((ms - Date.now()) / 60000); return m <= 1 ? 'within a minute' : m < 60 ? `in ${m} min` : `in ${Math.round(m / 60)} h`; };
+const WATCH_INTENT = /\b(price|cheaper|drops?|deal|discount|sale|track|watch|alert|notify|remind)\b/i;
+const URL_RE = /https?:\/\/[^\s<>"')]+/i;
+
+function openWatchModal({ url = '', target = null, conversationId = null } = {}) {
+  let preview = null;
+  const { el, close } = modal({
+    title: 'Watch a price',
+    body: `<p class="muted small" style="margin:0">Paste a product link. The agent checks the page on a schedule and alerts you when the price drops. It identifies itself honestly, respects each site's robots.txt, and checks no more than once an hour.</p>
+      <div class="key-row"><input class="input" id="w-url" type="url" placeholder="https://store.example.com/product" value="${esc(url)}"><button class="btn" id="w-preview">Check price</button></div>
+      <div id="w-out"></div>`,
+    foot: `<button class="btn" data-close>Cancel</button><button class="btn primary" id="w-create" disabled>Start watching</button>`,
+  });
+  const out = $('#w-out', el);
+  const runPreview = async () => {
+    const u = $('#w-url', el).value.trim(); if (!u) return;
+    const b = $('#w-preview', el); b.disabled = true; b.textContent = 'Reading the page…'; out.innerHTML = '<div class="muted">Fetching the page and finding the price…</div>'; $('#w-create', el).disabled = true;
+    try {
+      preview = await api('POST', '/api/watches/preview', { url: u });
+      const t = target ?? Math.floor(preview.price * 0.9 * 100) / 100;
+      out.innerHTML = `<div class="w-preview"><div class="w-title">${esc(preview.title || new URL(preview.final_url).hostname)}</div>
+          <div class="w-price">${money(preview.price, preview.currency)}</div>
+          <div class="muted small">${preview.method === 'structured' ? 'Read from the page\'s product data.' : `Read from the page text by ${esc(shortName(preview.model || 'an AI model'))}. Double-check it matches the price you see.`}${preview.in_stock === false ? ' · ⚠ Out of stock' : ''}</div></div>
+        <div class="w-cond"><div class="section-title">Alert me when</div>
+          <label class="chk"><input type="radio" name="cond" value="below" checked> the price is at or below <input class="input inline" id="w-target" type="number" min="0" step="0.01" value="${t}"> ${esc(preview.currency || '')}</label>
+          <label class="chk"><input type="radio" name="cond" value="drop_pct"> it drops by <input class="input inline" id="w-pct" type="number" min="1" max="99" value="10">% or more</label>
+          <label class="chk"><input type="radio" name="cond" value="any_drop"> it drops at all</label></div>
+        <label class="small">Check<select class="select" id="w-int">${INTERVALS.map(([v, l]) => `<option value="${v}" ${v === 360 ? 'selected' : ''}>${l}</option>`).join('')}</select></label>`;
+      $('#w-create', el).disabled = false;
+    } catch (e) { out.innerHTML = `<div class="err-box">${esc(e.message)}</div>`; }
+    b.disabled = false; b.textContent = 'Check price';
+  };
+  $('#w-preview', el).onclick = runPreview;
+  $('#w-url', el).onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); runPreview(); } };
+  $('#w-create', el).onclick = async () => {
+    const cond = el.querySelector('[name=cond]:checked').value;
+    const b = $('#w-create', el); b.disabled = true; b.textContent = 'Starting…';
+    try {
+      const w = await api('POST', '/api/watches', { url: $('#w-url', el).value.trim(), condition: cond, target_price: Number($('#w-target', el)?.value), drop_pct: Number($('#w-pct', el)?.value), interval_minutes: Number($('#w-int', el).value), conversation_id: conversationId });
+      close();
+      toast(w.already_met ? 'Watching. It is already at or below your target, so you will be alerted on the next new low.' : `Watching ${w.title || 'the link'}. You will be alerted when the price drops.`, 5000);
+      ensureNotifyPermission();
+      if (location.hash.startsWith('#/watches')) loadWatches(); else location.hash = '#/watches';
+    } catch (e) { out.insertAdjacentHTML('beforeend', `<div class="err-box">${esc(e.message)}</div>`); b.disabled = false; b.textContent = 'Start watching'; }
+  };
+  if (url) runPreview(); else setTimeout(() => $('#w-url', el)?.focus(), 0);
+}
+
+function ensureNotifyPermission() { try { if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission(); } catch {} }
+
+function renderWatches() {
+  closeStream();
+  S.conv = null; S.resp = new Map(); renderSidebar(); renderSkills();
+  $('#main').innerHTML = `${mobileTop('Price watches')}<div class="new-wrap"><div class="new-inner watches viz-root">
+    <div class="m-head"><div><h1>Price watches</h1><p class="muted" style="margin:4px 0 0">An agent that checks product pages for you and alerts you when prices drop.</p></div>
+      <button class="btn primary" id="w-add">+ Watch a link</button></div>
+    <div id="w-notifs"></div><div id="w-list"><div class="muted">Loading…</div></div></div></div>`;
+  $('#w-add').onclick = () => openWatchModal();
+  loadWatches();
+}
+
+let watchesData = [];
+async function loadWatches() {
+  const list = $('#w-list'); if (!list) return;
+  try {
+    const [ws, notes] = await Promise.all([api('GET', '/api/watches'), api('GET', '/api/notifications')]);
+    watchesData = ws;
+    $('#w-notifs').innerHTML = notes.items.length ? `<section class="m-card"><div class="m-card-head"><h2>Alerts</h2>${notes.unread ? '<button class="btn small ghost" id="n-read">Mark all read</button>' : ''}</div>
+      ${notes.items.slice(0, 8).map((n) => `<div class="notif ${n.read ? '' : 'unread'}"><span class="n-icon">${n.kind === 'price_drop' ? '▼' : '⚠'}</span>
+        <div style="flex:1;min-width:0"><b>${esc(n.title)}</b><div class="small">${esc(n.body || '')}</div><div class="muted small">${ago(n.created_at)}${n.url ? ` · <a href="${esc(n.url)}" target="_blank" rel="noopener noreferrer">Open page ↗</a>` : ''}</div></div></div>`).join('')}</section>` : '';
+    const nr = $('#n-read'); if (nr) nr.onclick = async () => { await api('POST', '/api/notifications/read', {}); pollNotifications(); loadWatches(); };
+    list.innerHTML = ws.length ? `<div class="w-grid">${ws.map(watchCardHTML).join('')}</div>`
+      : `<div class="empty-thread"><h2>No watches yet</h2><p>Add a product link, or paste one in a chat with words like "track the price" and the app will offer to watch it.</p></div>`;
+    ws.forEach(drawSpark);
+    if (notes.unread) { await api('POST', '/api/notifications/read', {}); pollNotifications(); } // seen on this page
+  } catch (e) { list.innerHTML = `<div class="err-box">${esc(e.message)}</div>`; }
+}
+
+function watchCardHTML(w) {
+  const change = w.baseline_price && w.last_price != null ? (w.last_price - w.baseline_price) / w.baseline_price : null;
+  const cond = w.condition === 'below' ? `below ${money(w.target_price, w.currency)}` : w.condition === 'drop_pct' ? `a ${w.drop_pct}% drop` : 'any drop';
+  const host = (() => { try { return new URL(w.url).hostname.replace(/^www\./, ''); } catch { return ''; } })();
+  return `<article class="w-card ${w.status}" data-w="${w.id}">
+    <div class="w-top"><div style="min-width:0;flex:1"><a class="w-name" href="${esc(w.url)}" target="_blank" rel="noopener noreferrer" title="${esc(w.title || w.url)}">${esc(w.title || host)}</a>
+      <div class="muted small">${esc(host)} · alert on ${cond} · ${esc(INTERVALS.find(([v]) => v === w.interval_minutes)?.[1].toLowerCase() || '')}</div></div>
+      <span class="badge ${w.status === 'active' ? 'completed' : w.status === 'error' ? 'failed' : ''}">${w.status === 'active' ? 'Watching' : w.status === 'paused' ? 'Paused' : 'Stopped'}</span></div>
+    <div class="w-mid"><div><div class="w-price">${money(w.last_price, w.currency)}</div>
+      <div class="small">${change == null || Math.abs(change) < 0.0005 ? '<span class="muted">No change since you started</span>' : change < 0 ? `<span class="good">▼ ${pct(-change)} since you started</span>` : `<span class="bad">▲ ${pct(change)} since you started</span>`}</div>
+      <div class="muted small">Lowest ${money(w.lowest_price, w.currency)}${w.in_stock === 0 ? ' · ⚠ out of stock' : ''}</div></div>
+      <div class="spark" id="spark-${w.id}"></div></div>
+    ${w.last_error ? `<div class="err-box small">⚠ ${esc(w.last_error)}</div>` : ''}
+    <div class="muted small">Checked ${ago(w.last_checked_at)}${w.status === 'active' ? ` · next ${until(w.next_check_at)}` : ''} · ${w.method === 'ai' ? 'price read by AI' : 'price from product data'}</div>
+    <div class="card-actions">
+      <button class="btn small" data-w-act="check">Check now</button>
+      <button class="btn small ghost" data-w-act="${w.status === 'active' ? 'pause' : 'resume'}">${w.status === 'active' ? 'Pause' : 'Resume'}</button>
+      <button class="btn small ghost" data-w-act="edit">Change alert</button>
+      <button class="btn small ghost" data-w-act="ask" title="Start a chat asking the models about this deal">Ask the models</button>
+      <button class="btn small ghost danger" data-w-act="delete">Delete</button></div></article>`;
+}
+
+// Price history: one series, 2px line, end marker, hover tooltip.
+function drawSpark(w) {
+  const el = document.getElementById(`spark-${w.id}`); if (!el) return;
+  const pts = w.history.filter((h) => h.ok && h.price != null);
+  if (pts.length < 2) { el.innerHTML = '<span class="muted small">History appears after a few checks.</span>'; return; }
+  const W = el.clientWidth || 220, H = 56, pad = 6;
+  const xs = pts.map((p) => p.checked_at), ys = pts.map((p) => p.price);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs), lo = Math.min(...ys), hi = Math.max(...ys);
+  const X = (v) => pad + ((v - x0) / Math.max(1, x1 - x0)) * (W - pad * 2);
+  const Y = (v) => (hi === lo ? H / 2 : pad + (1 - (v - lo) / (hi - lo)) * (H - pad * 2));
+  const d = pts.map((p, i) => `${i ? 'L' : 'M'}${X(p.checked_at).toFixed(1)},${Y(p.price).toFixed(1)}`).join('');
+  const last = pts.at(-1);
+  el.innerHTML = `<svg width="${W}" height="${H}" role="img" aria-label="Price history, ${pts.length} checks">
+    ${w.condition === 'below' && w.target_price >= lo && w.target_price <= hi ? `<line x1="${pad}" x2="${W - pad}" y1="${Y(w.target_price)}" y2="${Y(w.target_price)}" class="target"/>` : ''}
+    <path d="${d}" class="line"/><circle cx="${X(last.checked_at)}" cy="${Y(last.price)}" r="4" class="end"/>
+    <rect width="${W}" height="${H}" fill="transparent" class="hit"/></svg>`;
+  el.querySelector('.hit').onmousemove = (e) => {
+    const rx = e.offsetX; const p = pts.reduce((a, b) => (Math.abs(X(b.checked_at) - rx) < Math.abs(X(a.checked_at) - rx) ? b : a));
+    tip(`<b>${money(p.price, w.currency)}</b><div class="muted">${new Date(p.checked_at).toLocaleString()}</div>`, e.clientX, e.clientY);
+  };
+  el.querySelector('.hit').onmouseleave = () => tip(null);
+}
+
+document.addEventListener('click', async (e) => {
+  const b = e.target.closest('[data-w-act]'); if (!b) return;
+  const card = b.closest('[data-w]'); const id = card.dataset.w; const w = watchesData.find((x) => x.id === id);
+  try {
+    switch (b.dataset.wAct) {
+      case 'check': { b.disabled = true; b.textContent = 'Checking…'; const r = await api('POST', `/api/watches/${id}/check`); toast(r.ok ? `Now ${money(r.price, r.watch.currency)}${r.alerted ? ' · alert sent' : ''}` : `Check failed: ${r.error}`); loadWatches(); break; }
+      case 'pause': case 'resume': await api('PATCH', `/api/watches/${id}`, { status: b.dataset.wAct === 'pause' ? 'paused' : 'active' }); loadWatches(); break;
+      case 'delete': if (confirm(`Stop watching ${w.title || 'this link'} and delete its history?`)) { await api('DELETE', `/api/watches/${id}`); loadWatches(); } break;
+      case 'edit': {
+        const v = prompt(w.condition === 'drop_pct' ? 'Alert when it drops by what percent?' : `Alert when the price is at or below (${w.currency || ''}):`, w.condition === 'drop_pct' ? w.drop_pct : (w.target_price ?? Math.floor((w.last_price || 0) * 0.9)));
+        if (v == null) return;
+        await api('PATCH', `/api/watches/${id}`, w.condition === 'drop_pct' ? { condition: 'drop_pct', drop_pct: Number(v) } : { condition: 'below', target_price: Number(v) });
+        toast('Alert updated'); loadWatches(); break;
+      }
+      case 'ask':
+        newState.text = `Is this a good deal right now? ${w.title || ''}\n${w.url}\nCurrent price: ${money(w.last_price, w.currency)}. Lowest I've seen: ${money(w.lowest_price, w.currency)}. What should I consider before buying, and are there good alternatives?`;
+        location.hash = '#/new'; break;
+    }
+  } catch (err) { fail(err); }
+});
+
+// Unread alerts: badge in the sidebar, plus a browser notification for new ones.
+let lastNotifAt = Date.now();
+async function pollNotifications() {
+  if (!S.me) return;
+  try {
+    const n = await api('GET', '/api/notifications');
+    const badge = $('#w-badge'); if (badge) { badge.textContent = n.unread; badge.hidden = !n.unread; }
+    const fresh = n.items.filter((x) => !x.read && x.created_at > lastNotifAt);
+    if (fresh.length) {
+      lastNotifAt = Math.max(...fresh.map((x) => x.created_at));
+      toast(`🔔 ${fresh[0].title}`, 6000);
+      try { if (Notification.permission === 'granted' && document.hidden) for (const x of fresh) new Notification(x.title, { body: x.body || '', tag: x.id }); } catch {}
+      if (location.hash.startsWith('#/watches')) loadWatches();
+    }
+  } catch {}
+}
+setInterval(pollNotifications, 60_000);
 
 // ---------- keyboard shortcuts ----------
 document.addEventListener('keydown', (e) => {
