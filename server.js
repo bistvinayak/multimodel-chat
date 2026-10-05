@@ -1,7 +1,8 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
 import path from 'node:path';
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, rm, stat } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { openDb, tx } from './lib/db.js';
 import { hashPassword, verifyPassword, createSession, destroySession, userFromRequest, parseCookies, sessionCookie } from './lib/auth.js';
@@ -11,6 +12,7 @@ import * as lf from './lib/langfuse.js';
 import { buildContext } from './lib/context.js';
 import { streamCompletion, ModelError, probeModel, complete, keyInfo } from './lib/openrouter.js';
 import { initSecrets, encrypt, decrypt } from './lib/secrets.js';
+import { detect, safeName, LIMITS, MAX_PER_MESSAGE, extractPdfText, describeImage, materialize } from './lib/attachments.js';
 import { titlePrompt, cleanTitle, summaryPlan, summaryPrompt } from './lib/memory.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -31,6 +33,7 @@ if (!API_KEY) console.warn('Note: OPENROUTER_API_KEY is not set. Only users who 
 const DB_FILE = process.env.DB_PATH || path.join(ROOT, 'data', 'app.db');
 const db = openDb(DB_FILE);
 initSecrets(path.dirname(DB_FILE));
+const UPLOAD_DIR = path.join(path.dirname(DB_FILE), 'uploads');
 
 // ---------- per-user OpenRouter keys ----------
 const keyCache = new Map(); // user id -> { blob, key }
@@ -110,6 +113,11 @@ function conversationPayload(conv) {
   const turns = db.prepare('SELECT * FROM turns WHERE conversation_id=? ORDER BY created_at').all(conv.id);
   const responses = db.prepare(`SELECT ${RESPONSE_COLS} FROM responses WHERE conversation_id=? ORDER BY display_position`).all(conv.id);
   const byTurn = new Map(turns.map((t) => [t.id, []]));
+  const attByTurn = new Map();
+  for (const a of db.prepare(`SELECT turn_id, ${ATT_PUBLIC} FROM attachments WHERE conversation_id=? AND turn_id IS NOT NULL ORDER BY created_at`).all(conv.id)) {
+    if (!attByTurn.has(a.turn_id)) attByTurn.set(a.turn_id, []);
+    attByTurn.get(a.turn_id).push(a);
+  }
   for (const r of responses) byTurn.get(r.turn_id)?.push(r);
   const selections = db.prepare(
     `SELECT s.*, r.model_id FROM context_selections s JOIN responses r ON r.id=s.response_id
@@ -124,7 +132,8 @@ function conversationPayload(conv) {
   return {
     conversation: conv,
     models,
-    turns: turns.map((t) => ({ ...t, target_models: JSON.parse(t.target_models), trace_id: lf.traceIdFor(t.id), responses: byTurn.get(t.id) })),
+    turns: turns.map((t) => ({ ...t, target_models: JSON.parse(t.target_models), trace_id: lf.traceIdFor(t.id), responses: byTurn.get(t.id),
+      attachments: attByTurn.get(t.id) || [] })),
     langfuse: lf.enabled() && lfProject ? { session_url: `${lfProject}/sessions/${encodeURIComponent(conv.id)}`, trace_base: `${lfProject}/traces/` } : null,
     selections,
     stats,
@@ -186,6 +195,17 @@ function resolveTargets(convId, target) {
   return { mode: isAll ? 'all' : targets.length === 1 ? 'single' : 'subset', targets };
 }
 
+function ownUnsentAttachments(user, ids) {
+  const list = [...new Set((Array.isArray(ids) ? ids : []).map(String))];
+  if (list.length > MAX_PER_MESSAGE) throw new HttpError(400, `At most ${MAX_PER_MESSAGE} files per message`);
+  return list.map((id) => {
+    const a = db.prepare('SELECT * FROM attachments WHERE id=? AND user_id=?').get(id, user.id);
+    if (!a) throw new HttpError(400, 'One of the attached files was not found. Remove it and attach it again.');
+    if (a.turn_id) throw new HttpError(400, `${a.name} was already sent with another message`);
+    return a;
+  });
+}
+
 function replyRef(convId, reply_to) {
   if (!reply_to?.response_id) return { id: null, quote: null };
   const r = db.prepare('SELECT id FROM responses WHERE id=? AND conversation_id=?').get(String(reply_to.response_id), convId);
@@ -206,6 +226,65 @@ function logPreference(user, resp, eventType) {
       JSON.stringify(others.map((o) => o.id)), JSON.stringify(others.map((o) => o.model_id)), resp.display_position, null, now());
 }
 
+// ---------- attachments ----------
+const ATT_PUBLIC = 'id, name, kind, mime, size, status, error, created_at, (description IS NOT NULL) AS has_description, (text_content IS NOT NULL) AS has_text';
+const attJobs = new Map(); // attachment id -> Promise (PDF extraction / image description)
+const attRow = (id) => db.prepare('SELECT * FROM attachments WHERE id=?').get(id);
+
+async function visionModels(prefer = []) {
+  const catalog = await getCatalog();
+  const ranked = catalog.filter((m) => m.free && m.vision && !NOT_CHAT.test(m.id) && !['busy', 'blocked'].includes(healthOf(m.id)) && m.id.endsWith(':free'))
+    .sort((a, b) => qualityScore(b, { health: healthOf(b.id) }) - qualityScore(a, { health: healthOf(a.id) }));
+  return [...prefer.map((id) => ranked.find((m) => m.id === id)).filter(Boolean), ...ranked].filter((m, i, arr) => arr.indexOf(m) === i).slice(0, 4);
+}
+
+// Runs once per file, right after upload, so it is usually done before the message is sent.
+function processAttachment(user, a) {
+  const job = (async () => {
+    let apiKey;
+    try { apiKey = keyFor(user).key; } catch { return; }
+    if (a.kind === 'pdf') {
+      let lastErr;
+      for (const m of await backgroundModels()) {
+        try {
+          const text = await extractPdfText({ apiKey, model: m.id, filePath: a.path, filename: a.name });
+          db.prepare(`UPDATE attachments SET text_content=?, status='ready', error=NULL WHERE id=?`).run(text, a.id);
+          return;
+        } catch (e) { lastErr = e; if (/scanned|No text/.test(e.message)) break; }
+      }
+      // Fall back to letting OpenRouter parse it on every request.
+      db.prepare(`UPDATE attachments SET status='ready', error=? WHERE id=?`).run(`Text extraction failed (${lastErr?.message || 'unknown'}). Models will receive the PDF file directly.`, a.id);
+    } else if (a.kind === 'image') {
+      for (const m of await visionModels(['qwen/qwen3.8-27b:free', 'google/gemma-4-31b-it:free'])) {
+        try {
+          const text = await describeImage({ apiKey, model: m.id, filePath: a.path, mime: a.mime });
+          db.prepare('UPDATE attachments SET description=?, description_model=? WHERE id=?').run(text, m.id, a.id);
+          return;
+        } catch { /* next model */ }
+      }
+    }
+  })().catch((e) => console.warn('[attachments]', e.message)).finally(() => attJobs.delete(a.id));
+  attJobs.set(a.id, job);
+  return job;
+}
+
+/** Wait (bounded) for any processing of this turn's files, so every model gets the extracted text. */
+async function awaitAttachments(turnId, ms = 60_000) {
+  const jobs = db.prepare('SELECT id FROM attachments WHERE turn_id=?').all(turnId).map((a) => attJobs.get(a.id)).filter(Boolean);
+  if (jobs.length) await Promise.race([Promise.allSettled(jobs), new Promise((ok) => setTimeout(ok, ms))]);
+}
+
+async function removeFiles(rows) {
+  for (const r of rows) await rm(r.path, { force: true }).catch(() => {});
+}
+
+// Files uploaded but never sent are deleted after a day.
+setInterval(async () => {
+  const stale = db.prepare('SELECT id, path FROM attachments WHERE turn_id IS NULL AND created_at < ?').all(now() - 24 * 3600_000);
+  await removeFiles(stale);
+  for (const r of stale) db.prepare('DELETE FROM attachments WHERE id=?').run(r.id);
+}, 3600_000).unref();
+
 // ---------- lane swaps (manual and automatic) ----------
 // Healthy models that could stand in for a busy/failed lane, best first.
 async function rankAlternatives(r) {
@@ -215,12 +294,14 @@ async function rankAlternatives(r) {
   const wantTags = new Set((cur?.tags || []).filter((t) => t !== 'free'));
   const vendor = (id) => id.split('/')[0];
   const limited = r.error_kind === 'rate_limit' || r.status === 'rate_limited';
+  const hasImages = !!db.prepare(`SELECT 1 FROM attachments WHERE turn_id=? AND kind='image' LIMIT 1`).get(r.turn_id);
   const score = (m) => ({ ok: 4, unknown: 1 }[healthOf(m.id)] || 0)
     + qualityScore(m, { health: healthOf(m.id) }) / 4                       // prefer stronger models
     + m.tags.filter((t) => wantTags.has(t)).length
     + (m.context_length >= (cur?.context_length || 0) ? 1 : 0)
     + (m.id.endsWith(':free') ? 1 : 0)                                    // zero-priced non-:free endpoints can still demand credits
-    - (limited && vendor(m.id) === vendor(r.model_id) ? 3 : 0);           // same vendor likely shares the exhausted pool
+    - (limited && vendor(m.id) === vendor(r.model_id) ? 3 : 0)            // same vendor likely shares the exhausted pool
+    + (hasImages && m.vision ? 4 : 0) - (hasImages && cur?.vision && !m.vision ? 2 : 0); // keep image understanding when the message has images
   return (await getCatalog())
     .filter((m) => !inConv.has(m.id) && !NOT_CHAT.test(m.id))
     .filter((m) => (cur && !cur.free) || m.free)                          // a free lane only gets free stand-ins
@@ -343,8 +424,13 @@ async function runResponse(user, resp) {
     const auth = keyFor(user); // throws a clear error if neither a personal nor a shared key exists
     const model = await getModel(resp.model_id);
     maxOut = maxOutFor(user, model);
-    ({ messages } = buildContext(db, turn, resp.model_id, model, maxOut, pinsFor(turn.conversation_id, turn.id),
+    await awaitAttachments(turn.id);
+    let needsFileParser;
+    ({ messages, needsFileParser } = buildContext(db, turn, resp.model_id, model, maxOut, pinsFor(turn.conversation_id, turn.id),
       skillsFor(turn.conversation_id), { summary: summaryOf(turn.conversation_id) }));
+    // The snapshot keeps attachment:// references; real bytes are added only for the request.
+    const wire = await materialize(messages, attRow);
+    const plugins = needsFileParser ? [{ id: 'file-parser', pdf: { engine: 'cloudflare-ai' } }] : undefined;
     db.prepare(`UPDATE responses SET status='generating', content='', reasoning='', error=NULL, error_kind=NULL, finish_reason=NULL,
                 latency_ms=NULL, first_token_ms=NULL, prompt_tokens=NULL, completion_tokens=NULL, cost=NULL, replaced_by=NULL,
                 attempts=attempts+1, context_snapshot=?, key_source=?, finished_at=NULL WHERE id=?`).run(JSON.stringify(messages), auth.source, resp.id);
@@ -356,7 +442,7 @@ async function runResponse(user, resp) {
     for (let attempt = 0; ; attempt++) {
       try {
         stats = await streamCompletion({
-          apiKey: auth.key, model: resp.model_id, messages, maxTokens: maxOut, signal: ctl.signal,
+          apiKey: auth.key, model: resp.model_id, messages: wire, plugins, maxTokens: maxOut, signal: ctl.signal,
           onDelta: (t) => { content += t; state.content = content; state.retrying = null; emit({ type: 'delta', content: t }); flush(); },
           onReasoning: (t) => { reasoning += t; state.reasoning = reasoning; state.retrying = null; emit({ type: 'reasoning', content: t }); flush(); },
         });
@@ -571,6 +657,7 @@ route('PATCH', '/api/me', async (req, res, { user }) => {
 });
 
 route('DELETE', '/api/me', async (req, res, { user }) => {
+  await rm(path.join(UPLOAD_DIR, user.id), { recursive: true, force: true });
   db.prepare('DELETE FROM users WHERE id=?').run(user.id); // cascades to all of the user's data
   send(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie('', 0) });
 });
@@ -715,6 +802,66 @@ route('GET', '/api/compare', async (req, res, { user }) => {
   send(res, 200, { models, head_to_head: ids.length >= 2 ? headToHead(user.id, ids) : [], leaderboard });
 });
 
+// ---------- uploads ----------
+// Raw body upload (no multipart parsing needed): POST /api/uploads with X-Filename header.
+route('POST', '/api/uploads', async (req, res, { user }) => {
+  const name = safeName(decodeURIComponent(String(req.headers['x-filename'] || 'file')));
+  const max = Math.max(...Object.values(LIMITS));
+  const declared = Number(req.headers['content-length'] || 0);
+  if (declared > max) throw new HttpError(413, `Files can be at most ${Math.round(max / 1024 / 1024)} MB`);
+  const chunks = []; let size = 0;
+  for await (const c of req) { size += c.length; if (size > max) throw new HttpError(413, `Files can be at most ${Math.round(max / 1024 / 1024)} MB`); chunks.push(c); }
+  const buf = Buffer.concat(chunks);
+  if (!buf.length) throw new HttpError(400, 'The file is empty');
+  const kind = detect(buf, name);
+  if (!kind) throw new HttpError(415, 'Unsupported file. Attach images (PNG, JPEG, WebP, GIF), PDFs, or text and code files.');
+  if (buf.length > LIMITS[kind.kind]) throw new HttpError(413, `${kind.kind === 'image' ? 'Images' : kind.kind === 'pdf' ? 'PDFs' : 'Text files'} can be at most ${Math.round(LIMITS[kind.kind] / 1024 / 1024)} MB`);
+  const id = uid();
+  const dir = path.join(UPLOAD_DIR, user.id);
+  await mkdir(dir, { recursive: true });
+  const file = path.join(dir, id);
+  await writeFile(file, buf, { mode: 0o600 });
+  const sha = crypto.createHash('sha256').update(buf).digest('hex');
+  db.prepare(`INSERT INTO attachments (id, user_id, name, kind, mime, size, sha256, path, status, text_content, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(id, user.id, name, kind.kind, kind.mime, buf.length, sha, file, kind.kind === 'pdf' ? 'processing' : 'ready', kind.text ?? null, now());
+  if (kind.kind !== 'text') processAttachment(user, attRow(id));
+  send(res, 201, db.prepare(`SELECT ${ATT_PUBLIC} FROM attachments WHERE id=?`).get(id));
+});
+
+const ownAttachment = (user, id) => {
+  const a = db.prepare('SELECT * FROM attachments WHERE id=? AND user_id=?').get(id, user.id);
+  if (!a) throw new HttpError(404, 'File not found');
+  return a;
+};
+
+route('GET', '/api/uploads/:id', async (req, res, { user, params }) => {
+  ownAttachment(user, params.id);
+  send(res, 200, db.prepare(`SELECT ${ATT_PUBLIC}, description, description_model FROM attachments WHERE id=?`).get(params.id));
+});
+
+route('GET', '/api/uploads/:id/raw', async (req, res, { user, params }) => {
+  const a = ownAttachment(user, params.id);
+  await stat(a.path).catch(() => { throw new HttpError(404, 'File missing on disk'); });
+  res.writeHead(200, {
+    // Text is always served as plain text so an uploaded .html can never run as a page.
+    'Content-Type': a.kind === 'text' ? 'text/plain; charset=utf-8' : a.mime,
+    'Content-Length': a.size,
+    'Content-Disposition': `${a.kind === 'text' ? 'attachment' : 'inline'}; filename="${a.name}"; filename*=UTF-8''${encodeURIComponent(a.name)}`,
+    'X-Content-Type-Options': 'nosniff',
+    'Content-Security-Policy': "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox",
+    'Cache-Control': 'private, max-age=86400',
+  });
+  createReadStream(a.path).pipe(res);
+});
+
+route('DELETE', '/api/uploads/:id', async (req, res, { user, params }) => {
+  const a = ownAttachment(user, params.id);
+  if (a.turn_id) throw new HttpError(400, 'This file is part of a sent message. Delete the chat to remove it.');
+  await removeFiles([a]);
+  db.prepare('DELETE FROM attachments WHERE id=?').run(a.id);
+  send(res, 200, { ok: true });
+});
+
 route('GET', '/api/conversations', async (req, res, { user }) => {
   const q = new URL(req.url, 'http://x').searchParams.get('q')?.trim();
   if (!q) {
@@ -769,6 +916,7 @@ route('PATCH', '/api/conversations/:id', async (req, res, { user, params }) => {
 route('DELETE', '/api/conversations/:id', async (req, res, { user, params }) => {
   const c = ownConversation(user, params.id);
   for (const r of db.prepare('SELECT id FROM responses WHERE conversation_id=?').all(c.id)) running.get(r.id)?.ctl.abort('user');
+  await removeFiles(db.prepare('SELECT path FROM attachments WHERE conversation_id=?').all(c.id));
   db.prepare('DELETE FROM conversations WHERE id=?').run(c.id);
   send(res, 200, { ok: true });
 });
@@ -809,8 +957,9 @@ route('DELETE', '/api/conversations/:id/models/:model', async (req, res, { user,
 
 route('POST', '/api/conversations/:id/estimate', async (req, res, { user, params }) => {
   const c = ownConversation(user, params.id);
-  const { message = '', target, reply_to } = await readJson(req);
+  const { message = '', target, reply_to, attachment_ids = [] } = await readJson(req);
   const { targets } = resolveTargets(c.id, target);
+  const draftAttachments = ownUnsentAttachments(user, attachment_ids);
   const ref = replyRef(c.id, reply_to);
   const draft = { conversation_id: c.id, created_at: now() + 1, user_message: String(message), reply_to_response: ref.id, reply_quote: ref.quote };
   const pins = pinsFor(c.id, null);
@@ -819,7 +968,7 @@ route('POST', '/api/conversations/:id/estimate', async (req, res, { user, params
   for (const t of targets) {
     const model = await getModel(t.model_id);
     const maxOut = maxOutFor(user, model);
-    const { promptTokensEst, droppedTurns } = buildContext(db, draft, t.model_id, model, maxOut, pins, skills, { summary: summaryOf(c.id) });
+    const { promptTokensEst, droppedTurns } = buildContext(db, draft, t.model_id, model, maxOut, pins, skills, { summary: summaryOf(c.id), draftAttachments });
     const min = model ? promptTokensEst * model.prompt_price : null;
     const max = model ? min + maxOut * model.completion_price : null;
     out.push({ model_id: t.model_id, prompt_tokens: promptTokensEst, max_output: maxOut, free: !!model?.free, cost_min: min, cost_max: max, dropped_turns: droppedTurns });
@@ -833,8 +982,9 @@ route('POST', '/api/conversations/:id/estimate', async (req, res, { user, params
 
 route('POST', '/api/conversations/:id/messages', async (req, res, { user, params }) => {
   const c = ownConversation(user, params.id);
-  const { message, target, reply_to } = await readJson(req);
-  const text = String(message || '').trim();
+  const { message, target, reply_to, attachment_ids = [] } = await readJson(req);
+  const atts = ownUnsentAttachments(user, attachment_ids);
+  const text = String(message || '').trim() || (atts.length ? `Please look at the attached file${atts.length > 1 ? 's' : ''}.` : '');
   if (!text) throw new HttpError(400, 'Message is empty');
   const { mode, targets } = resolveTargets(c.id, target);
   const ref = replyRef(c.id, reply_to);
@@ -842,6 +992,7 @@ route('POST', '/api/conversations/:id/messages', async (req, res, { user, params
   tx(db, () => {
     db.prepare('INSERT INTO turns (id, conversation_id, user_message, mode, target_models, reply_to_response, reply_quote, created_at) VALUES (?,?,?,?,?,?,?,?)')
       .run(turnId, c.id, text, mode, JSON.stringify(targets.map((x) => x.model_id)), ref.id, ref.quote, t);
+    for (const a of atts) db.prepare('UPDATE attachments SET conversation_id=?, turn_id=? WHERE id=?').run(c.id, turnId, a.id);
     // "Continue with this" pins apply to exactly this next turn.
     db.prepare(`UPDATE context_selections SET consumed_turn_id=? WHERE conversation_id=? AND selection_type='continue'
                 AND active=1 AND consumed_turn_id IS NULL`).run(turnId, c.id);

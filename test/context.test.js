@@ -138,3 +138,36 @@ test('personal keys are encrypted at rest and tamper-evident', () => {
   const parts = blob.split(':'); parts[3] = Buffer.from('tampered').toString('base64');
   assert.throws(() => decrypt(parts.join(':')));       // GCM auth tag rejects edits
 });
+
+import { detect } from '../lib/attachments.js';
+
+test('file detection uses magic bytes, not names', () => {
+  assert.equal(detect(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 0, 0, 0]), 'x.png').kind, 'image');
+  assert.equal(detect(Buffer.from('%PDF-1.4\n...'), 'renamed.txt').kind, 'pdf');
+  assert.equal(detect(Buffer.from('a,b\n1,2\n'), 'data.csv').kind, 'text');
+  assert.equal(detect(Buffer.from([0x89, 0x50, 0x4e, 0x47]), 'x.png').mime, 'image/png');
+  assert.equal(detect(Buffer.from([1, 2, 0, 4, 5]), 'notes.txt'), null);                  // binary disguised as text
+  assert.equal(detect(Buffer.from('<svg><script>alert(1)</script></svg>'), 'a.svg'), null); // SVG is not accepted
+  assert.equal(detect(Buffer.from('MZ\x90\x00'), 'setup.exe'), null);
+});
+
+test('attachments: vision models get image parts, others get the description; text and PDFs are inlined', () => {
+  const { db } = seed();
+  const ins = db.prepare(`INSERT INTO attachments (id,user_id,conversation_id,turn_id,name,kind,mime,size,sha256,path,status,text_content,description,description_model,created_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+  db.prepare(`INSERT INTO turns (id,conversation_id,user_message,mode,target_models,created_at) VALUES ('t9','c','Look at these','all','[]',50)`).run();
+  ins.run('img', 'u', 'c', 't9', 'chart.png', 'image', 'image/png', 10, 'h', '/x', 'ready', null, 'A bar chart titled Sales', 'vision-model', 1);
+  ins.run('doc', 'u', 'c', 't9', 'report.pdf', 'pdf', 'application/pdf', 10, 'h', '/y', 'ready', 'Churn is 4.2%', null, null, 2);
+  ins.run('raw', 'u', 'c', 't9', 'scan.pdf', 'pdf', 'application/pdf', 10, 'h', '/z', 'ready', null, null, null, 3);
+  const turn = { id: 't9', conversation_id: 'c', created_at: 50, user_message: 'Look at these' };
+  const seeing = buildContext(db, turn, 'A', { vision: true }, 1000, []);
+  const blind = buildContext(db, turn, 'A', { vision: false }, 1000, []);
+  const last = (r) => r.messages.at(-1).content;
+  assert.ok(last(seeing).some((p) => p.type === 'image_url' && p.image_url.url === 'attachment://img'));
+  assert.ok(!JSON.stringify(last(blind)).includes('image_url'));
+  assert.match(JSON.stringify(last(blind)), /A bar chart titled Sales/);
+  assert.match(JSON.stringify(last(seeing)), /Churn is 4\.2%/);                      // extracted PDF text inlined
+  assert.ok(last(seeing).some((p) => p.type === 'file' && p.file.file_data === 'attachment://raw')); // unextracted PDF goes as a file
+  assert.equal(seeing.needsFileParser, true);
+  assert.ok(!JSON.stringify(seeing.messages).includes('base64'));                    // snapshots never hold file bytes
+});

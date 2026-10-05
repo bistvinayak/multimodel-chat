@@ -17,7 +17,8 @@ const S = {
   reply: null,                   // { id, model_id, quote } when replying to one answer
   filters: { q: '', free: true, fast: false, reasoning: false, coding: false, popular: false },
   lastSel: null,
-  alts: new Map(),               // response id -> alternatives array | 'loading'                 // { id, text } highlighted inside a card
+  alts: new Map(),
+  pending: [],                   // files attached to the message being written               // response id -> alternatives array | 'loading'                 // { id, text } highlighted inside a card
   navOpen: false,
 };
 
@@ -127,6 +128,7 @@ function renderShell() {
   $('#logout-btn').onclick = async () => { await api('POST', '/api/logout').catch(() => {}); S.me = null; renderAuth('login'); };
   $('#settings-btn').onclick = openSettings;
   $('#conv-search').oninput = searchConvs;
+  wireAttachments($('#main'));
   $('#layout').addEventListener('click', (e) => { if (S.navOpen && !e.target.closest('.sidebar') && !e.target.closest('[data-nav]')) closeNav(); });
 }
 function closeNav() { S.navOpen = false; $('#layout')?.classList.remove('nav-open'); }
@@ -379,7 +381,11 @@ function renderNew() {
   if (!newState.selected.length && S.me.preferences.last_models?.length) newState.selected = S.me.preferences.last_models.filter((id) => !S.models.length || S.modelMap.has(id)).slice(0, S.maxModels);
   $('#main').innerHTML = `${mobileTop('New conversation')}<div class="new-wrap"><div class="new-inner">
     <h1>What would you like help with?</h1>
-    <textarea class="textarea" id="new-text" rows="4" placeholder="Describe your task. Every model you pick will answer, and the conversation keeps its context.">${esc(newState.text)}</textarea>
+    <div class="new-box"><textarea class="textarea" id="new-text" rows="4" placeholder="Describe your task, or drop files here. Every model you pick will answer, and the conversation keeps its context.">${esc(newState.text)}</textarea>
+      <div class="attach-tray" hidden></div>
+      <div class="new-box-bar"><button class="btn small" id="attach-btn" title="Attach images, PDFs or text files">📎 Attach files</button>
+        <span class="muted small">Images, PDFs, text and code. Drag and drop or paste works too.</span>
+        <input type="file" id="file-input" multiple hidden accept="${ACCEPT}"></div></div>
     <div><div class="section-title" style="flex-wrap:wrap">Choose models <span class="muted small" style="flex:1">One model is a normal chat. Two or three gives you a side-by-side comparison on every turn.</span>
         <button class="btn small" id="best-btn" title="Picks the top-ranked free models, from different vendors where possible">★ Pick ${S.maxModels} best free models</button></div>
       <div id="new-picker"></div></div>
@@ -387,6 +393,9 @@ function renderNew() {
       <button class="btn primary" id="start-btn">Start conversation</button></div>
   </div></div>`;
   $('#new-text').oninput = (e) => { newState.text = e.target.value; };
+  $('#attach-btn').onclick = () => $('#file-input').click();
+  bindFileInput($('#file-input'));
+  renderTrays();
   $('#new-text').onkeydown = (e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) $('#start-btn').click(); };
   mountPicker($('#new-picker'), { selected: newState.selected, max: S.maxModels, onChange: (s) => (newState.selected = s) });
   $('#best-btn').onclick = async () => {
@@ -411,7 +420,8 @@ function renderNew() {
     try {
       let payload = await api('POST', '/api/conversations', { models: newState.selected, skill_ids: newSkillIds() });
       const text = newState.text.trim();
-      if (text) payload = await api('POST', `/api/conversations/${payload.conversation.id}/messages`, { message: text, target: 'all' });
+      if (uploadsBusy()) { err.textContent = 'Wait for the uploads to finish.'; btn.disabled = false; return; }
+      if (text || pendingIds().length) { payload = await api('POST', `/api/conversations/${payload.conversation.id}/messages`, { message: text, target: 'all', attachment_ids: pendingIds() }); clearPending(); }
       newState = { text: '', selected: [], skills: null };
       S.target = 'all'; S.reply = null;
       setConv(payload);
@@ -465,7 +475,11 @@ function renderConv() {
     <div class="composer"><div class="composer-inner">
       <div id="pin-note"></div>
       <div id="reply-note"></div>
+      <div class="attach-tray" hidden></div>
+      <div class="small vision-note" id="vision-note"></div>
       <div class="composer-row">
+        <button class="btn attach-btn" id="attach-btn" title="Attach images, PDFs or text files (or drag and drop, or paste)">📎</button>
+        <input type="file" id="file-input" multiple hidden accept="${ACCEPT}">
         <textarea class="textarea" id="msg" rows="1" placeholder="Ask anything… (Enter to send, Shift+Enter for a new line)"></textarea>
         <button class="btn" id="stop-all" hidden title="Stop every answer that is generating (Esc)">■ Stop</button>
         <button class="btn primary" id="send-btn">Send</button></div>
@@ -481,6 +495,9 @@ function renderConv() {
   };
   msg.onkeydown = (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendMessage(); } };
   $('#send-btn').onclick = sendMessage;
+  $('#attach-btn').onclick = () => $('#file-input').click();
+  bindFileInput($('#file-input'));
+  renderTrays();
   $('#stop-all').onclick = stopAll;
   msg.addEventListener('keydown', (e) => {
     // Up arrow in an empty box edits your last message, like most chat apps.
@@ -561,6 +578,7 @@ function renderComposerMeta() {
     ${models.map((m) => `<button class="to-chip ${chosen.has(m.model_id) ? 'on' : ''} ${m.status}" data-to="${esc(m.model_id)}" style="--lane:var(--lane-${m.position % 6})"
         title="${m.status === 'paused' ? 'Paused lane: you can still ask it directly' : 'Click to include or leave out'}">
         <span class="dot" style="background:var(--lane-${m.position % 6})"></span>${esc(shortName(m.model_id))}${chosen.has(m.model_id) ? ' ✓' : ''}</button>`).join('')}`;
+  renderTrays();
   const n = chosen.size;
   $('#send-btn').textContent = S.target === 'all' ? 'Send' : `Send to ${n}`;
   const r = S.reply && S.resp.get(S.reply.id);
@@ -579,7 +597,7 @@ function renderComposerMeta() {
 const estimate = debounce(async () => {
   const el = $('#estimate'); if (!el || !S.conv) return;
   try {
-    const est = await api('POST', `/api/conversations/${S.conv.conversation.id}/estimate`, { message: $('#msg')?.value || '', target: S.target, reply_to: replyBody() });
+    const est = await api('POST', `/api/conversations/${S.conv.conversation.id}/estimate`, { message: $('#msg')?.value || '', target: S.target, reply_to: replyBody(), attachment_ids: pendingIds() });
     const n = est.models.length;
     const allFree = est.models.every((m) => m.free);
     const dropped = Math.max(0, ...est.models.map((m) => m.dropped_turns));
@@ -602,6 +620,7 @@ function turnHTML(t) {
   const active = S.tabs[t.id] && rs.some((r) => r.id === S.tabs[t.id]) ? S.tabs[t.id] : rs[0]?.id;
   return `<section class="turn" id="turn-${t.id}">
     ${t.reply_to_response ? replyQuoteHTML(t) : ''}
+    ${turnAttachmentsHTML(t)}
     <div class="user-msg">${esc(t.user_message)}${S.conv.turns.at(-1)?.id === t.id ? `<button class="btn small ghost edit-btn" data-act="edit-turn" data-turn="${t.id}" title="Edit and resend (↑ in an empty box)">✎ Edit</button>` : ''}</div>
     ${t.mode === 'single' ? `<div class="turn-meta">Asked only ${esc(shortName(t.target_models[0]))}</div>`
       : t.mode === 'subset' ? `<div class="turn-meta">Asked ${t.target_models.map((m) => esc(shortName(m))).join(' and ')}</div>` : ''}
@@ -757,11 +776,12 @@ function renderCard(id) {
 
 async function sendMessage() {
   const msg = $('#msg'); const text = msg.value.trim();
-  if (!text || !S.conv) return;
+  if ((!text && !pendingIds().length) || !S.conv) return;
+  if (uploadsBusy()) return toast('Wait for the uploads to finish');
   const btn = $('#send-btn'); btn.disabled = true;
   try {
-    const payload = await api('POST', `/api/conversations/${S.conv.conversation.id}/messages`, { message: text, target: S.target, reply_to: replyBody() });
-    S.reply = null;
+    const payload = await api('POST', `/api/conversations/${S.conv.conversation.id}/messages`, { message: text, target: S.target, reply_to: replyBody(), attachment_ids: pendingIds() });
+    S.reply = null; clearPending();
     msg.value = ''; msg.style.height = 'auto';
     try { sessionStorage.removeItem(`draft:${S.conv.conversation.id}`); } catch {}
     setConv(payload); renderHead(); renderThread(); renderComposerMeta(); loadConvs();
@@ -1123,6 +1143,113 @@ function openSettings() {
   };
 }
 
+
+
+// ---------- attachments ----------
+const ACCEPT = 'image/png,image/jpeg,image/webp,image/gif,application/pdf,.txt,.md,.csv,.tsv,.json,.jsonl,.xml,.yaml,.yml,.html,.css,.js,.mjs,.jsx,.ts,.tsx,.py,.ipynb,.java,.kt,.go,.rb,.rs,.c,.h,.cpp,.hpp,.cs,.php,.swift,.scala,.sql,.sh,.r,.lua,.dart,.vue,.svelte,.log,.ini,.toml,.tex,.rst,.srt,.vtt';
+const MAX_FILES = 6, MAX_BYTES = 20 * 1024 * 1024;
+const fmtSize = (n) => (n < 1024 ? `${n} B` : n < 1048576 ? `${Math.round(n / 1024)} KB` : `${(n / 1048576).toFixed(1)} MB`);
+const fileIcon = (kind) => ({ image: '🖼', pdf: '📄', text: '📃' }[kind] || '📎');
+const guessKind = (f) => (f.type.startsWith('image/') ? 'image' : f.type === 'application/pdf' || /\.pdf$/i.test(f.name) ? 'pdf' : 'text');
+
+function addFiles(files) {
+  for (const f of files) {
+    if (S.pending.length >= MAX_FILES) { toast(`At most ${MAX_FILES} files per message`); break; }
+    if (f.size > MAX_BYTES) { toast(`${f.name} is larger than 20 MB`); continue; }
+    if (/\.svg$/i.test(f.name) || f.type === 'image/svg+xml') { toast('SVG images are not supported. Use PNG or JPEG.'); continue; }
+    const item = { local: crypto.randomUUID(), name: f.name, size: f.size, kind: guessKind(f), status: 'uploading', progress: 0,
+      preview: f.type.startsWith('image/') ? URL.createObjectURL(f) : null };
+    S.pending.push(item);
+    uploadOne(item, f);
+  }
+  renderTrays();
+}
+
+function uploadOne(item, file) {
+  const xhr = new XMLHttpRequest();
+  item.xhr = xhr;
+  xhr.open('POST', '/api/uploads');
+  xhr.setRequestHeader('X-Filename', encodeURIComponent(file.name));
+  xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
+  xhr.upload.onprogress = (e) => { if (e.lengthComputable) { item.progress = e.loaded / e.total; renderTrays(); } };
+  xhr.onload = () => {
+    let body = {}; try { body = JSON.parse(xhr.responseText); } catch {}
+    if (xhr.status === 401) { api('GET', '/api/me').catch(() => {}); return; }
+    if (xhr.status >= 300) { item.status = 'failed'; item.error = body.error || `Upload failed (${xhr.status})`; renderTrays(); return; }
+    Object.assign(item, { id: body.id, kind: body.kind, status: body.status, error: body.error });
+    renderTrays(); estimate();
+    if (item.status === 'processing') pollAttachment(item);
+  };
+  xhr.onerror = () => { item.status = 'failed'; item.error = 'Network error during upload'; renderTrays(); };
+  xhr.send(file);
+}
+
+async function pollAttachment(item) {
+  while (item.status === 'processing' && S.pending.includes(item)) {
+    await new Promise((ok) => setTimeout(ok, 1500));
+    try { const a = await api('GET', `/api/uploads/${item.id}`); item.status = a.status; item.error = a.error; item.has_text = a.has_text; } catch { break; }
+    renderTrays();
+  }
+  estimate();
+}
+
+function removePending(local) {
+  const item = S.pending.find((x) => x.local === local); if (!item) return;
+  item.xhr?.abort();
+  if (item.id) api('DELETE', `/api/uploads/${item.id}`).catch(() => {});
+  if (item.preview) URL.revokeObjectURL(item.preview);
+  S.pending = S.pending.filter((x) => x !== item);
+  renderTrays(); estimate();
+}
+
+function clearPending() { for (const i of S.pending) if (i.preview) URL.revokeObjectURL(i.preview); S.pending = []; renderTrays(); }
+const pendingIds = () => S.pending.filter((i) => i.id && i.status !== 'failed').map((i) => i.id);
+const uploadsBusy = () => S.pending.some((i) => i.status === 'uploading');
+
+function renderTrays() {
+  document.querySelectorAll('.attach-tray').forEach((tray) => {
+    tray.innerHTML = S.pending.map((i) => `<div class="att-chip ${i.status}" title="${esc(i.error || i.name)}">
+        ${i.preview ? `<img src="${i.preview}" alt="">` : `<span class="att-icon">${fileIcon(i.kind)}</span>`}
+        <span class="att-meta"><span class="att-name">${esc(i.name)}</span>
+          <span class="att-sub">${i.status === 'uploading' ? `Uploading ${Math.round(i.progress * 100)}%` : i.status === 'processing' ? 'Reading PDF…' : i.status === 'failed' ? `⚠ ${esc(i.error || 'Failed')}` : i.error ? '⚠ Sent as file' : fmtSize(i.size)}</span></span>
+        ${i.status === 'uploading' ? `<span class="att-bar"><i style="width:${Math.round(i.progress * 100)}%"></i></span>` : ''}
+        <button class="att-x" data-unattach="${i.local}" title="Remove">×</button></div>`).join('');
+    tray.hidden = !S.pending.length;
+  });
+  const note = $('#vision-note');
+  if (note && S.conv) {
+    const hasImg = S.pending.some((i) => i.kind === 'image' && i.status !== 'failed');
+    const blind = hasImg ? targetIds().filter((id) => S.modelMap.get(id) && !S.modelMap.get(id).vision) : [];
+    note.innerHTML = blind.length ? `🖼 ${blind.map((id) => esc(shortName(id))).join(', ')} can't see images, so ${blind.length > 1 ? 'they get' : 'it gets'} a detailed AI description of each image instead.` : '';
+  }
+  const send = $('#send-btn') || $('#start-btn');
+  if (send) send.disabled = uploadsBusy();
+}
+
+// Drag and drop anywhere on the main area, and paste images or files into a text box.
+// Wired once on #main (it persists across views); per view only the file input changes.
+function bindFileInput(input) { input.onchange = () => { addFiles([...input.files]); input.value = ''; }; }
+function wireAttachments(root) {
+  let depth = 0;
+  root.addEventListener('dragenter', (e) => { if ([...(e.dataTransfer?.types || [])].includes('Files')) { depth++; root.classList.add('dropping'); } });
+  root.addEventListener('dragleave', () => { if (--depth <= 0) { depth = 0; root.classList.remove('dropping'); } });
+  root.addEventListener('dragover', (e) => { if ([...(e.dataTransfer?.types || [])].includes('Files')) e.preventDefault(); });
+  root.addEventListener('drop', (e) => { if (!e.dataTransfer?.files?.length) return; e.preventDefault(); if (!$('#file-input')) { depth = 0; root.classList.remove('dropping'); return; } depth = 0; root.classList.remove('dropping'); addFiles([...e.dataTransfer.files]); });
+  root.addEventListener('paste', (e) => {
+    const files = [...(e.clipboardData?.files || [])];
+    if (files.length && e.target.matches('textarea')) { e.preventDefault(); addFiles(files.map((f, i) => (f.name === 'image.png' ? new File([f], `pasted-${Date.now()}-${i}.png`, { type: f.type }) : f))); }
+  });
+  root.addEventListener('click', (e) => { const x = e.target.closest('[data-unattach]'); if (x) removePending(x.dataset.unattach); });
+}
+
+function turnAttachmentsHTML(t) {
+  if (!t.attachments?.length) return '';
+  const blind = t.attachments.some((a) => a.kind === 'image') ? t.target_models.filter((id) => S.modelMap.get(id) && !S.modelMap.get(id).vision) : [];
+  return `<div class="turn-atts">${t.attachments.map((a) => a.kind === 'image'
+      ? `<a class="att-thumb" href="/api/uploads/${a.id}/raw" target="_blank" rel="noopener" title="${esc(a.name)}"><img src="/api/uploads/${a.id}/raw" alt="${esc(a.name)}" loading="lazy"></a>`
+      : `<a class="att-file" href="/api/uploads/${a.id}/raw" target="_blank" rel="noopener" title="${esc(a.error || a.name)}">${fileIcon(a.kind)} <span>${esc(a.name)}</span> <span class="muted">${fmtSize(a.size)}${a.error ? ' · sent as file' : ''}</span></a>`).join('')}</div>
+    ${blind.length ? `<div class="turn-meta">${blind.map((id) => esc(shortName(id))).join(', ')} got an AI description of the image${t.attachments.filter((a) => a.kind === 'image').length > 1 ? 's' : ''}</div>` : ''}`;
+}
 
 // ---------- compare models ----------
 let compareSel = [];

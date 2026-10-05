@@ -38,6 +38,7 @@ Personal keys are encrypted with a master key from `APP_SECRET` (64 hex characte
 | Model lanes | Add, pause, resume or remove models mid-conversation. Free users get at most 3 active models (`MAX_MODELS`). History stays visible after removal. |
 | Cost | Cost estimate before sending, real cost, tokens and latency per answer, and running totals per conversation. |
 | Convenience | AI-written chat titles. Search across titles, your messages and answers (press `/`). New chats start with the models you used last. Code blocks get syntax highlighting and a Copy button. Cmd/Ctrl+K starts a new chat. |
+| File uploads | Attach images (PNG, JPEG, WebP, GIF), PDFs, and text or code files: up to 6 per message, 20 MB each. Use the 📎 button, drag and drop, or paste a screenshot. Files are checked by their actual content, not the name. PDFs are parsed once at upload with OpenRouter's free engine, and every model gets the text. Models that can see get images directly. The others get a detailed description written once by a free vision model, with all visible text transcribed, so every model in a comparison works from the same material. Automatic stand-ins prefer vision models when a message has images. Saved context and traces hold file references, never the file bytes. Files are private to their owner, served with safe headers, and deleted with the chat or account. Files uploaded but never sent are removed after a day. |
 | Compare models | A page (sidebar: **Compare models**) that puts up to 4 models side by side. Catalog facts: price, context window, max answer length, strengths, estimated rank among free models, and whether each is answering right now. Your own data: answers, how often you picked each one when it was shown next to others, response time, time to first token, answer length, cost, and failure rate. The best value in each row is highlighted. It also shows head-to-head records, a personal leaderboard, and a button to start a chat with the models you're comparing. |
 | Your own OpenRouter key | In Settings, add your own key so your chats run on your OpenRouter account: your credits, your rate limits, and paid models. The key is checked with OpenRouter before saving, encrypted at rest with AES-256-GCM, and never sent back to the browser. Only the last 4 characters are shown. Settings shows its limit, usage and free requests left today. Without a personal key, chats use the shared `OPENROUTER_API_KEY` if the server has one. |
 | Finish | Lists saved and final picks from any model and any turn, with copy and Markdown download. |
@@ -80,6 +81,7 @@ lib/langfuse.js    OTLP tracing + scores for Langfuse
 lib/health.js  live model health from real traffic
 lib/memory.js  AI titles + rolling conversation summary
 lib/secrets.js AES-256-GCM encryption for personal API keys
+lib/attachments.js  file detection, PDF text extraction, image descriptions
 ```
 
 The API key stays on the server. The browser never sees it.
