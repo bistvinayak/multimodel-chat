@@ -45,7 +45,9 @@ const ERROR_HINT = {
 // ---------- utils ----------
 async function api(method, url, body) {
   // Errors keep any extra fields the server sent (for example suggested links).
-  const r = await fetch(url, { method, headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
+  let r;
+  try { r = await fetch(url, { method, headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined }); }
+  catch { throw new Error(`Can't reach the app server at ${location.host}. It may be restarting or stopped. Wait a few seconds and try again, or start it with "npm start".`); }
   const data = await r.json().catch(() => null);
   if (r.status === 401 && !url.startsWith('/api/login') && !url.startsWith('/api/signup')) {
     const wasSignedIn = !!S.me;
