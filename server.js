@@ -15,6 +15,7 @@ import { streamCompletion, ModelError, probeModel, complete, keyInfo } from './l
 import { initSecrets, encrypt, decrypt } from './lib/secrets.js';
 import { evaluateWithJev, evaluateWithJudge, buildBrief, overall, CRITERIA, DEFAULT_CRITERIA } from './lib/evaluator.js';
 import { safeFetch, checkRobots, extractStructured, extractWithAI, conditionMet, buyLinks } from './lib/watch.js';
+import { renderPage, browserEnabled, shutdownBrowser } from './lib/browser.js';
 import { SOURCES, COMPANY_PRESETS, resolveCompany, collect, prefilter, dedupeKey, scoreRelevance, pageDigest, judgePage, planRequest, terms as monTerms } from './lib/monitor.js';
 import { detect, safeName, LIMITS, MAX_PER_MESSAGE, extractPdfText, describeImage, materialize } from './lib/attachments.js';
 import { titlePrompt, cleanTitle, summaryPlan, summaryPrompt } from './lib/memory.js';
@@ -1107,17 +1108,28 @@ async function inspectUrlInner(user, url) {
   if (page.status >= 400) throw new HttpError(400, `The page returned HTTP ${page.status}. Check the link.`);
   if (!/html|xml/i.test(page.contentType)) throw new HttpError(400, 'That link is not a web page.');
   let x = extractStructured(page.body);
+  let html = page.body, finalUrl = page.url, rendered = false;
+  // Prices that only appear after JavaScript runs: render the page in headless Chrome.
+  if (x.price == null && browserEnabled()) {
+    try {
+      const r = await renderPage(page.url, { allowPrivate: opts.allowPrivate });
+      if (r.status && r.status >= 400) throw new Error(`HTTP ${r.status}`);
+      html = r.html; finalUrl = r.url; rendered = true;
+      const rx = extractStructured(html);
+      if (rx.price != null) x = { ...rx, method: 'browser' };
+    } catch (e) { console.warn('[browser]', e.message); }
+  }
   if (x.price == null) {
-    const ai = await extractWithAI({ apiKey: keyFor(user).key, models: (await backgroundModels()).map((m) => m.id), html: page.body, url: page.url });
-    x = { ...x, ...ai, title: ai.title || x.title };
+    const ai = await extractWithAI({ apiKey: keyFor(user).key, models: (await backgroundModels()).map((m) => m.id), html, url: finalUrl });
+    x = { ...x, ...ai, title: ai.title || x.title, method: rendered ? 'browser+ai' : 'ai' };
     if (x.price == null) {
-      const suggestions = buyLinks(page.body, page.url);
+      const suggestions = buyLinks(html, finalUrl);
       throw new HttpError(400, suggestions.length
         ? 'This looks like an overview page without a single product price. Try the store page instead.'
         : (ai.error || 'Could not find a product price on that page.'), { suggestions });
     }
   }
-  return { ...x, final_url: page.url };
+  return { ...x, final_url: finalUrl };
 }
 
 function notify(userId, n) {
@@ -1294,7 +1306,11 @@ async function runMonitor(m, { preview = false } = {}) {
     if (!(await checkRobots(m.url, watchFetchOpts()))) throw new HttpError(400, "This site's robots.txt does not allow automated checks of that page.");
     const page = await safeFetch(m.url, watchFetchOpts());
     if (page.status >= 400) throw new HttpError(400, `The page returned HTTP ${page.status}.`);
-    const { text, hash } = pageDigest(page.body);
+    let body = page.body;
+    if (pageDigest(body).text.length < 600 && browserEnabled()) {
+      try { body = (await renderPage(page.url, { allowPrivate: watchFetchOpts().allowPrivate })).html; } catch (e) { console.warn('[browser]', e.message); }
+    }
+    const { text, hash } = pageDigest(body);
     const state = JSON.parse(m.state || '{}');
     let event = null, verdict = null;
     if (m.criteria) {
@@ -1373,7 +1389,7 @@ route('POST', '/api/agents/companies/resolve', async (req, res) => {
 });
 
 route('GET', '/api/agents/catalog', async (req, res) => {
-  send(res, 200, { sources: Object.entries(SOURCES).map(([key, v]) => ({ key, ...v })), company_presets: COMPANY_PRESETS, intervals: MON_INTERVALS });
+  send(res, 200, { browser: browserEnabled(), sources: Object.entries(SOURCES).map(([key, v]) => ({ key, ...v })), company_presets: COMPANY_PRESETS, intervals: MON_INTERVALS });
 });
 
 // Plain-English request -> a tracker config the user confirms before anything is created.
@@ -1878,6 +1894,7 @@ export const server = http.createServer(async (req, res) => {
 
 for (const sig of ['SIGINT', 'SIGTERM']) {
   process.once(sig, async () => {
+    shutdownBrowser();
     if (lf.enabled()) { console.log('Flushing Langfuse traces…'); await Promise.race([lf.flush(), new Promise((ok) => setTimeout(ok, 5000))]); }
     process.exit(0);
   });

@@ -164,6 +164,13 @@ await step('Price already below target alerts right away', 'Agents', async () =>
   const after = (await u('GET', '/api/notifications')).data;
   must(after.items.length === before + 1 && after.items[0].title.startsWith('Already below your target'), 'no immediate alert');
 });
+await step('JavaScript-only price read with headless browser', 'Agents', async () => {
+  const { status, data } = await u('POST', '/api/watches/preview', { url: `${SHOP}/product/js-speaker` });
+  if (status === 400 && /No Chrome/.test(data?.error || '')) return { status: 'warn', detail: 'Chrome not installed on this machine' };
+  must(status === 200, `preview failed: ${data?.error}`);
+  must(data.price === 89 && data.method === 'browser', `got ${data.price} via ${data.method}`);
+  return `USD ${data.price} via ${data.method}`;
+});
 await step('Page agent alerts when a condition becomes true', 'Agents', async () => {
   await fetch(`${SHOP}/set?id=text-only-lamp&price=35.5`, { redirect: 'manual' });
   const m = (await u('POST', '/api/monitors', { kind: 'page', name: 'Lamp', url: `${SHOP}/product/text-only-lamp`, criteria: 'The desk lamp costs less than $30', interval_minutes: 288 })).data;

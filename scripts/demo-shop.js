@@ -10,11 +10,13 @@ const products = {
   headphones: { name: 'Acme Noise-Cancelling Headphones', price: 129.99, currency: 'USD' },
   kettle: { name: 'Acme Electric Kettle', price: 49.0, currency: 'USD' },
   'text-only-lamp': { name: 'Acme Desk Lamp (no product data, AI must read it)', price: 35.5, currency: 'USD', textOnly: true },
+  'js-speaker': { name: 'Acme Smart Speaker (price loads with JavaScript)', price: 89.0, currency: 'USD', jsOnly: true },
 };
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
 http.createServer((req, res) => {
   const url = new URL(req.url, 'http://x');
+  if (url.pathname.startsWith('/api/price/')) { const p = products[url.pathname.split('/').pop()]; res.writeHead(p ? 200 : 404, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(p || {})); }
   if (url.pathname === '/robots.txt') { res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end('User-agent: *\nDisallow: /private/\n'); }
   if (url.pathname === '/set') {
     const p = products[url.searchParams.get('id')]; const v = Number(url.searchParams.get('price'));
@@ -34,6 +36,12 @@ http.createServer((req, res) => {
   const p = m && products[m[1]];
   if (!p) { res.writeHead(404); return res.end('Not found'); }
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+  if (p.jsOnly) { // like many modern stores: the HTML is a shell and the price arrives from an API
+    return res.end(`<!doctype html><html><head><meta charset="utf-8"><title>${esc(p.name)} | Demo Shop</title></head><body><div id="app">Loading…</div>
+      <script>setTimeout(async () => { const p = await (await fetch('/api/price/${m[1]}')).json();
+        const s = document.createElement('script'); s.type = 'application/ld+json'; s.textContent = JSON.stringify({ '@context': 'https://schema.org', '@type': 'Product', name: p.name, offers: { '@type': 'Offer', price: p.price.toFixed(2), priceCurrency: p.currency } }); document.head.appendChild(s);
+        document.getElementById('app').innerHTML = '<h1>' + p.name + '</h1><p>Now $' + p.price.toFixed(2) + '</p>'; }, 600);</script></body></html>`);
+  }
   res.end(`<!doctype html><html><head><meta charset="utf-8"><title>${esc(p.name)} | Demo Shop</title>
     ${p.textOnly ? '' : `<script type="application/ld+json">${JSON.stringify({ '@context': 'https://schema.org', '@type': 'Product', name: p.name, offers: { '@type': 'Offer', price: p.price.toFixed(2), priceCurrency: p.currency, availability: 'https://schema.org/InStock' } })}</script>`}
     </head><body><h1>${esc(p.name)}</h1><p class="price">Now only $${p.price.toFixed(2)}</p><p>Was $${(p.price * 1.25).toFixed(2)}. Free shipping over $50.</p></body></html>`);

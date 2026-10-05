@@ -1757,7 +1757,7 @@ function openWatchModal({ url = '', target = null, conversationId = null, interv
       out.innerHTML = `<div class="w-preview"><div class="w-title">${esc(preview.title || new URL(preview.final_url).hostname)}</div>
           <div class="w-price">${preview.price_kind === 'from' ? '<span class="muted small">from </span>' : ''}${money(preview.price, preview.currency)}${preview.high_price ? `<span class="muted small"> to ${money(preview.high_price, preview.currency)} depending on the model</span>` : ''}</div>
           ${localCurrency() && preview.currency && preview.currency !== localCurrency() ? `<div class="small notice-inline">ℹ The store showed prices in ${esc(preview.currency)}. Stores often pick the currency from your network location (a VPN or proxy can change it). Alerts compare prices in this same currency.</div>` : ''}
-          <div class="muted small">${preview.method === 'structured' ? 'Read from the page\'s product data.' : `Read from the page text by ${esc(shortName(preview.model || 'an AI model'))}. Double-check it matches the price you see.`}${preview.in_stock === false ? ' · ⚠ Out of stock' : ''}</div></div>
+          <div class="muted small">${preview.method === 'browser' ? 'The price only appears after the page\'s JavaScript runs, so it was read with a headless browser.' : preview.method === 'browser+ai' ? `Rendered in a headless browser, then read by ${esc(shortName(preview.model || 'an AI model'))}. Double-check it matches the price you see.` : preview.method === 'structured' ? 'Read from the page\'s product data.' : `Read from the page text by ${esc(shortName(preview.model || 'an AI model'))}. Double-check it matches the price you see.`}${preview.in_stock === false ? ' · ⚠ Out of stock' : ''}</div></div>
         <div class="w-cond"><div class="section-title">Alert me when</div>
           <label class="chk"><input type="radio" name="cond" value="below" checked> the price is at or below <input class="input inline" id="w-target" type="number" min="0" step="0.01" value="${t}"> ${esc(preview.currency || '')}</label>
           <label class="chk"><input type="radio" name="cond" value="drop_pct"> it drops by <input class="input inline" id="w-pct" type="number" min="1" max="99" value="10">% or more</label>
@@ -1834,7 +1834,7 @@ function watchCardHTML(w) {
       <div class="muted small">Lowest ${money(w.lowest_price, w.currency)}${w.in_stock === 0 ? ' · ⚠ out of stock' : ''}</div></div>
       <div class="spark" id="spark-${w.id}"></div></div>
     ${w.last_error ? `<div class="err-box small">⚠ ${esc(w.last_error)}</div>` : ''}
-    <div class="muted small">Checked ${ago(w.last_checked_at)} · ${esc(freqLabel(w.interval_minutes))} · ${w.read_by?.method === 'ai' ? `price read by ${esc(shortName(w.read_by.model || 'AI'))}` : 'price from product data (no AI)'}</div>
+    <div class="muted small">Checked ${ago(w.last_checked_at)} · ${esc(freqLabel(w.interval_minutes))} · ${{ ai: `price read by ${esc(shortName(w.read_by?.model || 'AI'))}`, browser: 'read with headless browser (no AI)', 'browser+ai': `headless browser + ${esc(shortName(w.read_by?.model || 'AI'))}` }[w.read_by?.method] || 'price from product data (no AI)'}</div>
     <div class="card-actions">
       <button class="btn small" data-w-act="check">Check now</button>
       <button class="btn small ghost" data-w-act="ask" title="Ask the models whether this is a good deal">💬 Ask</button>

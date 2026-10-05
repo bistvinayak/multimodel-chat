@@ -50,6 +50,17 @@ Personal keys are encrypted with a master key from `APP_SECRET` (64 hex characte
 | Preference signal | Use, continue, save and final actions log a preference event with the competing responses and display position, ready for selection-rate analytics. |
 | Mobile | Answers become tabs per turn instead of squeezed columns. |
 
+## How agents read the web
+
+They don't scrape aggressively, and they never sign in or solve CAPTCHAs.
+
+1. **Official APIs and feeds first.** Jobs come from Greenhouse, Ashby and Lever job-board APIs, Remotive, Remote OK, Arbeitnow and the Hacker News API. News comes from Google News RSS and the Hacker News API.
+2. **A plain HTTP request for web pages** (price and page agents). The price comes from the product data stores embed (JSON-LD, Open Graph, microdata, or Amazon-style price blocks).
+3. **A headless browser when content needs JavaScript.** If the page loaded but has no readable price, or almost no text, it's rendered in headless Chrome. This uses the system Chrome or Chromium over the DevTools protocol, with no extra dependencies. One shared browser runs at most 2 pages at a time and shuts down after 5 idle minutes. Every request the page makes, including scripts and redirects, is checked against private and internal addresses, and images, media and fonts are skipped. Set `BROWSER_RENDER=off` to disable it, or `CHROME_PATH` to point at a browser.
+4. **A free AI model reads the visible text** only when there's still no structured price.
+
+Explicit refusals (401, 403, 429) and robots.txt are respected. The browser isn't used to get around them.
+
 ## Testing
 
 See [TESTING.md](TESTING.md). In short: `npm run check` runs the app health check, `npm run eval` runs the AI quality evals, and `npm test` runs the unit tests.
