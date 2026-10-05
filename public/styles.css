@@ -252,3 +252,33 @@ a { color: var(--accent); }
 /* automatic stand-ins */
 .badge.standin { color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); max-width: 50%; overflow: hidden; text-overflow: ellipsis; }
 .err-box .switched { font-size: 13px; color: var(--text); background: color-mix(in srgb, var(--accent) 8%, var(--panel)); border-radius: 6px; padding: 6px 8px; }
+
+/* live connection */
+.conn { display: none; background: color-mix(in srgb, var(--warn) 14%, var(--panel)); color: var(--text); font-size: 13px; text-align: center; padding: 4px 8px; border-bottom: 1px solid var(--border); }
+.conn.show { display: block; }
+
+/* edit last message */
+.user-msg { position: relative; }
+.user-msg .edit-btn { position: absolute; left: -64px; top: 6px; opacity: 0; transition: opacity .15s; }
+.user-msg:hover .edit-btn, .user-msg .edit-btn:focus { opacity: 1; }
+@media (hover: none), (max-width: 820px) { .user-msg .edit-btn { position: static; opacity: 1; margin-left: 6px; } }
+.user-edit { max-width: 760px; margin: 0 0 12px auto; display: grid; gap: 6px; }
+.edit-actions { display: flex; gap: 6px; align-items: center; justify-content: flex-end; flex-wrap: wrap; }
+.edit-actions .muted { margin-right: auto; }
+
+/* code blocks */
+.code-wrap { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; margin: .6em 0; }
+.code-wrap pre { margin: 0; border-radius: 0; }
+.code-wrap pre code.hljs { background: transparent; padding: 0; }
+.code-bar { display: flex; align-items: center; justify-content: space-between; padding: 2px 4px 2px 10px; background: var(--panel-2); border-bottom: 1px solid var(--border); font-size: 12px; color: var(--muted); }
+
+/* memory */
+.memory { border: 1px dashed var(--border); border-radius: 8px; padding: 4px 10px; }
+.memory summary { cursor: pointer; }
+.memory .md { margin: 6px 0; }
+
+/* search */
+.search-wrap { padding: 0 14px 6px; }
+.search-wrap .input { padding: 6px 10px; font-size: 14px; }
+.conv-item .hit { display: block; font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.conv-item mark { background: color-mix(in srgb, var(--warn) 30%, transparent); color: inherit; border-radius: 2px; }

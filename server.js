@@ -9,7 +9,8 @@ import { getCatalog, getModel, qualityScore, NOT_CHAT } from './lib/models.js';
 import { healthOf, recordOk, recordLimited, recordBlocked } from './lib/health.js';
 import * as lf from './lib/langfuse.js';
 import { buildContext } from './lib/context.js';
-import { streamCompletion, ModelError, probeModel } from './lib/openrouter.js';
+import { streamCompletion, ModelError, probeModel, complete } from './lib/openrouter.js';
+import { titlePrompt, cleanTitle, summaryPlan, summaryPrompt } from './lib/memory.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 try { process.loadEnvFile(path.join(ROOT, '.env')); } catch {}
@@ -29,7 +30,15 @@ if (!API_KEY) console.warn('WARNING: OPENROUTER_API_KEY is not set. Model calls 
 const db = openDb(process.env.DB_PATH || path.join(ROOT, 'data', 'app.db'));
 let lfProject = null; // Langfuse project URL, for deep links
 if (lf.enabled()) lf.projectUrl().then((u) => { lfProject = u; console.log(u ? `Langfuse tracing on: ${u}` : 'Langfuse keys set, but the project lookup failed. Check LANGFUSE_HOST and keys.'); });
-const running = new Map(); // response_id -> AbortController
+const running = new Map(); // response_id -> { ctl, convId, content, reasoning, retrying, switching }
+
+// ---------- live event hub: one NDJSON stream per open chat, any number of tabs ----------
+const hubs = new Map(); // conversation_id -> Set<ServerResponse>
+function publish(convId, ev) {
+  const subs = hubs.get(convId); if (!subs) return;
+  const line = JSON.stringify(ev) + '\n';
+  for (const r of subs) if (!r.writableEnded && !r.destroyed) r.write(line);
+}
 const uid = () => crypto.randomUUID();
 const now = () => Date.now();
 const DEFAULT_PREFS = { max_output_tokens: 8192, free_only: true, auto_switch: true };
@@ -68,7 +77,8 @@ const touch = (convId) => db.prepare('UPDATE conversations SET updated_at=? WHER
 
 const RESPONSE_COLS = `id, turn_id, conversation_id, model_id, served_model, provider, display_position, content, reasoning,
   status, error_kind, error, finish_reason, latency_ms, first_token_ms, prompt_tokens, completion_tokens, cost,
-  saved, final, attempts, replaced_by, stands_in_for, auto_switched, trace_span_id, created_at, finished_at`;
+  saved, final, attempts, replaced_by, stands_in_for, auto_switched, trace_span_id, created_at, finished_at,
+  json_array_length(versions) AS version_count`;
 const getResponseRow = (id) => db.prepare(`SELECT ${RESPONSE_COLS} FROM responses WHERE id=?`).get(id);
 
 function conversationPayload(conv) {
@@ -94,6 +104,7 @@ function conversationPayload(conv) {
     langfuse: lf.enabled() && lfProject ? { session_url: `${lfProject}/sessions/${encodeURIComponent(conv.id)}`, trace_base: `${lfProject}/traces/` } : null,
     selections,
     stats,
+    memory: conv.conversation_summary ? { summary: conv.conversation_summary, upto: conv.summary_upto } : null,
     skill_ids: db.prepare('SELECT skill_id FROM conversation_skills WHERE conversation_id=?').all(conv.id).map((x) => x.skill_id),
     max_models: MAX_MODELS,
   };
@@ -246,12 +257,12 @@ function traceRun(user, turn, respId, spanId, startedAt, messages, maxOut, event
     const resp = db.prepare('SELECT * FROM responses WHERE id=?').get(respId);
     db.prepare('UPDATE responses SET trace_span_id=? WHERE id=?').run(spanId, respId);
     lf.enqueue(lf.generationSpan({ conv, user, turn, resp, spanId, startedAt, messages, maxOut, events }));
-    maybeTraceTurn(user, turn.id);
   } catch (e) { console.warn('[langfuse] trace failed:', e.message); }
 }
 
 // The turn's root span goes out once every model in it has finished (stand-ins included).
 function maybeTraceTurn(user, turnId) {
+  if (!lf.enabled()) return;
   const turn = db.prepare('SELECT * FROM turns WHERE id=?').get(turnId);
   if (!turn || turn.traced) return;
   const responses = db.prepare('SELECT * FROM responses WHERE turn_id=? ORDER BY display_position').all(turnId);
@@ -264,29 +275,39 @@ function maybeTraceTurn(user, turnId) {
 }
 
 // ---------- model run (streams NDJSON to the client) ----------
-async function runResponse(user, resp, req, res) {
-  if (running.has(resp.id)) throw new HttpError(409, 'This response is already generating');
+const summaryOf = (convId) => {
+  const c = db.prepare('SELECT conversation_summary, summary_upto FROM conversations WHERE id=?').get(convId);
+  return c?.conversation_summary ? { text: c.conversation_summary, upto: c.summary_upto || 0 } : null;
+};
+
+/** Starts a model run in the background. It keeps going if the browser reloads or disconnects. */
+function startRun(user, respId, { regenerate = false } = {}) {
+  if (running.has(respId)) throw new HttpError(409, 'This response is already generating');
+  const resp = db.prepare('SELECT * FROM responses WHERE id=?').get(respId);
+  if (!resp) throw new HttpError(404, 'Response not found');
+  if (regenerate) archiveVersion(resp);
+  // Reserve the slot synchronously so double clicks can't start two runs.
+  running.set(respId, { ctl: new AbortController(), convId: resp.conversation_id, content: '', reasoning: '', retrying: null, switching: false });
+  runResponse(user, resp).catch((e) => console.error('[run]', e));
+}
+
+function archiveVersion(resp) {
+  if (!resp.content?.trim()) return;
+  const versions = JSON.parse(resp.versions || '[]');
+  versions.push({ content: resp.content, reasoning: resp.reasoning, status: resp.status, prompt_tokens: resp.prompt_tokens,
+    completion_tokens: resp.completion_tokens, cost: resp.cost, latency_ms: resp.latency_ms, finished_at: resp.finished_at });
+  db.prepare('UPDATE responses SET versions=? WHERE id=?').run(JSON.stringify(versions.slice(-10)), resp.id);
+}
+
+async function runResponse(user, resp) {
+  const state = running.get(resp.id);
+  const ctl = state.ctl;
+  const emit = (obj) => publish(resp.conversation_id, { ...obj, rid: resp.id });
   const turn = db.prepare('SELECT * FROM turns WHERE id=?').get(resp.turn_id);
-  const model = await getModel(resp.model_id);
-  const maxOut = maxOutFor(user, model);
-  const { messages } = buildContext(db, turn, resp.model_id, model, maxOut, pinsFor(turn.conversation_id, turn.id), skillsFor(turn.conversation_id));
-
-  const ctl = new AbortController();
-  running.set(resp.id, ctl);
-  db.prepare(`UPDATE responses SET status='generating', content='', reasoning='', error=NULL, error_kind=NULL, finish_reason=NULL,
-              latency_ms=NULL, first_token_ms=NULL, prompt_tokens=NULL, completion_tokens=NULL, cost=NULL,
-              attempts=attempts+1, context_snapshot=?, finished_at=NULL WHERE id=?`).run(JSON.stringify(messages), resp.id);
-
-  res.writeHead(200, { 'Content-Type': 'application/x-ndjson', 'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no' });
-  const emit = (obj) => { if (!res.writableEnded && !res.destroyed) res.write(JSON.stringify(obj) + '\n'); };
-  // If the browser tab goes away, stop paying for tokens nobody will see.
-  res.on('close', () => { if (!res.writableEnded) ctl.abort('user'); });
-  emit({ type: 'start', response: getResponseRow(resp.id) });
-
-  let content = '', reasoning = '', lastFlush = now();
-  const started = now();
+  let messages = [], maxOut = 0, started = now();
   const spanId = lf.newSpanId();
   const events = []; // retries and switches, attached to the Langfuse generation
+  let content = '', reasoning = '', lastFlush = now();
   const flush = (force) => {
     if (force || now() - lastFlush > 1500) {
       db.prepare('UPDATE responses SET content=?, reasoning=? WHERE id=?').run(content, reasoning, resp.id);
@@ -295,15 +316,24 @@ async function runResponse(user, resp, req, res) {
   };
 
   try {
+    const model = await getModel(resp.model_id);
+    maxOut = maxOutFor(user, model);
+    ({ messages } = buildContext(db, turn, resp.model_id, model, maxOut, pinsFor(turn.conversation_id, turn.id),
+      skillsFor(turn.conversation_id), { summary: summaryOf(turn.conversation_id) }));
+    db.prepare(`UPDATE responses SET status='generating', content='', reasoning='', error=NULL, error_kind=NULL, finish_reason=NULL,
+                latency_ms=NULL, first_token_ms=NULL, prompt_tokens=NULL, completion_tokens=NULL, cost=NULL, replaced_by=NULL,
+                attempts=attempts+1, context_snapshot=?, finished_at=NULL WHERE id=?`).run(JSON.stringify(messages), resp.id);
+    started = now();
+    emit({ type: 'start', response: getResponseRow(resp.id) });
+
     let stats;
-    // Free models are often rate-limited upstream for a few seconds. Retry the SAME model
-    // with backoff (never a different one: that would invalidate the comparison).
+    // Free models are often rate-limited upstream for a few seconds: retry the SAME model with backoff.
     for (let attempt = 0; ; attempt++) {
       try {
         stats = await streamCompletion({
           apiKey: API_KEY, model: resp.model_id, messages, maxTokens: maxOut, signal: ctl.signal,
-          onDelta: (t) => { content += t; emit({ type: 'delta', content: t }); flush(); },
-          onReasoning: (t) => { reasoning += t; emit({ type: 'reasoning', content: t }); flush(); },
+          onDelta: (t) => { content += t; state.content = content; state.retrying = null; emit({ type: 'delta', content: t }); flush(); },
+          onReasoning: (t) => { reasoning += t; state.reasoning = reasoning; state.retrying = null; emit({ type: 'reasoning', content: t }); flush(); },
         });
         break;
       } catch (e) {
@@ -313,6 +343,7 @@ async function runResponse(user, resp, req, res) {
           && !(e.retryAfterMs > 60_000);
         if (!retryable) { e.attempts = attempt + 1; throw e; }
         const wait = e.retryAfterMs ?? backoffMs(attempt);
+        state.retrying = { attempt: attempt + 1, of: maxRetries, wait_ms: wait, at: now() };
         emit({ type: 'retrying', attempt: attempt + 1, of: maxRetries, wait_ms: wait });
         events.push({ name: 'rate_limited_retry', time: now(), attributes: { attempt: attempt + 1, wait_ms: wait, error: e.message.slice(0, 300) } });
         await new Promise((ok) => {
@@ -346,19 +377,21 @@ async function runResponse(user, resp, req, res) {
     if (me.kind === 'rate_limit') {
       me.message = me.retryAfterMs > 60_000
         ? `Rate limited upstream. The provider says capacity returns in about ${Math.ceil(me.retryAfterMs / 60_000)} min. Raw: ${me.message}`
-        : `Still rate limited after ${me.attempts || 1} attempts over about ${Math.round((Date.now() - started) / 1000)}s. Raw: ${me.message}`;
+        : `Still rate limited after ${me.attempts || 1} attempts over about ${Math.round((now() - started) / 1000)}s. Raw: ${me.message}`;
     }
     db.prepare(`UPDATE responses SET content=?, reasoning=?, status=?, error=?, error_kind=?, finished_at=? WHERE id=?`)
       .run(content, reasoning, status, me.kind === 'stopped' ? null : me.message, me.kind, now(), resp.id);
     if (me.kind === 'rate_limit' && prefsOf(user).auto_switch && !ctl.signal.aborted && standInDepth(resp.id) < MAX_AUTO_SWITCHES) {
+      state.switching = true;
       emit({ type: 'switching' });
       events.push({ name: 'auto_switch_started', time: now() });
       try {
         const alt = await pickStandIn(getResponseRow(resp.id));
         if (alt) {
           const newId = swapLane(getResponseRow(resp.id), alt.id, true);
-          emit({ type: 'switched', from: resp.model_id, to: alt.id, new_response_id: newId });
           events.push({ name: 'auto_switched', time: now(), attributes: { from: resp.model_id, to: alt.id, new_response_id: newId } });
+          startRun(user, newId); // the stand-in starts right away, server side
+          emit({ type: 'switched', from: resp.model_id, to: alt.id, new_response_id: newId });
         } else {
           emit({ type: 'switch_failed', message: 'No other free model is answering right now.' });
           events.push({ name: 'auto_switch_failed', time: now(), attributes: { reason: 'no responding alternative' } });
@@ -369,9 +402,75 @@ async function runResponse(user, resp, req, res) {
     running.delete(resp.id);
     touch(resp.conversation_id);
     traceRun(user, turn, resp.id, spanId, started, messages, maxOut, events);
+    emit({ type: 'final', response: getResponseRow(resp.id) });
+    onTurnSettled(user, turn.id);
   }
-  emit({ type: 'final', response: getResponseRow(resp.id) });
-  res.end();
+}
+
+// ---------- when every model in a turn has finished ----------
+function onTurnSettled(user, turnId) {
+  const responses = db.prepare('SELECT status, id FROM responses WHERE turn_id=?').all(turnId);
+  if (responses.some((r) => ['pending', 'generating'].includes(r.status) || running.has(r.id))) return;
+  try { maybeTraceTurn(user, turnId); } catch (e) { console.warn('[langfuse]', e.message); }
+  const turn = db.prepare('SELECT conversation_id FROM turns WHERE id=?').get(turnId);
+  maybeTitle(turn.conversation_id).catch((e) => console.warn('[title]', e.message));
+  maybeSummarize(turn.conversation_id).catch((e) => console.warn('[summary]', e.message));
+}
+
+// Strong, currently-healthy free models first, for background jobs.
+async function backgroundModels(prefer = []) {
+  const catalog = await getCatalog();
+  const ranked = catalog.filter((m) => m.free && !NOT_CHAT.test(m.id) && !['busy', 'blocked'].includes(healthOf(m.id)) && m.id.endsWith(':free'))
+    .sort((a, b) => qualityScore(b, { health: healthOf(b.id) }) - qualityScore(a, { health: healthOf(a.id) }));
+  const preferred = prefer.map((id) => ranked.find((m) => m.id === id)).filter(Boolean);
+  return [...new Set([...preferred, ...ranked])].slice(0, 4);
+}
+
+const titling = new Set();
+async function maybeTitle(convId) {
+  const conv = db.prepare('SELECT * FROM conversations WHERE id=?').get(convId);
+  if (!conv || conv.title_source !== 'auto' || titling.has(convId)) return;
+  const first = db.prepare('SELECT * FROM turns WHERE conversation_id=? ORDER BY created_at LIMIT 1').get(convId);
+  const answer = first && db.prepare(`SELECT model_id, content FROM responses WHERE turn_id=? AND status='completed' ORDER BY latency_ms LIMIT 1`).get(first.id);
+  if (!answer) return;
+  titling.add(convId);
+  try {
+    for (const m of await backgroundModels([answer.model_id])) {
+      try {
+        const title = cleanTitle(await complete({ apiKey: API_KEY, model: m.id, messages: titlePrompt(first.user_message, answer.content), maxTokens: 400, timeoutMs: 30_000 }));
+        if (!title) continue;
+        const cur = db.prepare('SELECT title_source FROM conversations WHERE id=?').get(convId);
+        if (cur?.title_source !== 'auto') return; // the user renamed it meanwhile
+        db.prepare(`UPDATE conversations SET title=?, title_source='ai' WHERE id=?`).run(title, convId);
+        publish(convId, { type: 'title', title });
+        return;
+      } catch { /* try the next model */ }
+    }
+  } finally { titling.delete(convId); }
+}
+
+const summarizing = new Set();
+async function maybeSummarize(convId) {
+  if (summarizing.has(convId)) return;
+  const conv = db.prepare('SELECT * FROM conversations WHERE id=?').get(convId);
+  const turns = db.prepare('SELECT id, user_message, created_at FROM turns WHERE conversation_id=? ORDER BY created_at').all(convId);
+  const decisions = db.prepare(`SELECT s.selected_text, r.model_id FROM context_selections s JOIN responses r ON r.id=s.response_id
+    WHERE s.conversation_id=? AND s.selection_type='canonical' AND s.active=1 ORDER BY s.created_at`).all(convId)
+    .map((d) => `- (from ${d.model_id}) ${d.selected_text.replace(/\s+/g, ' ').slice(0, 600)}`).join('\n');
+  const plan = summaryPlan(turns, conv.summary_upto, decisions);
+  if (!plan) return;
+  summarizing.add(convId);
+  try {
+    for (const m of await backgroundModels()) {
+      try {
+        const text = await complete({ apiKey: API_KEY, model: m.id, messages: summaryPrompt(conv.conversation_summary, plan.fold, decisions), maxTokens: 2500, timeoutMs: 90_000 });
+        if (text.length < 40) continue;
+        db.prepare('UPDATE conversations SET conversation_summary=?, summary_upto=? WHERE id=?').run(text, plan.upto, convId);
+        publish(convId, { type: 'summary', upto: plan.upto });
+        return;
+      } catch { /* next model */ }
+    }
+  } finally { summarizing.delete(convId); }
 }
 
 // ---------- routes ----------
@@ -494,9 +593,22 @@ route('POST', '/api/models/probe', async (req, res) => {
 });
 
 route('GET', '/api/conversations', async (req, res, { user }) => {
+  const q = new URL(req.url, 'http://x').searchParams.get('q')?.trim();
+  if (!q) {
+    return send(res, 200, db.prepare(`SELECT c.id, c.title, c.created_at, c.updated_at,
+      (SELECT COUNT(*) FROM turns t WHERE t.conversation_id=c.id) AS turns
+      FROM conversations c WHERE c.user_id=? ORDER BY c.updated_at DESC`).all(user.id));
+  }
+  // Search titles, your messages and answers. LIKE wildcards in the query are escaped.
+  const like = `%${q.replace(/[\\%_]/g, (m) => '\\' + m)}%`;
   send(res, 200, db.prepare(`SELECT c.id, c.title, c.created_at, c.updated_at,
-    (SELECT COUNT(*) FROM turns t WHERE t.conversation_id=c.id) AS turns
-    FROM conversations c WHERE c.user_id=? ORDER BY c.updated_at DESC`).all(user.id));
+      (SELECT COUNT(*) FROM turns t WHERE t.conversation_id=c.id) AS turns,
+      (SELECT t.user_message FROM turns t WHERE t.conversation_id=c.id AND t.user_message LIKE ? ESCAPE '\\' LIMIT 1) AS hit_message,
+      (SELECT substr(r.content, 1, 400) FROM responses r WHERE r.conversation_id=c.id AND r.content LIKE ? ESCAPE '\\' LIMIT 1) AS hit_answer
+    FROM conversations c WHERE c.user_id=? AND (c.title LIKE ? ESCAPE '\\'
+      OR EXISTS (SELECT 1 FROM turns t WHERE t.conversation_id=c.id AND t.user_message LIKE ? ESCAPE '\\')
+      OR EXISTS (SELECT 1 FROM responses r WHERE r.conversation_id=c.id AND r.content LIKE ? ESCAPE '\\'))
+    ORDER BY c.updated_at DESC LIMIT 50`).all(like, like, user.id, like, like, like));
 });
 
 route('POST', '/api/conversations', async (req, res, { user }) => {
@@ -517,6 +629,8 @@ route('POST', '/api/conversations', async (req, res, { user }) => {
       : db.prepare('SELECT id FROM skills WHERE user_id=? AND auto=1').all(user.id);
     skillRows.forEach((k, i) => db.prepare('INSERT OR IGNORE INTO conversation_skills (conversation_id, skill_id, added_at) VALUES (?,?,?)').run(id, k.id, t + i));
   });
+  const prefs = prefsOf(user); prefs.last_models = ids;
+  db.prepare('UPDATE users SET preferences=? WHERE id=?').run(JSON.stringify(prefs), user.id);
   send(res, 201, conversationPayload(ownConversation(user, id)));
 });
 
@@ -525,13 +639,13 @@ route('GET', '/api/conversations/:id', async (req, res, { user, params }) => sen
 route('PATCH', '/api/conversations/:id', async (req, res, { user, params }) => {
   const c = ownConversation(user, params.id);
   const { title } = await readJson(req);
-  if (title?.trim()) db.prepare('UPDATE conversations SET title=? WHERE id=?').run(title.trim().slice(0, 120), c.id);
+  if (title?.trim()) db.prepare(`UPDATE conversations SET title=?, title_source='user' WHERE id=?`).run(title.trim().slice(0, 120), c.id);
   send(res, 200, conversationPayload(ownConversation(user, c.id)));
 });
 
 route('DELETE', '/api/conversations/:id', async (req, res, { user, params }) => {
   const c = ownConversation(user, params.id);
-  for (const r of db.prepare('SELECT id FROM responses WHERE conversation_id=?').all(c.id)) running.get(r.id)?.abort('user');
+  for (const r of db.prepare('SELECT id FROM responses WHERE conversation_id=?').all(c.id)) running.get(r.id)?.ctl.abort('user');
   db.prepare('DELETE FROM conversations WHERE id=?').run(c.id);
   send(res, 200, { ok: true });
 });
@@ -582,7 +696,7 @@ route('POST', '/api/conversations/:id/estimate', async (req, res, { user, params
   for (const t of targets) {
     const model = await getModel(t.model_id);
     const maxOut = maxOutFor(user, model);
-    const { promptTokensEst, droppedTurns } = buildContext(db, draft, t.model_id, model, maxOut, pins, skills);
+    const { promptTokensEst, droppedTurns } = buildContext(db, draft, t.model_id, model, maxOut, pins, skills, { summary: summaryOf(c.id) });
     const min = model ? promptTokensEst * model.prompt_price : null;
     const max = model ? min + maxOut * model.completion_price : null;
     out.push({ model_id: t.model_id, prompt_tokens: promptTokensEst, max_output: maxOut, free: !!model?.free, cost_min: min, cost_max: max, dropped_turns: droppedTurns });
@@ -613,14 +727,86 @@ route('POST', '/api/conversations/:id/messages', async (req, res, { user, params
     if (c.title === 'New conversation') db.prepare('UPDATE conversations SET title=? WHERE id=?').run(text.replace(/\s+/g, ' ').slice(0, 60), c.id);
     db.prepare('UPDATE conversations SET updated_at=? WHERE id=?').run(t, c.id);
   });
+  // All models start at once, server side; output flows over the conversation stream.
+  for (const r of db.prepare('SELECT id FROM responses WHERE turn_id=?').all(turnId)) startRun(user, r.id);
   send(res, 201, conversationPayload(ownConversation(user, c.id)));
 });
 
+// Starts (or regenerates) a run in the background; output arrives on the conversation stream.
 route('POST', '/api/responses/:id/run', async (req, res, { user, params }) => {
   const r = ownResponse(user, params.id);
-  if (r.status === 'completed') throw new HttpError(400, 'Response already completed');
-  await runResponse(user, r, req, res);
+  const { regenerate } = await readJson(req);
+  if (r.status === 'completed' && !regenerate) throw new HttpError(400, 'Response already completed');
+  startRun(user, r.id, { regenerate: !!r.content?.trim() });
+  send(res, 202, { ok: true });
 });
+
+route('POST', '/api/responses/:id/restore', async (req, res, { user, params }) => {
+  const r = ownResponse(user, params.id);
+  if (running.has(r.id)) throw new HttpError(409, 'Stop this response first');
+  const full = db.prepare('SELECT * FROM responses WHERE id=?').get(r.id);
+  const versions = JSON.parse(full.versions || '[]');
+  const i = Number((await readJson(req)).index);
+  const v = versions[i];
+  if (!v) throw new HttpError(404, 'Version not found');
+  // Swap: the current answer becomes a version, the chosen version becomes current.
+  versions.splice(i, 1);
+  if (full.content?.trim()) versions.push({ content: full.content, reasoning: full.reasoning, status: full.status, prompt_tokens: full.prompt_tokens,
+    completion_tokens: full.completion_tokens, cost: full.cost, latency_ms: full.latency_ms, finished_at: full.finished_at });
+  db.prepare(`UPDATE responses SET content=?, reasoning=?, status='completed', error=NULL, error_kind=NULL, prompt_tokens=?, completion_tokens=?,
+              cost=?, latency_ms=?, versions=? WHERE id=?`)
+    .run(v.content, v.reasoning || '', v.prompt_tokens ?? null, v.completion_tokens ?? null, v.cost ?? null, v.latency_ms ?? null, JSON.stringify(versions), r.id);
+  send(res, 200, getResponseRow(r.id));
+});
+
+route('GET', '/api/responses/:id/versions', async (req, res, { user, params }) => {
+  const r = ownResponse(user, params.id);
+  send(res, 200, { versions: JSON.parse(db.prepare('SELECT versions FROM responses WHERE id=?').get(r.id).versions || '[]') });
+});
+
+// Live NDJSON stream for one chat. Sends a snapshot of anything mid-generation, then every event.
+route('GET', '/api/conversations/:id/stream', async (req, res, { user, params }) => {
+  const c = ownConversation(user, params.id);
+  res.writeHead(200, { 'Content-Type': 'application/x-ndjson', 'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no' });
+  if (!hubs.has(c.id)) hubs.set(c.id, new Set());
+  hubs.get(c.id).add(res);
+  for (const [rid, st] of running) {
+    if (st.convId === c.id) res.write(JSON.stringify({ type: 'snapshot', rid, content: st.content, reasoning: st.reasoning, retrying: st.retrying, switching: st.switching }) + '\n');
+  }
+  res.write(JSON.stringify({ type: 'ready' }) + '\n');
+  const ping = setInterval(() => res.write('{"type":"ping"}\n'), 15_000);
+  res.on('close', () => { clearInterval(ping); hubs.get(c.id)?.delete(res); if (!hubs.get(c.id)?.size) hubs.delete(c.id); });
+});
+
+route('POST', '/api/conversations/:id/stop', async (req, res, { user, params }) => {
+  const c = ownConversation(user, params.id);
+  let n = 0;
+  for (const st of running.values()) if (st.convId === c.id) { st.ctl.abort('user'); n++; }
+  send(res, 200, { stopped: n });
+});
+
+// Edit the latest message and rerun every model on it. Earlier answers are kept as versions.
+route('POST', '/api/turns/:id/edit', async (req, res, { user, params }) => {
+  const turn = db.prepare(`SELECT t.* FROM turns t JOIN conversations c ON c.id=t.conversation_id WHERE t.id=? AND c.user_id=?`).get(params.id, user.id);
+  if (!turn) throw new HttpError(404, 'Message not found');
+  const last = db.prepare('SELECT id FROM turns WHERE conversation_id=? ORDER BY created_at DESC LIMIT 1').get(turn.conversation_id);
+  if (last.id !== turn.id) throw new HttpError(400, 'Only your latest message can be edited');
+  const text = String((await readJson(req)).message || '').trim();
+  if (!text) throw new HttpError(400, 'Message is empty');
+  const resps = db.prepare('SELECT * FROM responses WHERE turn_id=?').all(turn.id);
+  if (resps.some((r) => running.has(r.id))) throw new HttpError(409, 'Stop the running answers first');
+  // Stand-ins stay; replaced (busy) lanes are not rerun.
+  const rerun = resps.filter((r) => !r.replaced_by);
+  tx(db, () => {
+    db.prepare('UPDATE turns SET user_message=?, traced=0 WHERE id=?').run(text, turn.id);
+    for (const r of rerun) { archiveVersion(r); db.prepare(`UPDATE responses SET status='pending', content='', reasoning='', error=NULL, error_kind=NULL WHERE id=?`).run(r.id); }
+  });
+  for (const r of rerun) startRun(user, r.id);
+  touch(turn.conversation_id);
+  send(res, 200, conversationPayload(ownConversation(user, turn.conversation_id)));
+});
+
+
 
 route('GET', '/api/responses/:id/alternatives', async (req, res, { user, params }) => {
   const r = ownResponse(user, params.id);
@@ -635,12 +821,13 @@ route('POST', '/api/responses/:id/replace', async (req, res, { user, params }) =
   if (!(await getModel(model_id))) throw new HttpError(400, 'Unknown model');
   if (model_id === r.model_id) throw new HttpError(400, 'Pick a different model');
   const newId = swapLane(r, model_id, false);
+  startRun(user, newId);
   send(res, 200, { ...conversationPayload(ownConversation(user, r.conversation_id)), new_response_id: newId });
 });
 
 route('POST', '/api/responses/:id/stop', async (req, res, { user, params }) => {
   const r = ownResponse(user, params.id);
-  running.get(r.id)?.abort('user');
+  running.get(r.id)?.ctl.abort('user');
   send(res, 200, { ok: true });
 });
 

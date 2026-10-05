@@ -93,3 +93,32 @@ test('a reply tells every recipient which answer (or quoted part) is being repli
   assert.match(other, /written by A, another model/);
   assert.doesNotMatch(other, /A says planner-worker/); // only the quoted part is shared
 });
+
+import { summaryPlan, cleanTitle, SUMMARY_KEEP_RECENT } from '../lib/memory.js';
+
+test('rolling summary replaces dropped turns and keeps uncovered ones condensed', () => {
+  const { db, turn, resp } = seed();
+  for (let i = 0; i < 30; i++) { turn(`x${i}`, `requirement ${i} ` + 'z'.repeat(900), 100 + i); resp(`r${i}`, `x${i}`, 'B', 'y'.repeat(900)); }
+  const opts = { summary: { text: 'Goal: build a review analyzer. Decision: use Postgres.', upto: 115 } };
+  const { messages, droppedTurns, summaryUsed, promptTokensEst } = buildContext(db, { conversation_id: 'c', created_at: 999, user_message: 'NOW' }, 'B', { context_length: 12000 }, 1000, [], [], opts);
+  assert.ok(droppedTurns > 0 && summaryUsed);
+  assert.match(messages[0].content, /Conversation summary so far[\s\S]*use Postgres/);
+  assert.ok(promptTokensEst <= 12000 - 1000, `prompt ${promptTokensEst} must fit the budget`);
+  assert.doesNotMatch(messages[0].content, /requirement 3 /); // covered by the summary, not repeated
+});
+
+test('summary plan: only when history is large, never folds the newest turns', () => {
+  const small = Array.from({ length: 6 }, (_, i) => ({ user_message: 'short', created_at: i }));
+  assert.equal(summaryPlan(small, null), null);
+  const big = Array.from({ length: 30 }, (_, i) => ({ user_message: 'w'.repeat(2000), created_at: i }));
+  const plan = summaryPlan(big, null);
+  assert.equal(plan.fold.length, 30 - SUMMARY_KEEP_RECENT);
+  assert.equal(plan.upto, 30 - SUMMARY_KEEP_RECENT - 1);
+  assert.equal(summaryPlan(big, plan.upto), null); // nothing new to fold yet
+});
+
+test('title cleanup', () => {
+  assert.equal(cleanTitle('"Code Review Benefits."'), 'Code Review Benefits');
+  assert.equal(cleanTitle('Title: Planning A Research Agent\nextra'), 'Planning A Research Agent');
+  assert.equal(cleanTitle('Hi'), null);
+});

@@ -10,7 +10,7 @@ const S = {
   convs: [],
   skills: [],
   conv: null, resp: new Map(),
-  running: new Map(),            // response id -> true while streaming in this tab
+  live: new Set(),               // response ids currently generating (from the stream)
   tabs: {},                      // turn id -> response id shown on mobile
   expanded: new Set(),
   target: 'all',                 // 'all' or an array of model ids (any subset)
@@ -110,6 +110,7 @@ function renderShell() {
         <div class="brand"><span class="brand-mark"><i style="background:var(--lane-0)"></i><i style="background:var(--lane-1)"></i><i style="background:var(--lane-2)"></i></span>Multi-Model Workspace</div>
         <button class="btn primary" id="new-btn">+ New conversation</button>
       </div>
+      <div class="search-wrap"><input class="input" id="conv-search" placeholder="Search chats  (/)" aria-label="Search chats"></div>
       <nav class="conv-list" id="conv-list"></nav>
       <section class="skills" id="skills"></section>
       <div class="sidebar-foot"><span class="who" title="${esc(S.me.email)}">${esc(S.me.name)}</span>
@@ -121,6 +122,7 @@ function renderShell() {
   $('#new-btn').onclick = () => { location.hash = '#/new'; closeNav(); };
   $('#logout-btn').onclick = async () => { await api('POST', '/api/logout').catch(() => {}); S.me = null; renderAuth('login'); };
   $('#settings-btn').onclick = openSettings;
+  $('#conv-search').oninput = searchConvs;
   $('#layout').addEventListener('click', (e) => { if (S.navOpen && !e.target.closest('.sidebar') && !e.target.closest('[data-nav]')) closeNav(); });
 }
 function closeNav() { S.navOpen = false; $('#layout')?.classList.remove('nav-open'); }
@@ -135,10 +137,16 @@ async function loadModels() {
   if (S.conv) { renderHead(); renderThread(); }
 }
 
+let convSeq = 0;
 async function loadConvs() {
-  S.convs = await api('GET', '/api/conversations');
+  const q = $('#conv-search')?.value.trim();
+  const seq = ++convSeq;
+  const list = await api('GET', `/api/conversations${q ? `?q=${encodeURIComponent(q)}` : ''}`);
+  if (seq !== convSeq) return; // a newer search or refresh already replaced this one
+  S.convs = list; S.searchQ = q || '';
   renderSidebar();
 }
+const searchConvs = debounce(() => loadConvs().catch(() => {}), 250);
 async function loadSkills() {
   try { S.skills = await api('GET', '/api/skills'); } catch { S.skills = []; }
   renderSkills();
@@ -233,13 +241,22 @@ function openSkillEditor(skill) {
   };
 }
 
+function snippet(text, q) {
+  const t = String(text).replace(/\s+/g, ' '); const i = t.toLowerCase().indexOf(q.toLowerCase());
+  return i < 0 ? t.slice(0, 80) : (i > 30 ? '…' : '') + t.slice(Math.max(0, i - 30), i + q.length + 40);
+}
+function highlight(text, q) {
+  const e = esc(text), qe = esc(q);
+  return qe ? e.replace(new RegExp(qe.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), (m) => `<mark>${m}</mark>`) : e;
+}
+
 function renderSidebar() {
   const el = $('#conv-list'); if (!el) return;
   const cur = S.conv?.conversation.id;
   el.innerHTML = S.convs.length ? S.convs.map((c) => `<div class="conv-item ${c.id === cur ? 'active' : ''}" data-id="${c.id}">
-      <span class="t" title="${esc(c.title)}">${esc(c.title)}</span>
+      <span class="t" title="${esc(c.title)}">${esc(c.title)}${S.searchQ && (c.hit_message || c.hit_answer) ? `<span class="hit">${highlight(snippet(c.hit_message || c.hit_answer, S.searchQ), S.searchQ)}</span>` : ''}</span>
       <button class="btn small ghost x" data-del="${c.id}" title="Delete conversation">✕</button></div>`).join('')
-    : '<div class="muted small" style="padding:8px">No conversations yet.</div>';
+    : `<div class="muted small" style="padding:8px">${S.searchQ ? 'No chats match.' : 'No conversations yet.'}</div>`;
   el.onclick = async (e) => {
     const del = e.target.closest('[data-del]');
     if (del) {
@@ -350,7 +367,10 @@ function mountPicker(el, opts) {
 let newState = { text: '', selected: [], skills: null };
 const newSkillIds = () => newState.skills ?? S.skills.filter((k) => k.auto).map((k) => k.id);
 function renderNew() {
-  S.conv = null; S.resp = new Map(); renderSidebar(); renderSkills();
+  closeStream();
+  S.conv = null; S.resp = new Map(); S.live = new Set(); renderSidebar(); renderSkills();
+  // Start from the models used last time, if they still exist.
+  if (!newState.selected.length && S.me.preferences.last_models?.length) newState.selected = S.me.preferences.last_models.filter((id) => !S.models.length || S.modelMap.has(id)).slice(0, S.maxModels);
   $('#main').innerHTML = `${mobileTop('New conversation')}<div class="new-wrap"><div class="new-inner">
     <h1>What would you like help with?</h1>
     <textarea class="textarea" id="new-text" rows="4" placeholder="Describe your task. Every model you pick will answer, and the conversation keeps its context.">${esc(newState.text)}</textarea>
@@ -392,7 +412,6 @@ function renderNew() {
       history.replaceState(null, '', `#/c/${payload.conversation.id}`);
       renderConv();
       loadConvs();
-      startPending();
     } catch (e) { err.textContent = e.message; btn.disabled = false; }
   };
   setTimeout(() => $('#new-text')?.focus(), 0);
@@ -405,7 +424,10 @@ function setConv(payload) {
   for (const t of payload.turns) {
     t.responses = t.responses.map((r) => {
       // Keep live streamed text for responses this tab is currently streaming.
-      if (S.running.has(r.id) && old.has(r.id)) { const o = old.get(r.id); Object.assign(r, { content: o.content, reasoning: o.reasoning, status: o.status }); }
+      // Keep streamed text for answers still generating: the DB copy lags by up to 1.5s.
+      if (S.live.has(r.id) && old.has(r.id) && r.status !== 'completed' && r.status !== 'failed' && r.status !== 'stopped' && r.status !== 'rate_limited') {
+        const o = old.get(r.id); Object.assign(r, { content: o.content, reasoning: o.reasoning, status: o.status, retrying: o.retrying, switching: o.switching });
+      }
       S.resp.set(r.id, r); return r;
     });
   }
@@ -429,14 +451,17 @@ const refreshConv = debounce(async () => {
 
 function renderConv() {
   renderSidebar(); renderSkills();
+  openStream(S.conv.conversation.id);
   $('#main').innerHTML = `${mobileTop(S.conv.conversation.title)}
     <header class="conv-head" id="conv-head"></header>
+    <div class="conn" id="conn">Reconnecting… answers keep generating on the server.</div>
     <div class="thread" id="thread"></div>
     <div class="composer"><div class="composer-inner">
       <div id="pin-note"></div>
       <div id="reply-note"></div>
       <div class="composer-row">
         <textarea class="textarea" id="msg" rows="1" placeholder="Ask anything… (Enter to send, Shift+Enter for a new line)"></textarea>
+        <button class="btn" id="stop-all" hidden title="Stop every answer that is generating (Esc)">■ Stop</button>
         <button class="btn primary" id="send-btn">Send</button></div>
       <div class="composer-meta"><div class="send-to" id="send-to"></div><span id="estimate"></span></div>
     </div></div>`;
@@ -450,6 +475,12 @@ function renderConv() {
   };
   msg.onkeydown = (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendMessage(); } };
   $('#send-btn').onclick = sendMessage;
+  $('#stop-all').onclick = stopAll;
+  msg.addEventListener('keydown', (e) => {
+    // Up arrow in an empty box edits your last message, like most chat apps.
+    if (e.key === 'ArrowUp' && !msg.value) { const t = S.conv.turns.at(-1); if (t) { e.preventDefault(); startEditTurn(t.id); } }
+  });
+  updateStopAll();
   $('#send-to').onclick = (e) => {
     const b = e.target.closest('[data-to]'); if (!b) return;
     const v = b.dataset.to;
@@ -484,6 +515,8 @@ function renderHead() {
         <button class="btn small ghost" data-lane="remove" data-model="${esc(m.model_id)}" title="Remove from conversation">✕</button></span>`).join('')}
       <button class="btn small" id="add-model" ${active >= S.conv.max_models ? `disabled title="Max ${S.conv.max_models} active models"` : ''}>+ Add model</button></div>
     ${S.conv.skill_ids?.length ? `<div class="skills-on small">Skills on: ${S.conv.skill_ids.map((id) => S.skills.find((k) => k.id === id)).filter(Boolean).map((k) => `<span class="tag">${esc(k.name)}</span>`).join('')}</div>` : ''}
+    ${S.conv.memory ? `<details class="memory small"><summary>🧠 Memory: older turns are summarized for every model</summary><div class="md">${md(S.conv.memory.summary)}</div>
+      <div class="muted">Built only from your messages and the answers you shared, so each model keeps its own view. It updates as the chat grows.</div></details>` : ''}
     <div class="stats"><span>Conversation cost <b>${fmtCost(stats.cost)}</b></span><span>Model calls <b>${stats.calls}</b></span>
       <span>Messages <b>${stats.messages}</b></span><span>Tokens <b>${fmtTokens(stats.tokens)}</b></span></div>
     ${canonical.length ? `<details class="context-panel" ${S.ctxOpen ? 'open' : ''} ontoggle="window.__ctxOpen=this.open"><summary>Shared context: ${canonical.length} selected decision${canonical.length > 1 ? 's' : ''} sent to every model</summary>
@@ -555,6 +588,7 @@ function renderThread() {
   const turns = S.conv.turns;
   if (!turns.length) { th.innerHTML = `<div class="empty-thread"><h2>Ask your first question</h2><p>Every active model answers separately. Use the best answer as shared context, and the other models will build on it.</p></div>`; return; }
   th.innerHTML = turns.map(turnHTML).join('');
+  enhanceCode(th);
 }
 
 function turnHTML(t) {
@@ -562,7 +596,7 @@ function turnHTML(t) {
   const active = S.tabs[t.id] && rs.some((r) => r.id === S.tabs[t.id]) ? S.tabs[t.id] : rs[0]?.id;
   return `<section class="turn" id="turn-${t.id}">
     ${t.reply_to_response ? replyQuoteHTML(t) : ''}
-    <div class="user-msg">${esc(t.user_message)}</div>
+    <div class="user-msg">${esc(t.user_message)}${S.conv.turns.at(-1)?.id === t.id ? `<button class="btn small ghost edit-btn" data-act="edit-turn" data-turn="${t.id}" title="Edit and resend (↑ in an empty box)">✎ Edit</button>` : ''}</div>
     ${t.mode === 'single' ? `<div class="turn-meta">Asked only ${esc(shortName(t.target_models[0]))}</div>`
       : t.mode === 'subset' ? `<div class="turn-meta">Asked ${t.target_models.map((m) => esc(shortName(m))).join(' and ')}</div>` : ''}
     <div class="lane-tabs">${rs.map((r) => `<button class="${r.id === active ? 'on' : ''}" style="--lane:${laneColor(r.model_id)}" data-act="tab" data-turn="${t.id}" data-id="${r.id}">
@@ -592,7 +626,7 @@ function cardHTML(r, tabActive) {
   if (r.provider) meta.push(`via ${esc(r.provider)}`);
   if (r.attempts > 1) meta.push(`attempt ${r.attempts}`);
   const body = has ? md(r.content) : live ? (r.switching ? `<div class="retrying"><b>${esc(shortName(r.model_id))} is still rate limited.</b><span class="muted">Finding the best other model that is answering right now…</span></div>` : r.retrying ? retryingHTML(r) : `<span class="muted">${r.reasoning ? 'Thinking…' : 'Waiting for the first token…'}</span>`)
-    : r.status === 'pending' ? '<span class="muted">Not started yet.</span>' : '';
+    : r.status === 'pending' ? (Date.now() - r.created_at < 15000 ? '<span class="muted">Starting…</span>' : '<span class="muted">Not started.</span>') : '';
   return `<article class="card ${r.final ? 'is-final' : ''} ${tabActive ? 'tab-active' : ''}" id="card-${r.id}" data-id="${r.id}" style="--lane:${laneColor(r.model_id)}">
     <div class="card-head"><span class="dot" style="background:${laneColor(r.model_id)}"></span>
       <span class="name" title="${esc(r.model_id)}">${esc(shortName(r.model_id))}</span>
@@ -606,7 +640,9 @@ function cardHTML(r, tabActive) {
     ${meta.length ? `<div class="card-meta">${meta.join('<span>·</span>')}</div>` : ''}
     <div class="card-actions">
       ${live ? `<button class="btn small" data-act="stop" data-id="${r.id}">■ Stop</button>` : ''}
-      ${!live && r.status !== 'completed' ? `<button class="btn small" data-act="run" data-id="${r.id}">${r.status === 'pending' ? 'Run' : '↻ Retry'}</button>` : ''}
+      ${!live && r.status !== 'completed' && !(r.status === 'pending' && Date.now() - r.created_at < 15000) ? `<button class="btn small" data-act="run" data-id="${r.id}">${r.status === 'pending' ? 'Run' : '↻ Retry'}</button>` : ''}
+      ${!live && has && r.status === 'completed' ? `<button class="btn small ghost" data-act="regen" data-id="${r.id}" title="Ask this model again. The current answer is kept as a version.">↻ Regenerate</button>` : ''}
+      ${!live && r.version_count ? `<button class="btn small ghost" data-act="versions" data-id="${r.id}" title="Earlier answers from this model">Versions (${r.version_count + 1})</button>` : ''}
       ${has && !live ? `
         <button class="btn small" data-act="use" data-id="${r.id}" title="Send this answer (or the part you highlighted) to every model on future turns">Use as context</button>
         <button class="btn small" data-act="continue" data-id="${r.id}" title="Your next message builds on this answer, for all models">Continue with this</button>
@@ -668,10 +704,24 @@ async function swapModel(id, modelId) {
   const payload = await api('POST', `/api/responses/${id}/replace`, { model_id: modelId });
   setConv(payload); renderHead(); renderThread(); renderComposerMeta();
   toast(`${shortName(S.resp.get(id).model_id)} paused. ${shortName(modelId)} is answering this turn and future ones.`);
-  runResponse(payload.new_response_id);
 }
 // Tick countdowns on cards that are waiting to retry.
 setInterval(() => { for (const [id, r] of S.resp) if (r.retrying && r.status === 'generating') renderCard(id); }, 1000);
+
+// Syntax highlighting + copy buttons for code blocks (skipped while a card is still streaming).
+function enhanceCode(root) {
+  if (!root) return;
+  root.querySelectorAll('.card-body pre > code').forEach((code) => {
+    const pre = code.parentElement;
+    if (pre.parentElement.classList.contains('code-wrap')) return;
+    if (window.hljs && !code.classList.contains('hljs')) { try { hljs.highlightElement(code); } catch {} }
+    const lang = [...code.classList].find((c) => c.startsWith('language-'))?.slice(9) || '';
+    const wrap = document.createElement('div'); wrap.className = 'code-wrap';
+    pre.replaceWith(wrap);
+    wrap.innerHTML = `<div class="code-bar"><span>${esc(lang)}</span><button class="btn small ghost" data-act="copy-code">Copy</button></div>`;
+    wrap.appendChild(pre);
+  });
+}
 
 const pendingCardRender = new Set();
 let renderTimer = null;
@@ -688,6 +738,7 @@ function renderCard(id) {
       if (!r || !el) continue;
       const openThinking = el.querySelector('.thinking')?.open;
       el.outerHTML = cardHTML(r, el.classList.contains('tab-active'));
+      if (r.status !== 'generating') enhanceCode(document.getElementById(`card-${rid}`));
       const th2 = document.querySelector(`#card-${rid} .thinking`); if (th2 && openThinking !== undefined && r.content.trim()) th2.open = openThinking;
       const turn = S.conv.turns.find((t) => t.id === r.turn_id);
       const tabs = turn && document.querySelector(`#turn-${turn.id} .lane-tabs`);
@@ -709,69 +760,135 @@ async function sendMessage() {
     try { sessionStorage.removeItem(`draft:${S.conv.conversation.id}`); } catch {}
     setConv(payload); renderHead(); renderThread(); renderComposerMeta(); loadConvs();
     const th = $('#thread'); th.scrollTop = th.scrollHeight;
-    startPending();
   } catch (e) { fail(e); } finally { btn.disabled = false; msg.focus(); }
 }
 
-function startPending() {
-  const last = S.conv?.turns.at(-1); if (!last) return;
-  for (const r of last.responses) if (r.status === 'pending') runResponse(r.id);
-}
-
-// Each model streams on its own request, so one slow or failed model never blocks the others.
-async function runResponse(id) {
-  if (S.running.has(id)) return;
-  S.running.set(id, true);
-  const r = S.resp.get(id);
-  Object.assign(r, { status: 'generating', content: '', reasoning: '', error: null, error_kind: null, retrying: null });
-  S.alts.delete(id);
-  renderCard(id);
-  try {
-    var switched = null;
-    const res = await fetch(`/api/responses/${id}/run`, { method: 'POST' });
-    if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `HTTP ${res.status}`); }
-    const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = '';
-    for (;;) {
-      const { value, done } = await reader.read(); if (done) break;
-      buf += dec.decode(value, { stream: true });
-      let nl;
-      while ((nl = buf.indexOf('\n')) >= 0) {
-        const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
-        if (!line.trim()) continue;
-        const ev = JSON.parse(line);
-        const cur = S.resp.get(id); if (!cur) continue;
-        if (ev.type === 'delta') cur.content += ev.content;
-        else if (ev.type === 'reasoning') cur.reasoning += ev.content;
-        else if (ev.type === 'start' || ev.type === 'final') { Object.assign(cur, ev.response); cur.retrying = null; }
-        else if (ev.type === 'retrying') cur.retrying = { attempt: ev.attempt, of: ev.of, until: Date.now() + ev.wait_ms, total: ev.wait_ms };
-        else if (ev.type === 'switching') { cur.retrying = null; cur.switching = true; }
-        else if (ev.type === 'switched') switched = ev;
-        else if (ev.type === 'switch_failed') { cur.switching = false; toast(`${shortName(cur.model_id)} is rate limited. ${ev.message}`); }
-        renderCard(id);
-      }
+// ---------- live stream ----------
+// Models run on the server. The browser just watches one stream per open chat, so a reload,
+// a tab switch or a dropped connection never stops an answer; on reconnect the server sends
+// a snapshot of everything mid-generation and the stream carries on.
+let stream = null; // { convId, ctl }
+function openStream(convId) {
+  if (stream?.convId === convId) return;
+  closeStream();
+  const ctl = new AbortController();
+  stream = { convId, ctl, retry: 0 };
+  (async function loop() {
+    while (stream?.ctl === ctl) {
+      try {
+        const res = await fetch(`/api/conversations/${convId}/stream`, { signal: ctl.signal });
+        if (res.status === 401) { await api('GET', '/api/me').catch(() => {}); return; }
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        stream.retry = 0; setConn(true);
+        const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = '';
+        for (;;) {
+          const { value, done } = await reader.read(); if (done) break;
+          buf += dec.decode(value, { stream: true });
+          let nl;
+          while ((nl = buf.indexOf('\n')) >= 0) {
+            const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
+            if (line.trim()) onStreamEvent(JSON.parse(line));
+          }
+        }
+      } catch (e) { if (ctl.signal.aborted) return; }
+      if (stream?.ctl !== ctl) return;
+      setConn(false);
+      await new Promise((ok) => setTimeout(ok, Math.min(5000, 500 * 2 ** stream.retry++)));
+      refreshConvFull(); // catch up on anything that finished while disconnected
     }
-  } catch (e) {
-    const cur = S.resp.get(id);
-    if (cur) Object.assign(cur, { status: 'failed', error: e.message, error_kind: 'network' });
-    renderCard(id);
-  } finally {
-    S.running.delete(id);
-    const cur = S.resp.get(id); if (cur) cur.switching = false;
-    if (typeof switched !== 'undefined' && switched) await applySwitch(switched);
-    else refreshConv();
+  })();
+}
+function closeStream() { stream?.ctl.abort(); stream = null; }
+function setConn(ok) { document.getElementById('conn')?.classList.toggle('show', !ok); }
+
+const refreshConvFull = debounce(async () => {
+  if (!S.conv) return;
+  try { setConv(await api('GET', `/api/conversations/${S.conv.conversation.id}`)); renderHead(); renderThread(); renderComposerMeta(); } catch {}
+}, 200);
+
+function onStreamEvent(ev) {
+  if (ev.type === 'ping' || ev.type === 'ready') return;
+  if (ev.type === 'title') {
+    if (S.conv) { S.conv.conversation.title = ev.title; const t = $('#title'); if (t && document.activeElement !== t) t.value = ev.title; }
+    loadConvs(); return;
   }
+  if (ev.type === 'summary') { refreshConv(); return; }
+  const cur = S.resp.get(ev.rid);
+  if (!cur) { refreshConvFull(); return; } // a response this tab hasn't seen yet (stand-in, other tab)
+  switch (ev.type) {
+    case 'start': Object.assign(cur, ev.response, { retrying: null, switching: false }); S.live.add(cur.id); S.alts.delete(cur.id); break;
+    case 'snapshot': Object.assign(cur, { status: 'generating', content: ev.content, reasoning: ev.reasoning, switching: ev.switching,
+      retrying: ev.retrying ? { attempt: ev.retrying.attempt, of: ev.retrying.of, until: ev.retrying.at + ev.retrying.wait_ms, total: ev.retrying.wait_ms } : null }); S.live.add(cur.id); break;
+    case 'delta': cur.content += ev.content; cur.retrying = null; break;
+    case 'reasoning': cur.reasoning += ev.content; cur.retrying = null; break;
+    case 'retrying': cur.retrying = { attempt: ev.attempt, of: ev.of, until: Date.now() + ev.wait_ms, total: ev.wait_ms }; break;
+    case 'switching': cur.retrying = null; cur.switching = true; break;
+    case 'switch_failed': cur.switching = false; toast(`${shortName(cur.model_id)} is rate limited. ${ev.message}`); break;
+    case 'switched':
+      toast(`${shortName(ev.from)} was rate limited, so ${shortName(ev.to)} is answering instead. ${shortName(ev.from)} is paused.`, 6000);
+      if (Array.isArray(S.target)) S.target = S.target.map((m) => (m === ev.from ? ev.to : m));
+      if (S.reply?.model_id === ev.from) S.reply = null;
+      refreshConvFull();
+      break;
+    case 'final': Object.assign(cur, ev.response, { retrying: null, switching: false }); S.live.delete(cur.id); refreshConv(); break;
+  }
+  renderCard(cur.id);
+  updateStopAll();
 }
 
-// The server swapped a rate-limited lane to a stand-in model: tell the user, show it, run it.
-async function applySwitch(ev) {
-  toast(`${shortName(ev.from)} was rate limited, so ${shortName(ev.to)} is answering instead. ${shortName(ev.from)} is paused.`, 6000);
-  if (Array.isArray(S.target)) S.target = S.target.map((m) => (m === ev.from ? ev.to : m));
-  if (S.reply?.model_id === ev.from) S.reply = null;
+// Asks the server to (re)run one answer; output arrives on the stream.
+async function runResponse(id, { regenerate = false } = {}) {
+  const r = S.resp.get(id);
   try {
-    setConv(await api('GET', `/api/conversations/${S.conv.conversation.id}`));
-    renderHead(); renderThread(); renderComposerMeta();
-  } catch {}
-  runResponse(ev.new_response_id);
+    await api('POST', `/api/responses/${id}/run`, regenerate ? { regenerate: true } : {});
+    if (r) { Object.assign(r, { status: 'generating', content: '', reasoning: '', error: null, error_kind: null, retrying: null }); S.live.add(id); S.alts.delete(id); renderCard(id); updateStopAll(); }
+  } catch (e) { fail(e); }
+}
+
+function updateStopAll() {
+  const b = $('#stop-all'); if (!b) return;
+  const n = [...S.resp.values()].filter((r) => r.status === 'generating' || r.status === 'pending' && S.live.has(r.id)).length;
+  b.hidden = !n; b.textContent = `■ Stop ${n > 1 ? `all ${n}` : ''}`.trim();
+}
+
+async function stopAll() {
+  if (!S.conv) return;
+  try { const { stopped } = await api('POST', `/api/conversations/${S.conv.conversation.id}/stop`); if (stopped) toast(`Stopped ${stopped} answer${stopped > 1 ? 's' : ''}`); } catch (e) { fail(e); }
+}
+
+// ---------- edit your last message ----------
+function startEditTurn(turnId) {
+  const t = S.conv.turns.find((x) => x.id === turnId);
+  if (!t || S.conv.turns.at(-1).id !== turnId) return;
+  const box = document.querySelector(`#turn-${turnId} .user-msg`); if (!box) return;
+  box.outerHTML = `<div class="user-edit" id="edit-${turnId}"><textarea class="textarea" rows="3">${esc(t.user_message)}</textarea>
+    <div class="edit-actions"><span class="muted small">Every model answers again. The current answers are kept as earlier versions.</span>
+    <button class="btn small" data-act="edit-cancel">Cancel</button><button class="btn small primary" data-act="edit-save" data-turn="${turnId}">Save and resend</button></div></div>`;
+  const ta = document.querySelector(`#edit-${turnId} textarea`);
+  ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length);
+  ta.onkeydown = (e) => {
+    if (e.key === 'Escape') { e.stopPropagation(); renderThread(); }
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); document.querySelector(`#edit-${turnId} [data-act="edit-save"]`).click(); }
+  };
+}
+
+async function openVersions(id) {
+  const r = S.resp.get(id);
+  const { versions } = await api('GET', `/api/responses/${id}/versions`);
+  const { el, close } = modal({
+    title: `Earlier answers from ${shortName(r.model_id)}`, wide: true,
+    body: versions.length ? versions.map((v, i) => `<div class="out-item"><div style="display:flex;gap:8px;align-items:center"><b style="flex:1">Version ${i + 1}</b>
+        <span class="muted small">${v.finished_at ? new Date(v.finished_at).toLocaleString() : ''}</span>
+        <button class="btn small primary" data-restore="${i}">Use this version</button></div>
+        <details><summary class="small">Show</summary><div class="card-body md">${md(v.content)}</div></details></div>`).reverse().join('')
+      : '<p class="muted">No earlier versions.</p>',
+    foot: '<span class="muted small" style="margin-right:auto">The version you pick becomes the answer every model sees in later turns. The current one is kept here.</span><button class="btn" data-close>Close</button>',
+  });
+  el.addEventListener('click', async (e) => {
+    const b = e.target.closest('[data-restore]'); if (!b) return;
+    try { const row = await api('POST', `/api/responses/${id}/restore`, { index: Number(b.dataset.restore) }); Object.assign(S.resp.get(id), row); renderCard(id); close(); toast('Restored'); }
+    catch (err) { fail(err); }
+  });
 }
 
 async function onThreadClick(e) {
@@ -789,6 +906,23 @@ async function onThreadClick(e) {
       case 'expand': S.expanded.add(id); renderCard(id); break;
       case 'stop': await api('POST', `/api/responses/${id}/stop`); break;
       case 'run': runResponse(id); break;
+      case 'regen': runResponse(id, { regenerate: true }); break;
+      case 'versions': await openVersions(id); break;
+      case 'edit-turn': startEditTurn(b.dataset.turn); break;
+      case 'edit-cancel': renderThread(); break;
+      case 'edit-save': {
+        const ta = document.querySelector(`#edit-${b.dataset.turn} textarea`);
+        if (!ta.value.trim()) return;
+        b.disabled = true;
+        setConv(await api('POST', `/api/turns/${b.dataset.turn}/edit`, { message: ta.value }));
+        renderThread(); renderHead();
+        break;
+      }
+      case 'copy-code': {
+        const code = b.closest('.code-wrap')?.querySelector('code')?.innerText || '';
+        await navigator.clipboard.writeText(code); b.textContent = 'Copied'; setTimeout(() => { b.textContent = 'Copy'; }, 1200);
+        break;
+      }
       case 'use': {
         const part = S.lastSel?.id === id && S.lastSel.text.trim().length > 20 ? S.lastSel.text.trim() : '';
         setConv(await api('POST', `/api/responses/${id}/use`, { selected_text: part }));
@@ -954,6 +1088,15 @@ function openSettings() {
     try { await api('DELETE', '/api/me'); close(); S.me = null; S.conv = null; renderAuth('signup'); } catch (e) { fail(e); }
   };
 }
+
+// ---------- keyboard shortcuts ----------
+document.addEventListener('keydown', (e) => {
+  if (!S.me) return;
+  const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName);
+  if (e.key === 'Escape' && $('#modal-root').innerHTML === '' && S.conv && [...S.resp.values()].some((r) => r.status === 'generating')) { e.preventDefault(); stopAll(); }
+  else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); location.hash = '#/new'; }
+  else if (e.key === '/' && !typing) { e.preventDefault(); $('#conv-search')?.focus(); }
+});
 
 // ---------- boot ----------
 (async () => {
