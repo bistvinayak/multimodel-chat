@@ -534,3 +534,11 @@ table.heat td.hcell.dark { color: #ffffff; }
 .ag-type { display: grid; gap: 4px; text-align: left; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px; color: var(--text); }
 .ag-type:hover { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent); }
 .ag-type-icon { font-size: 22px; }
+
+.src-list { display: grid; gap: 6px; margin-top: 6px; }
+.src-item { display: flex; gap: 8px; align-items: flex-start; cursor: pointer; }
+.src-item input { margin-top: 3px; }
+.src-companies { margin-top: 2px; } .src-companies summary { cursor: pointer; color: var(--accent); }
+
+.comp-chips { display: flex; flex-wrap: wrap; gap: 4px; margin: 6px 0; } .comp-chips .sel-chip { font-size: 12px; padding: 1px 2px 1px 8px; }
+.src-companies .key-row { margin-top: 4px; } .src-companies .input { padding: 4px 8px; font-size: 13px; }

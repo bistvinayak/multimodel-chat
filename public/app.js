@@ -1779,7 +1779,7 @@ function openWatchModal({ url = '', target = null, conversationId = null, interv
     try {
       const w = await api('POST', '/api/watches', { url: $('#w-url', el).value.trim(), condition: cond, target_price: Number($('#w-target', el)?.value), drop_pct: Number($('#w-pct', el)?.value), interval_minutes: Number($('#w-int', el).value), conversation_id: conversationId });
       close();
-      toast(w.already_met ? 'Watching. It is already at or below your target, so you will be alerted on the next new low.' : `Watching ${w.title || 'the link'}. You will be alerted when the price drops.`, 5000);
+      toast(w.already_met ? `It's already at or below your target, so you've been alerted now. You'll be alerted again if it drops further.` : `Watching ${w.title || 'the link'}. You will be alerted when the price drops.`, 6000);
       ensureNotifyPermission();
       S.agentTab = 'prices'; if (location.hash.startsWith('#/agents')) loadAgents(); else location.hash = '#/agents';
     } catch (e) { out.insertAdjacentHTML('beforeend', `<div class="err-box">${esc(e.message)}</div>`); b.disabled = false; b.textContent = 'Start watching'; }
@@ -1829,6 +1829,7 @@ function watchCardHTML(w) {
       <div class="muted small">${esc(host)} · alert on ${cond}</div></div>
       <span class="badge ${w.status === 'active' ? 'completed' : w.status === 'error' ? 'failed' : ''}">${w.status === 'active' ? 'Watching' : w.status === 'paused' ? 'Paused' : 'Stopped'}</span></div>
     <div class="w-mid"><div><div class="w-price">${money(w.last_price, w.currency)}</div>
+      ${w.condition === 'below' && w.last_price != null && w.last_price <= w.target_price ? `<div class="small good">✓ At or below your target of ${money(w.target_price, w.currency)}</div>` : ''}
       <div class="small">${change == null || Math.abs(change) < 0.0005 ? '<span class="muted">No change since you started</span>' : change < 0 ? `<span class="good">▼ ${pct(-change)} since you started</span>` : `<span class="bad">▲ ${pct(change)} since you started</span>`}</div>
       <div class="muted small">Lowest ${money(w.lowest_price, w.currency)}${w.in_stock === 0 ? ' · ⚠ out of stock' : ''}</div></div>
       <div class="spark" id="spark-${w.id}"></div></div>
@@ -2071,9 +2072,16 @@ function planCardHTML(p) {
   let fields = '';
   if (p.type === 'price') fields = field('url', 'Product link', p.url) + `<div class="pf-row">${field('target_price', 'Alert at or below', p.target_price, 'e.g. 180')}</div>`;
   if (p.type === 'jobs' || p.type === 'news') fields = field('query', p.type === 'jobs' ? 'Roles (comma-separated, include synonyms)' : 'Topics (comma-separated)', p.query, p.type === 'jobs' ? 'AI Product Manager, AI PM, Associate Product Manager' : 'OpenAI launch, Anthropic Claude, GPT-6')
-    + (p.type === 'jobs' ? `<div class="pf-row">${field('location', 'Location (optional)', p.location, 'London, Remote')}${field('exclude', 'Leave out titles with', p.exclude, 'Senior, Director')}</div>` : '')
+    + (p.type === 'jobs' ? `<div class="pf-row">${field('location', 'Location (optional)', p.location, 'USA, London, Remote')}${field('exclude', 'Leave out titles with', p.exclude, 'Senior, Director')}</div>
+        <div class="muted small" style="margin-top:-6px">Countries match their cities and states ("USA" finds "San Francisco, CA"). "Remote" finds remote roles.</div>` : '')
     + field('criteria', 'What counts (the AI screener uses this)', p.criteria, 'e.g. entry-level PM roles focused on AI products')
-    + `<div class="small"><b>Sources</b><div class="eval-crit">${catalog.sources.filter((x) => x.kind === p.type).map((x) => `<label class="chk"><input type="checkbox" data-src="${x.key}" ${p.type === 'news' || x.key !== 'companies' || p.companies?.length ? 'checked' : ''}> ${esc(x.label)}${x.key === 'companies' ? ` (${catalog.company_presets.length} AI & tech companies)` : ''}</label>`).join('')}</div></div>`;
+    + `<div class="small"><b>Where to search</b> <span class="muted">(the agent checks these on every run)</span>
+        <div class="src-list">${catalog.sources.filter((x) => x.kind === p.type).map((x) => `<label class="src-item"><input type="checkbox" data-src="${x.key}" ${p.type === 'news' || x.key !== 'companies' || p.companies?.length ? 'checked' : ''}>
+          <span><b>${esc(x.label)}</b><span class="muted"> · ${esc(x.desc || '')}</span>
+          ${x.key === 'companies' ? `<details class="src-companies" open><summary><span data-comp-count>${(p.companies || []).length}</span> companies (click × to remove)</summary>
+            <div class="comp-chips" data-comps>${(p.companies || []).map(compChip).join('')}</div>
+            <div class="key-row"><input class="input" data-comp-add placeholder="Add a company, e.g. Robinhood"><button class="btn small" type="button" data-comp-btn>Add</button></div>
+            <div class="muted small" data-comp-msg>Works for companies whose jobs are on Greenhouse, Ashby or Lever (most startups and many tech companies).</div></details>` : ''}</span></label>`).join('')}</div></div>`;
   if (p.type === 'page') fields = field('url', 'Page link', p.url) + field('criteria', 'Alert when the page says (leave empty to alert on any change)', p.criteria, 'e.g. applications are open');
   return `<div class="plan-card"><div class="plan-head"><span class="badge">${KIND_LABEL[p.type]}</span> <input class="input plan-name" data-pf="name" value="${esc(p.name || '')}" aria-label="Name" placeholder="Name (optional)"></div>
     ${p.summary ? `<div class="small muted">${esc(p.summary)}</div>` : ''}
@@ -2084,14 +2092,34 @@ function planCardHTML(p) {
     <div class="plan-preview"></div></div>`;
 }
 
+const compName = (c) => c.split(':')[1].replace(/-/g, ' ').replace(/\b\w/g, (k) => k.toUpperCase());
+const compChip = (c) => `<span class="sel-chip" data-comp="${esc(c)}">${esc(compName(c))}<button type="button" data-comp-rm title="Remove">×</button></span>`;
 function wirePlanCard(root, p, done = () => {}) {
+  // Editable company list
+  const comps = root.querySelector('[data-comps]');
+  if (comps) {
+    p.companies = [...(p.companies || [])];
+    const sync = () => { root.querySelector('[data-comp-count]').textContent = p.companies.length; };
+    comps.onclick = (e) => { const x = e.target.closest('[data-comp-rm]'); if (!x) return; e.preventDefault(); const chip = x.closest('[data-comp]'); p.companies = p.companies.filter((c) => c !== chip.dataset.comp); chip.remove(); sync(); };
+    const add = async () => {
+      const input = root.querySelector('[data-comp-add]'); const msg = root.querySelector('[data-comp-msg]'); const name = input.value.trim(); if (!name) return;
+      msg.textContent = `Looking for ${name}'s job board…`;
+      try {
+        const r = await api('POST', '/api/agents/companies/resolve', { name });
+        if (!p.companies.includes(r.board)) { p.companies.push(r.board); comps.insertAdjacentHTML('beforeend', compChip(r.board)); sync(); }
+        msg.textContent = `Added ${r.name} (${r.jobs} open roles on ${r.board.split(':')[0]}).`; input.value = '';
+      } catch (err) { msg.textContent = err.message; }
+    };
+    root.querySelector('[data-comp-btn]').onclick = (e) => { e.preventDefault(); add(); };
+    root.querySelector('[data-comp-add]').onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); add(); } };
+  }
   const read = () => {
     const v = { ...p };
     root.querySelectorAll('[data-pf]').forEach((x) => { v[x.dataset.pf] = x.value.trim(); });
     v.interval_minutes = Number(v.interval_minutes);
     if (p.type === 'jobs' || p.type === 'news') {
       v.sources = [...root.querySelectorAll('[data-src]:checked')].map((x) => x.dataset.src);
-      v.companies = v.sources.includes('companies') ? catalog.company_presets : [];
+      v.companies = v.sources.includes('companies') ? p.companies : [];
     }
     return v;
   };

@@ -157,6 +157,13 @@ await step('Price watch alerts on a price drop', 'Agents', async () => {
   must(r.data.alerted, `no alert (price ${r.data.price})`);
   await fetch(`${SHOP}/set?id=headphones&price=129.99`, { redirect: 'manual' });
 });
+await step('Price already below target alerts right away', 'Agents', async () => {
+  const before = (await u('GET', '/api/notifications')).data.items.length;
+  const w = (await u('POST', '/api/watches', { url: `${SHOP}/product/kettle`, condition: 'below', target_price: 60, interval_minutes: 288 })).data;
+  must(w.already_met, `kettle at ${w.last_price} should already be under 60`);
+  const after = (await u('GET', '/api/notifications')).data;
+  must(after.items.length === before + 1 && after.items[0].title.startsWith('Already below your target'), 'no immediate alert');
+});
 await step('Page agent alerts when a condition becomes true', 'Agents', async () => {
   await fetch(`${SHOP}/set?id=text-only-lamp&price=35.5`, { redirect: 'manual' });
   const m = (await u('POST', '/api/monitors', { kind: 'page', name: 'Lamp', url: `${SHOP}/product/text-only-lamp`, criteria: 'The desk lamp costs less than $30', interval_minutes: 288 })).data;

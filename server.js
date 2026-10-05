@@ -15,7 +15,7 @@ import { streamCompletion, ModelError, probeModel, complete, keyInfo } from './l
 import { initSecrets, encrypt, decrypt } from './lib/secrets.js';
 import { evaluateWithJev, evaluateWithJudge, buildBrief, overall, CRITERIA, DEFAULT_CRITERIA } from './lib/evaluator.js';
 import { safeFetch, checkRobots, extractStructured, extractWithAI, conditionMet, buyLinks } from './lib/watch.js';
-import { SOURCES, COMPANY_PRESETS, collect, prefilter, dedupeKey, scoreRelevance, pageDigest, judgePage, planRequest, terms as monTerms } from './lib/monitor.js';
+import { SOURCES, COMPANY_PRESETS, resolveCompany, collect, prefilter, dedupeKey, scoreRelevance, pageDigest, judgePage, planRequest, terms as monTerms } from './lib/monitor.js';
 import { detect, safeName, LIMITS, MAX_PER_MESSAGE, extractPdfText, describeImage, materialize } from './lib/attachments.js';
 import { titlePrompt, cleanTitle, summaryPlan, summaryPrompt } from './lib/memory.js';
 
@@ -1210,6 +1210,12 @@ route('POST', '/api/watches', async (req, res, { user }) => {
       met ? x.price : null, x.in_stock == null ? null : x.in_stock ? 1 : 0, x.method, cfg.interval_minutes, t, t + cfg.interval_minutes * 60_000, body.conversation_id || null, t);
   db.prepare('INSERT INTO watch_checks (id, watch_id, checked_at, price, currency, in_stock, ok, method, model) VALUES (?,?,?,?,?,?,1,?,?)')
     .run(uid(), id, t, x.price, x.currency || null, x.in_stock == null ? null : x.in_stock ? 1 : 0, x.method, x.model || null);
+  // Already at or below target when created: alert right away (later alerts only on new lows).
+  if (met) {
+    const cur = x.currency || null;
+    notify(user.id, { kind: 'price_drop', title: `Already below your target: ${x.title || new URL(url).hostname}`,
+      body: `${x.title || 'The item'} ${conditionMet({ ...cfg, baseline_price: x.price, last_price: null, last_notified_price: null }, x.price, (p) => fmtMoney(p, cur))}.`, url: x.final_url || url, watch_id: id });
+  }
   send(res, 201, { ...watchPayload(db.prepare('SELECT * FROM watches WHERE id=?').get(id)), already_met: !!met });
 });
 
@@ -1272,7 +1278,7 @@ function normalizeMonitor(body, base = {}) {
   const src = Array.isArray(body.sources) ? body.sources : base.sources ? JSON.parse(base.sources) : defaults;
   out.sources = JSON.stringify(src.filter((x) => SOURCES[x]?.kind === kind));
   const comp = Array.isArray(body.companies) ? body.companies : base.companies ? JSON.parse(base.companies) : (kind === 'jobs' ? COMPANY_PRESETS : []);
-  out.companies = JSON.stringify(comp.map(String).filter((c) => /^(greenhouse|ashby|lever):[a-z0-9-]+$/i.test(c)).slice(0, 30));
+  out.companies = JSON.stringify([...new Set(comp.map(String).filter((c) => /^(greenhouse|ashby|lever):[a-z0-9-]+$/i.test(c)))].slice(0, 50));
   out.interval_minutes = nearestInterval(Number(body.interval_minutes ?? base.interval_minutes ?? (kind === 'news' ? 360 : 720)));
   if (!out.name) out.name = kind === 'page' ? `Watch ${(() => { try { return new URL(out.url).hostname; } catch { return 'page'; } })()}` : monTerms(out.query)[0];
   return out;
@@ -1357,6 +1363,14 @@ const ownMonitor = (user, id) => { const m = db.prepare('SELECT * FROM monitors 
 const monitorPayload = (m) => ({ ...m, sources: JSON.parse(m.sources), companies: JSON.parse(m.companies), state: undefined,
   counts: db.prepare('SELECT COUNT(*) total, SUM(relevant) relevant, SUM(feedback=1) liked, SUM(feedback=-1) disliked FROM monitor_items WHERE monitor_id=?').get(m.id),
   items: db.prepare('SELECT * FROM monitor_items WHERE monitor_id=? AND relevant=1 AND dismissed=0 ORDER BY found_at DESC, score DESC LIMIT 25').all(m.id) });
+
+route('POST', '/api/agents/companies/resolve', async (req, res) => {
+  const name = String((await readJson(req)).name || '').trim().slice(0, 60);
+  if (name.length < 2) throw new HttpError(400, 'Type a company name');
+  const found = await resolveCompany(name);
+  if (!found) throw new HttpError(404, `Couldn't find a public job board for "${name}". Many large companies (Google, Meta, Microsoft) use their own career sites, which aren't supported.`);
+  send(res, 200, found);
+});
 
 route('GET', '/api/agents/catalog', async (req, res) => {
   send(res, 200, { sources: Object.entries(SOURCES).map(([key, v]) => ({ key, ...v })), company_presets: COMPANY_PRESETS, intervals: MON_INTERVALS });
