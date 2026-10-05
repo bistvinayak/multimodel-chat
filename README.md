@@ -48,6 +48,15 @@ Personal keys are encrypted with a master key from `APP_SECRET` (64 hex characte
 | Preference signal | Use, continue, save and final actions log a preference event with the competing responses and display position, ready for selection-rate analytics. |
 | Mobile | Answers become tabs per turn instead of squeezed columns. |
 
+## Testing price watches locally
+
+```bash
+npm run demo-shop                  # a tiny store at http://127.0.0.1:4330/admin
+WATCH_ALLOW_PRIVATE=1 npm start    # let the app read 127.0.0.1 while testing
+```
+
+Watch `http://127.0.0.1:4330/product/headphones`. Lower its price on the admin page, then press **Check now**. `/product/text-only-lamp` has no product data, so the AI fallback has to read the price. `/private/...` is blocked by robots.txt. Restart with a plain `npm start` afterwards, because `WATCH_ALLOW_PRIVATE` turns off the private-address protection.
+
 ## Langfuse tracing
 
 Add your keys to `.env` and restart. Every chat is then traced:

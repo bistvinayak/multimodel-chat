@@ -11,6 +11,7 @@
     "start": "node --disable-warning=ExperimentalWarning server.js",
     "dev": "node --watch --disable-warning=ExperimentalWarning server.js",
     "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js",
-    "langfuse:backfill": "node --disable-warning=ExperimentalWarning scripts/langfuse-backfill.js"
+    "langfuse:backfill": "node --disable-warning=ExperimentalWarning scripts/langfuse-backfill.js",
+    "demo-shop": "node scripts/demo-shop.js"
   }
 }

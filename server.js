@@ -1086,7 +1086,12 @@ const watchFetchOpts = () => ({ allowPrivate: process.env.WATCH_ALLOW_PRIVATE ==
 const lastHit = new Map(); // hostname -> last fetch time (politeness)
 const checking = new Set();
 
+// Fetch-layer failures (timeouts, blocked addresses, DNS) are user-facing messages, not server errors.
 async function inspectUrl(user, url) {
+  try { return await inspectUrlInner(user, url); }
+  catch (e) { throw e instanceof HttpError ? e : new HttpError(400, e.message); }
+}
+async function inspectUrlInner(user, url) {
   const opts = watchFetchOpts();
   if (!(await checkRobots(url, opts))) throw new HttpError(400, "This site's robots.txt does not allow automated checks of that page, so it can't be watched.");
   lastHit.set(new URL(url).hostname, now());
@@ -1114,8 +1119,9 @@ const fmtMoney = (p, c) => (p == null ? '?' : `${c ? `${c} ` : ''}${Number(p).to
 
 async function checkWatch(w) {
   if (checking.has(w.id)) return;
-  checking.add(w.id);
   const user = userById(w.user_id);
+  if (!user) { db.prepare(`UPDATE watches SET status='paused' WHERE id=?`).run(w.id); return { ok: false, error: 'Owner no longer exists' }; }
+  checking.add(w.id);
   const t = now();
   try {
     const x = await inspectUrl(user, w.url);

@@ -205,3 +205,10 @@ test('price watch: parsing, structured extraction, robots and alert conditions',
   assert.equal(conditionMet({ condition: 'drop_pct', drop_pct: 10, baseline_price: 100 }, 95), null);
   assert.match(conditionMet({ condition: 'any_drop', last_price: 20 }, 19), /from 20 to 19/);
 });
+
+import { assertPublicUrl } from '../lib/watch.js';
+test('fake-IP range is allowed only through DNS, never as a literal address', async () => {
+  await assert.rejects(assertPublicUrl('http://198.18.2.14/'), /Private or local/);
+  await assert.rejects(assertPublicUrl('http://127.0.0.1/'), /Private or local/);
+  await assert.rejects(assertPublicUrl('http://169.254.169.254/latest'), /Private or local/);
+});
