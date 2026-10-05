@@ -171,3 +171,14 @@ test('attachments: vision models get image parts, others get the description; te
   assert.equal(seeing.needsFileParser, true);
   assert.ok(!JSON.stringify(seeing.messages).includes('base64'));                    // snapshots never hold file bytes
 });
+
+import { overall, CRITERIA, DEFAULT_CRITERIA, buildBrief } from '../lib/evaluator.js';
+
+test('evaluation: overall score, default rubric, blind brief', () => {
+  assert.equal(overall({ a: { value: 4 }, b: { value: 2 } }), 75);
+  assert.equal(overall({ a: { value: null } }), null);
+  assert.deepEqual(DEFAULT_CRITERIA, ['relevance', 'completeness', 'instruction_following', 'clarity', 'actionability']); // PRD §17
+  assert.ok(CRITERIA.groundedness.noul);
+  const brief = buildBrief({ question: 'How do I cut churn?', context: 'Decision: focus on onboarding' });
+  assert.match(brief, /USER REQUEST:[\s\S]*cut churn[\s\S]*onboarding/);
+});

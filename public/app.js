@@ -60,7 +60,11 @@ function md(text) {
 function fmtCost(c) { if (c === null || c === undefined) return '—'; if (c === 0) return 'Free'; return c < 0.01 ? `$${c.toFixed(5)}` : `$${c.toFixed(3)}`; }
 function fmtTokens(n) { return n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}K` : String(n || 0); }
 function perM(p) { return p === 0 ? '0' : (p * 1e6).toFixed(p * 1e6 < 1 ? 2 : 2).replace(/\.00$/, ''); }
-function shortName(id) { const m = S.modelMap.get(id); return (m?.name || id).replace(/^[^:]+:\s*/, ''); }
+function shortName(id) {
+  const m = S.modelMap.get(id);
+  if (m) return m.name.replace(/^[^:]+:\s*/, '');
+  return String(id || '').split('/').pop().replace(/:free$/, ' (free)'); // catalog not loaded yet: never cut at the ":free" colon
+}
 function laneColor(modelId) { const m = S.conv?.models.find((x) => x.model_id === modelId); return `var(--lane-${(m?.position ?? 0) % 6})`; }
 function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
 
@@ -112,7 +116,7 @@ function renderShell() {
       <div class="sidebar-head">
         <div class="brand"><span class="brand-mark"><i style="background:var(--lane-0)"></i><i style="background:var(--lane-1)"></i><i style="background:var(--lane-2)"></i></span>Multi-Model Workspace</div>
         <button class="btn primary" id="new-btn">+ New conversation</button>
-        <button class="btn" id="compare-btn">⚖ Compare models</button>
+        <div class="nav-row"><button class="btn" id="compare-btn">⚖ Compare</button><button class="btn" id="metrics-btn">📊 Metrics</button></div>
       </div>
       <div class="search-wrap"><input class="input" id="conv-search" placeholder="Search chats  (/)" aria-label="Search chats"></div>
       <nav class="conv-list" id="conv-list"></nav>
@@ -125,6 +129,7 @@ function renderShell() {
   </div>`;
   $('#new-btn').onclick = () => { location.hash = '#/new'; closeNav(); };
   $('#compare-btn').onclick = () => { location.hash = '#/compare'; closeNav(); };
+  $('#metrics-btn').onclick = () => { location.hash = '#/metrics'; closeNav(); };
   $('#logout-btn').onclick = async () => { await api('POST', '/api/logout').catch(() => {}); S.me = null; renderAuth('login'); };
   $('#settings-btn').onclick = openSettings;
   $('#conv-search').oninput = searchConvs;
@@ -140,7 +145,7 @@ async function loadModels() {
     S.models = models; S.maxModels = max_models; S.modelMap = new Map(models.map((m) => [m.id, m])); S.modelsError = null;
   } catch (e) { S.modelsError = e.message; }
   document.querySelectorAll('[data-picker]').forEach((el) => el._redraw?.());
-  if (S.conv) { renderHead(); renderThread(); }
+  if (S.conv) { renderHead(); renderThread(); renderComposerMeta(); }
 }
 
 let convSeq = 0;
@@ -280,6 +285,7 @@ function route() {
   const m = location.hash.match(/^#\/c\/([\w-]+)/);
   if (m) openConversation(m[1]);
   else if (location.hash.startsWith('#/compare')) renderCompare();
+  else if (location.hash.startsWith('#/metrics')) renderMetrics();
   else renderNew();
 }
 window.addEventListener('hashchange', () => S.me && route());
@@ -627,6 +633,8 @@ function turnHTML(t) {
     <div class="lane-tabs">${rs.map((r) => `<button class="${r.id === active ? 'on' : ''}" style="--lane:${laneColor(r.model_id)}" data-act="tab" data-turn="${t.id}" data-id="${r.id}">
       <span class="dot" style="background:${laneColor(r.model_id)};width:8px;height:8px;border-radius:50%"></span>${esc(shortName(r.model_id))}${r.status === 'completed' ? ' ✓' : r.status === 'generating' ? ' …' : ['failed', 'rate_limited'].includes(r.status) ? ' ⚠' : ''}</button>`).join('')}</div>
     <div class="lanes" style="--n:${Math.max(1, rs.length)}">${rs.map((r) => cardHTML(r, r.id === active)).join('')}</div>
+    ${rs.filter((r) => r.status === 'completed').length >= 2 ? `<div class="turn-tools"><button class="btn small" data-act="evaluate" data-turn="${t.id}">⚖ Evaluate answers</button>
+      ${S.conv.evaluations?.some((e) => e.turn_id === t.id) ? '<span class="muted small">Evaluated. Run again to rescore.</span>' : ''}</div>` : ''}
   </section>`;
 }
 
@@ -656,6 +664,7 @@ function cardHTML(r, tabActive) {
     <div class="card-head"><span class="dot" style="background:${laneColor(r.model_id)}"></span>
       <span class="name" title="${esc(r.model_id)}">${esc(shortName(r.model_id))}</span>
       ${r.stands_in_for && S.resp.get(r.stands_in_for) ? `<span class="badge standin" title="Answering in place of ${esc(shortName(S.resp.get(r.stands_in_for).model_id))}, which was ${S.resp.get(r.stands_in_for).error_kind === 'rate_limit' ? 'rate limited' : 'unavailable'}">Stand-in for ${esc(shortName(S.resp.get(r.stands_in_for).model_id))}</span>` : ''}
+      ${(() => { const ev = latestEvalFor(r.id); const o = evalOverall(ev, r.id); return o == null ? '' : `<span class="badge eval ${ev.recommended_response === r.id ? 'rec' : ''}" title="${ev.evaluator === 'jev' ? 'Jev' : 'Judge'} score${ev.recommended_response === r.id ? ', recommended' : ''}">⚖ ${Math.round(o)}${ev.recommended_response === r.id ? ' ★' : ''}</span>`; })()}
       ${r.final ? '<span class="badge final">Final</span>' : ''}${r.saved ? '<span class="badge">Saved</span>' : ''}
       <span class="badge ${r.status}">${STATUS_LABEL[r.status] || r.status}</span></div>
     ${r.reasoning ? `<details class="thinking" ${live && !has ? 'open' : ''}><summary>Reasoning (${fmtTokens(Math.ceil(r.reasoning.length / 4))} tokens)</summary><pre>${esc(r.reasoning.slice(-20000))}</pre></details>` : ''}
@@ -944,6 +953,11 @@ async function onThreadClick(e) {
         renderThread(); renderHead();
         break;
       }
+      case 'evaluate': {
+        const turn = S.conv.turns.find((x) => x.id === b.dataset.turn);
+        await openEvaluate(turn.responses.filter((r) => r.status === 'completed').map((r) => r.id));
+        break;
+      }
       case 'copy-code': {
         const code = b.closest('.code-wrap')?.querySelector('code')?.innerText || '';
         await navigator.clipboard.writeText(code); b.textContent = 'Copied'; setTimeout(() => { b.textContent = 'Copy'; }, 1200);
@@ -1065,8 +1079,9 @@ function openFinish() {
           <button class="btn small" data-dl="${r.id}">Download .md</button>
           <button class="btn small ${r.final ? 'on' : ''}" data-fin="${r.id}">${r.final ? 'Final ✓' : 'Use as final'}</button></div></div>`).join('')
       : '<p class="muted">Nothing selected yet. Use <b>Save</b> or <b>Use as final</b> on any answer card, from any model and any turn.</p>',
-    foot: `<span class="muted small" style="margin-right:auto">Combining and AI evaluation of picks are planned for V1.5.</span><button class="btn primary" data-close>Continue conversation</button>`,
+    foot: `${picks.length >= 2 ? '<button class="btn" id="eval-picks" style="margin-right:auto">⚖ Evaluate selected responses</button>' : '<span class="muted small" style="margin-right:auto">Save two or more answers to have them evaluated.</span>'}<button class="btn primary" data-close>Continue conversation</button>`,
   });
+  const ep = $('#eval-picks', el); if (ep) ep.onclick = () => { close(); openEvaluate(picks.map(({ r }) => r.id), { title: 'Evaluate your selected outputs' }); };
   el.addEventListener('click', async (e) => {
     const c = e.target.closest('[data-copy]'), d = e.target.closest('[data-dl]'), f = e.target.closest('[data-fin]');
     try {
@@ -1099,6 +1114,12 @@ function openSettings() {
           ${S.me.openrouter_key?.set ? '<button class="btn danger" id="key-del">Remove</button>' : ''}</div>
         <div class="small muted">Use your own OpenRouter account: your credits, your rate limits, and paid models if you have credits. Get a key at <a href="https://openrouter.ai/keys" target="_blank" rel="noopener">openrouter.ai/keys</a>. It is checked with OpenRouter, encrypted on the server, and never shown again. Only the last 4 characters are kept visible.</div>
         <div class="err-text" id="key-err"></div></div>
+      <div class="key-box"><b>Jev evaluator key (TypeSafe)</b>
+        <div class="small muted">${S.me.jev_key?.set ? `✓ Evaluations use Jev with your key ••••${esc(S.me.jev_key.last4)}.` : S.me.jev_shared_available ? 'Evaluations use Jev with this app\'s shared key.' : 'No Jev key, so evaluations use a free fallback judge on OpenRouter.'}</div>
+        <div class="key-row"><input class="input" id="jev-input" type="password" autocomplete="off" spellcheck="false" placeholder="TypeSafe API key">
+          <button class="btn" id="jev-save">${S.me.jev_key?.set ? 'Replace key' : 'Save key'}</button>${S.me.jev_key?.set ? '<button class="btn danger" id="jev-del">Remove</button>' : ''}</div>
+        <div class="small muted">Jev scores answers on a rubric and picks the best one, with calibrated confidence. The key is checked with a test call, then encrypted on the server.</div>
+        <div class="err-text" id="jev-err"></div></div>
       <div id="lf-status" class="small muted">Checking Langfuse…</div>
       <hr style="border:0;border-top:1px solid var(--border);width:100%">
       <div><b>Delete account</b><p class="muted small">Permanently deletes your account, conversations, responses, and preference history.</p>
@@ -1113,6 +1134,13 @@ function openSettings() {
       : k.source === 'shared' ? `Your chats run on this app's shared key. ${usage}` : '⚠ No key. Add your OpenRouter key to start chatting.';
   }).catch(() => {});
   showKey();
+  $('#jev-save', el).onclick = async () => {
+    const btn = $('#jev-save', el); btn.disabled = true; btn.textContent = 'Checking with Jev…'; $('#jev-err', el).textContent = '';
+    try { S.me = await api('PUT', '/api/me/jev-key', { key: $('#jev-input', el).value }); toast('Jev key saved. Evaluations now use Jev.'); close(); openSettings(); }
+    catch (e) { $('#jev-err', el).textContent = e.message; btn.disabled = false; btn.textContent = 'Save key'; }
+  };
+  const jd = $('#jev-del', el);
+  if (jd) jd.onclick = async () => { try { S.me = await api('DELETE', '/api/me/jev-key'); toast('Jev key removed'); close(); openSettings(); } catch (e) { fail(e); } };
   $('#key-save', el).onclick = async () => {
     const input = $('#key-input', el); const btn = $('#key-save', el);
     $('#key-err', el).textContent = ''; btn.disabled = true; btn.textContent = 'Checking with OpenRouter…';
@@ -1251,6 +1279,78 @@ function turnAttachmentsHTML(t) {
     ${blind.length ? `<div class="turn-meta">${blind.map((id) => esc(shortName(id))).join(', ')} got an AI description of the image${t.attachments.filter((a) => a.kind === 'image').length > 1 ? 's' : ''}</div>` : ''}`;
 }
 
+
+// ---------- evaluation (Jev or fallback judge) ----------
+let evaluatorInfo = null;
+async function getEvaluator() { evaluatorInfo = await api('GET', '/api/evaluator'); return evaluatorInfo; }
+const latestEvalFor = (rid) => [...(S.conv?.evaluations || [])].reverse().find((e) => e.candidates.includes(rid));
+const evalOverall = (e, rid) => e?.results.find((r) => r.response_id === rid)?.scores.overall?.value ?? null;
+
+async function openEvaluate(responseIds, { title = 'Evaluate answers' } = {}) {
+  const info = await getEvaluator();
+  const cands = responseIds.map((id) => S.resp.get(id)).filter((r) => r?.content?.trim());
+  const { el, close } = modal({
+    title, wide: true,
+    body: `<div class="eval-who">${info.evaluator === 'jev'
+        ? `<b>Evaluator: Jev</b> by TypeSafe, a decision model with calibrated scores and confidence${info.key_source === 'personal' ? ' (your key)' : ''}.`
+        : `<b>Evaluator: fallback judge</b>, a free model on OpenRouter scoring the same rubric. Add a Jev key in Settings for calibrated scores with confidence.`}</div>
+      <div><div class="section-title">Answers</div><div class="eval-cands">${cands.map((r) => `<label class="chk"><input type="checkbox" data-cand="${r.id}" checked>
+        <span class="dot" style="background:${laneColor(r.model_id)}"></span>${esc(shortName(r.model_id))}</label>`).join('')}</div>
+        <div class="muted small">The evaluator never sees model names. Answers are labeled A, B, C.</div></div>
+      <div><div class="section-title">Rubric</div><div class="eval-crit">${info.criteria.map((c) => `<label class="chk" title="${esc(c.question)}"><input type="checkbox" data-crit="${c.key}" ${c.default ? 'checked' : ''}> ${esc(c.label)}</label>`).join('')}</div></div>
+      <div id="eval-out"></div>`,
+    foot: `<span class="muted small" style="margin-right:auto">The result is a recommendation. You make the final call.</span><button class="btn" data-close>Close</button><button class="btn primary" id="eval-run">Run evaluation</button>`,
+  });
+  $('#eval-run', el).onclick = async () => {
+    const ids = [...el.querySelectorAll('[data-cand]:checked')].map((x) => x.dataset.cand);
+    const criteria = [...el.querySelectorAll('[data-crit]:checked')].map((x) => x.dataset.crit);
+    if (!ids.length) return toast('Pick at least one answer');
+    if (!criteria.length) return toast('Pick at least one criterion');
+    const btn = $('#eval-run', el); btn.disabled = true; btn.textContent = info.evaluator === 'jev' ? 'Jev is scoring…' : 'Judging…';
+    $('#eval-out', el).innerHTML = '<div class="muted">Scoring every answer against the rubric…</div>';
+    try {
+      const ev = await api('POST', '/api/evaluations', { response_ids: ids, criteria });
+      S.conv.evaluations = [...(S.conv.evaluations || []), ev];
+      $('#eval-out', el).innerHTML = evaluationHTML(ev);
+      ids.forEach((id) => renderCard(id));
+      btn.textContent = 'Run again';
+    } catch (e) { $('#eval-out', el).innerHTML = `<div class="err-box">${esc(e.message)}</div>`; btn.textContent = 'Run evaluation'; }
+    btn.disabled = false;
+  };
+  el.addEventListener('click', async (e) => {
+    const f = e.target.closest('[data-eval-final]'); if (!f) return;
+    try { const row = await api('POST', `/api/responses/${f.dataset.evalFinal}/final`); Object.assign(S.resp.get(row.id), row); renderCard(row.id); toast('Marked as final'); close(); } catch (err) { fail(err); }
+  });
+}
+
+function evaluationHTML(ev) {
+  const res = ev.results;
+  const name = (rid) => shortName(S.resp.get(rid)?.model_id || res.find((r) => r.response_id === rid)?.model_id || '?');
+  const rec = ev.recommended_response;
+  const human = ev.human_picks || [];
+  const agree = human.length ? (human.includes(rec) ? '✓ Matches the answer you picked.' : `You picked ${human.map(name).join(', ')}, so you and the evaluator disagree here.`) : '';
+  const best = (k) => { const vals = res.map((r) => r.scores[k]?.value).filter((v) => v != null); return vals.length > 1 && new Set(vals).size > 1 ? Math.max(...vals) : null; };
+  const cell = (r, k) => {
+    const v = r.scores[k]?.value, c = r.scores[k]?.confidence;
+    if (v == null) return '<td class="muted">—</td>';
+    return `<td class="${best(k) === v ? 'best' : ''}" title="${v.toFixed(2)} of 4${c != null ? ` · confidence ${Math.round(c * 100)}%` : ''}">
+      <div class="score"><span class="meter"><i style="width:${(v / 4) * 100}%"></i></span>${v.toFixed(1)}</div></td>`;
+  };
+  return `<div class="eval-rec"><div class="eval-rec-label">Evaluator recommendation</div>
+      <div class="eval-rec-main"><span class="dot" style="background:${laneColor(S.resp.get(rec)?.model_id)}"></span><b>${esc(name(rec))}</b>
+        ${evalOverall(ev, rec) != null ? `<span class="big">${Math.round(evalOverall(ev, rec))}</span><span class="muted">/100</span>` : ''}
+        ${ev.recommended_confidence != null ? `<span class="tag">confidence ${Math.round(ev.recommended_confidence * 100)}%</span>` : ''}
+        <button class="btn small" data-eval-final="${rec}">Use as final</button></div>
+      ${agree ? `<div class="small">${agree}</div>` : ''}</div>
+    <div class="cmp-wrap"><table class="cmp"><thead><tr><th></th>${res.map((r) => `<th><span class="dot" style="background:${laneColor(r.model_id)}"></span> ${esc(name(r.response_id))}${r.response_id === rec ? ' ⭐' : ''}</th>`).join('')}</tr></thead><tbody>
+      ${ev.criteria.map((k) => `<tr><th scope="row">${esc(ev.criteria_labels[k] || k)}</th>${res.map((r) => cell(r, k)).join('')}</tr>`).join('')}
+      <tr class="total"><th scope="row">Overall</th>${res.map((r) => `<td class="${r.response_id === rec ? 'best' : ''}"><b>${r.scores.overall?.value != null ? Math.round(r.scores.overall.value) : '—'}</b><span class="muted">/100</span></td>`).join('')}</tr>
+      ${ev.probabilities ? `<tr><th scope="row">Head-to-head pick</th>${res.map((r) => `<td>${ev.probabilities[r.response_id] != null ? `${Math.round(ev.probabilities[r.response_id] * 100)}%` : '—'}</td>`).join('')}</tr>` : ''}
+    </tbody></table></div>
+    <div class="muted small">Scores run from 0 (Poor) to 4 (Excellent). Hover a cell to see the evaluator's confidence. Evaluated by ${esc(ev.evaluator === 'jev' ? 'Jev' : 'fallback judge')} (${esc(ev.evaluator_model || '')})
+      in ${fmtMs(ev.latency_ms)}${ev.input_tokens != null ? ` using ${fmtTokens(ev.input_tokens + (ev.output_tokens || 0))} tokens` : ''}.</div>`;
+}
+
 // ---------- compare models ----------
 let compareSel = [];
 const fmtMs = (ms) => (ms == null ? '—' : ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`);
@@ -1346,6 +1446,183 @@ function leaderboardHTML(board) {
       <td>${u.answers}</td><td>${fmtMs(u.avg_latency_ms)}</td><td>${pct(u.failure_rate)}</td>
       <td>${compareSel.includes(u.model_id) ? '' : `<button class="btn small ghost" data-cmp-add="${esc(u.model_id)}">+ Compare</button>`}</td></tr>`).join('')}
     </tbody></table></div>`;
+}
+
+
+// ---------- metrics (for AI PMs) ----------
+let metricsState = { days: 30, conversation: '' };
+const fmtNum = (n) => (n == null ? '—' : n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e4 ? `${Math.round(n / 1e3)}K` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}K` : String(Math.round(n)));
+const ERROR_LABEL = { rate_limit: 'Rate limited', insufficient_credits: 'No credits', context_limit: 'Context too long', invalid_model: 'Model unavailable', forbidden: 'Refused for this app',
+  timeout: 'Timed out', network: 'Network error', provider_unavailable: 'Provider down', safety: 'Safety filter', empty: 'Empty answer', truncated: 'Cut off at max length', interrupted: 'Server restart', no_key: 'No API key', stopped: 'Stopped by user', unknown: 'Other' };
+
+function renderMetrics() {
+  closeStream();
+  S.conv = null; S.resp = new Map(); renderSidebar(); renderSkills();
+  $('#main').innerHTML = `${mobileTop('Metrics')}<div class="new-wrap"><div class="new-inner metrics viz-root">
+    <div class="m-head"><div><h1>Metrics</h1><p class="muted" style="margin:4px 0 0">Usage, speed, cost, reliability and quality across your chats.</p></div>
+      <div class="m-filters">
+        <div class="seg" role="group" aria-label="Time range">${[[7, '7 days'], [30, '30 days'], [90, '90 days'], [0, 'All time']].map(([d, l]) => `<button data-days="${d}" class="${metricsState.days === d ? 'on' : ''}">${l}</button>`).join('')}</div>
+        <select class="select" id="m-conv" aria-label="Chat"><option value="">All chats</option>${S.convs.map((c) => `<option value="${c.id}" ${metricsState.conversation === c.id ? 'selected' : ''}>${esc(c.title.slice(0, 50))}</option>`).join('')}</select>
+      </div></div>
+    <div id="m-body"><div class="muted">Loading…</div></div></div></div>`;
+  $('.m-filters').onclick = (e) => { const b = e.target.closest('[data-days]'); if (!b) return; metricsState.days = Number(b.dataset.days); document.querySelectorAll('.seg button').forEach((x) => x.classList.toggle('on', x === b)); loadMetrics(); };
+  $('#m-conv').onchange = (e) => { metricsState.conversation = e.target.value; loadMetrics(); };
+  loadMetrics();
+}
+
+let metricsData = null;
+async function loadMetrics() {
+  const body = $('#m-body'); if (!body) return;
+  try {
+    metricsData = await api('GET', `/api/metrics?days=${metricsState.days}&tz=${new Date().getTimezoneOffset()}${metricsState.conversation ? `&conversation=${metricsState.conversation}` : ''}`);
+    drawMetrics();
+  } catch (e) { body.innerHTML = `<div class="err-box">${esc(e.message)}</div>`; }
+}
+window.addEventListener('resize', debounce(() => { if (location.hash.startsWith('#/metrics') && metricsData) drawMetrics(); }, 200));
+
+function tile(label, value, sub = '') { return `<div class="tile"><div class="tile-label">${label}</div><div class="tile-value">${value}</div>${sub ? `<div class="tile-sub">${sub}</div>` : ''}</div>`; }
+
+function drawMetrics() {
+  const d = metricsData, s = d.summary, body = $('#m-body');
+  if (!s.answers) { body.innerHTML = '<div class="empty-thread"><h2>No data yet</h2><p>Metrics appear once models have answered in this time range.</p></div>'; return; }
+  const failRate = s.answers ? (s.failed + s.rate_limited) / s.answers : null;
+  body.innerHTML = `
+    <section class="tiles">
+      ${tile('Messages', fmtNum(s.messages), `${s.conversations} chat${s.conversations === 1 ? '' : 's'} · ${pct(s.multi_model_share)} multi-model`)}
+      ${tile('Model calls', fmtNum(s.model_calls), `${s.answers} answers · ${(s.avg_models_per_message || 0).toFixed(1)} models per message`)}
+      ${tile('Tokens', fmtNum(s.tokens_in + s.tokens_out), `${fmtNum(s.tokens_in)} in · ${fmtNum(s.tokens_out)} out`)}
+      ${tile('Cost', fmtCost(s.cost), s.personal_key_share != null ? `${pct(s.personal_key_share)} on your own key` : '')}
+      ${tile('Response time', fmtMs(s.latency_p50), `p50 · p95 ${fmtMs(s.latency_p95)}`)}
+      ${tile('Time to first token', fmtMs(s.ttft_p50), `p50 · p95 ${fmtMs(s.ttft_p95)}`)}
+      ${tile('Output speed', s.throughput ? `${Math.round(s.throughput)} tok/s` : '—', 'while streaming')}
+      ${tile('Failure rate', pct(failRate), `${s.rate_limited} rate limited · ${s.failed} failed · ${s.auto_switches} auto-switched`)}
+      ${tile('Picks', fmtNum(s.picks), 'use as context, continue, save, final')}
+      ${tile('Evaluator agreement', s.evaluator_agreement != null ? pct(s.evaluator_agreement) : '—', s.evaluator_agreement_n ? `${s.evaluations} evaluations, ${s.evaluator_agreement_n} with your pick` : `${s.evaluations} evaluations`)}
+    </section>
+    <section class="m-card"><div class="m-card-head"><h2>Tokens per day</h2><div class="legend"><span><i style="background:var(--series-1)"></i>Input</span><span><i style="background:var(--series-2)"></i>Output</span></div>
+      <button class="btn small ghost" data-table="daily">Table</button></div><div class="chart" id="ch-daily"></div><div class="m-table" id="tb-daily" hidden></div></section>
+    <section class="m-card"><div class="m-card-head"><h2>Response time by model</h2><div class="legend"><span><i class="dot-l"></i>p50 (typical)</span><span><i class="dot-l hollow"></i>p95 (slow end)</span></div></div>
+      <div class="chart" id="ch-latency"></div></section>
+    <section class="m-card"><div class="m-card-head"><h2>By model</h2><button class="btn small ghost" id="csv">Export CSV</button></div>
+      <div class="cmp-wrap">${modelTableHTML(d.per_model)}</div>
+      <p class="muted small">Pick rate counts only answers shown next to another finished answer. Output speed is tokens per second after the first token.</p></section>
+    <section class="m-card"><div class="m-card-head"><h2>Evaluator scores by model</h2><span class="muted small">${d.evaluator === 'jev' ? 'Jev' : 'Fallback judge'} · average score, 0 to 4</span></div>
+      <div id="ch-heat">${heatmapHTML(d.eval_matrix)}</div></section>
+    ${d.errors.length ? `<section class="m-card"><div class="m-card-head"><h2>Why answers failed</h2></div><div class="chart" id="ch-errors"></div></section>` : ''}`;
+  drawDaily(d.daily); drawLatency(d.per_model); if (d.errors.length) drawErrors(d.errors);
+  body.querySelector('[data-table="daily"]').onclick = (e) => { const t = $('#tb-daily'); t.hidden = !t.hidden; $('#ch-daily').hidden = !t.hidden; e.target.textContent = t.hidden ? 'Table' : 'Chart'; };
+  $('#tb-daily').innerHTML = `<table class="cmp"><thead><tr><th>Day</th><th>Answers</th><th>Input tokens</th><th>Output tokens</th><th>Failures</th><th>Cost</th></tr></thead><tbody>${d.daily.filter((x) => x.answers).map((x) => `<tr><td>${x.day}</td><td>${x.answers}</td><td>${fmtNum(x.tokens_in)}</td><td>${fmtNum(x.tokens_out)}</td><td>${x.failures}</td><td>${fmtCost(x.cost)}</td></tr>`).join('')}</tbody></table>`;
+  $('#csv').onclick = () => downloadCSV(d.per_model);
+}
+
+function modelTableHTML(rows) {
+  const maxTok = Math.max(1, ...rows.map((r) => r.tokens_in + r.tokens_out));
+  return `<table class="cmp"><thead><tr><th>Model</th><th>Answers</th><th>Tokens (in / out)</th><th>Avg answer</th><th>p50 time</th><th>p95 time</th><th>First token</th><th>Speed</th><th>Cost</th><th>Failed</th><th>Rate limited</th><th>Pick rate</th><th>Eval score</th></tr></thead><tbody>
+    ${rows.map((r) => `<tr><td><b>${esc(shortName(r.model_id))}</b><div class="model-id">${esc(r.model_id)}</div></td>
+      <td>${r.answers}</td>
+      <td><span class="meter"><i style="width:${((r.tokens_in + r.tokens_out) / maxTok) * 100}%"></i></span>${fmtNum(r.tokens_in)} / ${fmtNum(r.tokens_out)}</td>
+      <td>${r.avg_out_tokens != null ? `${fmtNum(r.avg_out_tokens)} tok` : '—'}</td>
+      <td>${fmtMs(r.latency_p50)}</td><td>${fmtMs(r.latency_p95)}</td><td>${fmtMs(r.ttft_p50)}</td>
+      <td>${r.throughput ? `${Math.round(r.throughput)} tok/s` : '—'}</td><td>${fmtCost(r.cost)}</td>
+      <td>${pct(r.failure_rate)}</td><td>${pct(r.rate_limit_rate)}</td>
+      <td>${r.shown_in_comparisons ? `${pct(r.pick_rate)} <span class="muted small">(${r.chosen}/${r.shown_in_comparisons})</span>` : '—'}</td>
+      <td>${r.eval_overall != null ? `${Math.round(r.eval_overall)}<span class="muted">/100</span> <span class="muted small">(${r.evaluated}${r.eval_wins ? `, ${r.eval_wins} ★` : ''})</span>` : '—'}</td></tr>`).join('')}
+  </tbody></table>`;
+}
+
+function downloadCSV(rows) {
+  const cols = ['model_id', 'answers', 'completed', 'tokens_in', 'tokens_out', 'avg_out_tokens', 'latency_p50', 'latency_p95', 'ttft_p50', 'throughput', 'cost', 'failure_rate', 'rate_limit_rate', 'shown_in_comparisons', 'chosen', 'pick_rate', 'eval_overall', 'evaluated', 'eval_wins'];
+  const csv = [cols.join(','), ...rows.map((r) => cols.map((c) => (r[c] == null ? '' : typeof r[c] === 'number' ? +r[c].toFixed(4) : `"${String(r[c]).replace(/"/g, '""')}"`)).join(','))].join('\n');
+  const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' })); a.download = `model-metrics-${metricsState.days || 'all'}d.csv`; a.click(); URL.revokeObjectURL(a.href);
+}
+
+// Shared tooltip
+function tip(html, x, y) {
+  let t = document.getElementById('viz-tip');
+  if (!t) { t = document.createElement('div'); t.id = 'viz-tip'; document.body.appendChild(t); }
+  if (html == null) { t.style.opacity = 0; return; }
+  t.innerHTML = html; t.style.opacity = 1;
+  const r = t.getBoundingClientRect();
+  t.style.left = `${Math.min(window.innerWidth - r.width - 8, x + 14)}px`; t.style.top = `${Math.max(8, y - r.height - 10)}px`;
+}
+const niceMax = (v) => { if (v <= 0) return 1; const p = 10 ** Math.floor(Math.log10(v)); return Math.ceil(v / p / (v / p > 5 ? 2 : 1)) * p * (v / p > 5 ? 2 : 1); };
+// Bar with a 4px rounded data end and a square baseline.
+const barPath = (x, y, w, h, r = 4) => { r = Math.min(r, h, w / 2); return h <= 0 ? '' : `M${x},${y + h}V${y + r}Q${x},${y} ${x + r},${y}H${x + w - r}Q${x + w},${y} ${x + w},${y + r}V${y + h}Z`; };
+
+function drawDaily(daily) {
+  const el = $('#ch-daily'); const W = el.clientWidth || 700, H = 220, m = { l: 48, r: 8, t: 10, b: 26 };
+  const iw = W - m.l - m.r, ih = H - m.t - m.b;
+  const max = niceMax(Math.max(...daily.map((d) => d.tokens_in + d.tokens_out), 1));
+  const band = iw / daily.length, bw = Math.max(2, Math.min(24, band * 0.7));
+  const y = (v) => m.t + ih - (v / max) * ih;
+  const ticks = [0, 0.5, 1].map((f) => f * max);
+  const labelEvery = Math.ceil(daily.length / Math.max(2, Math.floor(iw / 70)));
+  el.innerHTML = `<svg width="${W}" height="${H}" role="img" aria-label="Input and output tokens per day">
+    ${ticks.map((t) => `<line x1="${m.l}" x2="${W - m.r}" y1="${y(t)}" y2="${y(t)}" class="grid"/><text x="${m.l - 6}" y="${y(t) + 4}" class="axis" text-anchor="end">${fmtNum(t)}</text>`).join('')}
+    ${daily.map((d, i) => {
+      const x = m.l + i * band + (band - bw) / 2;
+      const hIn = (d.tokens_in / max) * ih, hOut = (d.tokens_out / max) * ih;
+      const gap = d.tokens_in && d.tokens_out ? 2 : 0;
+      // Output sits on input with a 2px surface gap; only the top segment gets the rounded end.
+      const inPath = d.tokens_out ? `M${x},${m.t + ih}V${m.t + ih - hIn}H${x + bw}V${m.t + ih}Z` : barPath(x, m.t + ih - hIn, bw, hIn);
+      return `<g class="hit" data-i="${i}"><rect x="${m.l + i * band}" y="${m.t}" width="${band}" height="${ih}" fill="transparent"/>
+        ${hIn ? `<path d="${inPath}" fill="var(--series-1)"/>` : ''}
+        ${hOut ? `<path d="${barPath(x, m.t + ih - hIn - gap - hOut, bw, hOut)}" fill="var(--series-2)"/>` : ''}</g>
+        ${i % labelEvery === 0 ? `<text x="${m.l + i * band + band / 2}" y="${H - 8}" class="axis" text-anchor="middle">${d.day.slice(5)}</text>` : ''}`;
+    }).join('')}
+    <line x1="${m.l}" x2="${W - m.r}" y1="${m.t + ih}" y2="${m.t + ih}" class="baseline"/></svg>`;
+  el.querySelectorAll('.hit').forEach((g) => {
+    const d = daily[g.dataset.i];
+    g.onmousemove = (e) => tip(`<b>${d.day}</b><div><i class="sw" style="background:var(--series-1)"></i>Input ${fmtNum(d.tokens_in)}</div><div><i class="sw" style="background:var(--series-2)"></i>Output ${fmtNum(d.tokens_out)}</div><div class="muted">${d.answers} answers · ${d.failures} failed · ${fmtCost(d.cost)}</div>`, e.clientX, e.clientY);
+    g.onmouseleave = () => tip(null);
+  });
+}
+
+function drawLatency(rows) {
+  const data = rows.filter((r) => r.latency_p50 != null).slice(0, 12);
+  const el = $('#ch-latency');
+  if (!data.length) { el.innerHTML = '<p class="muted">No finished answers yet.</p>'; return; }
+  const W = el.clientWidth || 700, rowH = 30, m = { l: Math.min(220, W * 0.32), r: 60, t: 6, b: 24 };
+  const H = m.t + m.b + rowH * data.length, iw = W - m.l - m.r;
+  const max = niceMax(Math.max(...data.map((r) => r.latency_p95 || r.latency_p50)));
+  const x = (v) => m.l + (v / max) * iw;
+  const ticks = [0, 0.25, 0.5, 0.75, 1].map((f) => f * max);
+  el.innerHTML = `<svg width="${W}" height="${H}" role="img" aria-label="Typical and slow-end response time per model">
+    ${ticks.map((t) => `<line x1="${x(t)}" x2="${x(t)}" y1="${m.t}" y2="${H - m.b}" class="grid"/><text x="${x(t)}" y="${H - 6}" class="axis" text-anchor="middle">${fmtMs(t)}</text>`).join('')}
+    ${data.map((r, i) => { const cy = m.t + i * rowH + rowH / 2; return `<g class="hit" data-i="${i}">
+      <rect x="0" y="${cy - rowH / 2}" width="${W}" height="${rowH}" fill="transparent"/>
+      <text x="${m.l - 10}" y="${cy + 4}" class="label" text-anchor="end">${esc(shortName(r.model_id).slice(0, 28))}</text>
+      ${r.latency_p95 != null ? `<line x1="${x(r.latency_p50)}" x2="${x(r.latency_p95)}" y1="${cy}" y2="${cy}" class="range"/>` : ''}
+      ${r.latency_p95 != null ? `<circle cx="${x(r.latency_p95)}" cy="${cy}" r="5" class="p95"/>` : ''}
+      <circle cx="${x(r.latency_p50)}" cy="${cy}" r="5" class="p50"/>
+      <text x="${x(r.latency_p95 ?? r.latency_p50) + 10}" y="${cy + 4}" class="axis">${fmtMs(r.latency_p50)}</text></g>`; }).join('')}
+  </svg>`;
+  el.querySelectorAll('.hit').forEach((g) => {
+    const r = data[g.dataset.i];
+    g.onmousemove = (e) => tip(`<b>${esc(shortName(r.model_id))}</b><div>Typical (p50): ${fmtMs(r.latency_p50)}</div><div>Slow end (p95): ${fmtMs(r.latency_p95)}</div><div>First token (p50): ${fmtMs(r.ttft_p50)}</div><div class="muted">${r.completed} finished answers</div>`, e.clientX, e.clientY);
+    g.onmouseleave = () => tip(null);
+  });
+}
+
+function heatmapHTML(mx) {
+  if (!mx.rows.length) return '<p class="muted">No evaluations yet. Use ⚖ Evaluate answers under any message with two or more answers.</p>';
+  // Sequential one-hue ramp (blue), light = low, dark = high; text ink switches for contrast.
+  const steps = ['--seq-1', '--seq-2', '--seq-3', '--seq-4', '--seq-5'];
+  const bucket = (v) => Math.min(4, Math.max(0, Math.floor(v)));
+  return `<div class="cmp-wrap"><table class="cmp heat"><thead><tr><th>Model</th>${mx.criteria.map((c) => `<th>${esc(c.label)}</th>`).join('')}<th>Evaluations</th></tr></thead><tbody>
+    ${mx.rows.map((r) => `<tr><td><b>${esc(shortName(r.model_id))}</b></td>${mx.criteria.map((c) => { const v = r.values[c.key]; return v == null ? '<td class="muted">—</td>'
+      : `<td class="hcell ${bucket(v) >= 3 ? 'dark' : ''}" style="background:var(${steps[bucket(v)]})" title="${esc(shortName(r.model_id))} · ${esc(c.label)}: ${v.toFixed(2)} of 4">${v.toFixed(1)}</td>`; }).join('')}<td>${r.n}</td></tr>`).join('')}
+  </tbody></table></div>
+  <div class="heat-legend small muted">0 Poor ${steps.map((st) => `<i style="background:var(${st})"></i>`).join('')} 4 Excellent</div>`;
+}
+
+function drawErrors(errors) {
+  const el = $('#ch-errors'); const W = el.clientWidth || 700, rowH = 26, m = { l: 170, r: 50, t: 4, b: 4 };
+  const H = m.t + m.b + rowH * errors.length, iw = W - m.l - m.r, max = Math.max(...errors.map((e) => e.n));
+  el.innerHTML = `<svg width="${W}" height="${H}" role="img" aria-label="Failure reasons">${errors.map((e, i) => { const y = m.t + i * rowH + 5, w = Math.max(2, (e.n / max) * iw);
+    return `<text x="${m.l - 10}" y="${y + 12}" class="label" text-anchor="end">${esc(ERROR_LABEL[e.kind] || e.kind)}</text>
+      <path d="M${m.l},${y}H${m.l + w - 4}Q${m.l + w},${y} ${m.l + w},${y + 4}V${y + 12}Q${m.l + w},${y + 16} ${m.l + w - 4},${y + 16}H${m.l}Z" fill="var(--series-1)"><title>${e.n}</title></path>
+      <text x="${m.l + w + 8}" y="${y + 12}" class="axis">${e.n}</text>`; }).join('')}</svg>`;
 }
 
 // ---------- keyboard shortcuts ----------

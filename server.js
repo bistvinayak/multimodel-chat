@@ -12,6 +12,7 @@ import * as lf from './lib/langfuse.js';
 import { buildContext } from './lib/context.js';
 import { streamCompletion, ModelError, probeModel, complete, keyInfo } from './lib/openrouter.js';
 import { initSecrets, encrypt, decrypt } from './lib/secrets.js';
+import { evaluateWithJev, evaluateWithJudge, buildBrief, overall, CRITERIA, DEFAULT_CRITERIA } from './lib/evaluator.js';
 import { detect, safeName, LIMITS, MAX_PER_MESSAGE, extractPdfText, describeImage, materialize } from './lib/attachments.js';
 import { titlePrompt, cleanTitle, summaryPlan, summaryPrompt } from './lib/memory.js';
 
@@ -53,6 +54,14 @@ function keyFor(user) {
   throw new ModelError('no_key', 'No OpenRouter key is available. Add your own key in Settings.');
 }
 const userById = (id) => db.prepare('SELECT * FROM users WHERE id=?').get(id);
+
+// Jev (TypeSafe) key: the user's own, else the server's TYPESAFE_API_KEY, else none (fallback judge).
+const JEV_BASE = (process.env.TYPESAFE_API_BASE || 'https://api.typesafe.ai').replace(/\/+$/, '');
+function jevKeyFor(user) {
+  const u = userById(user.id);
+  if (u?.jev_key_enc) { try { return { key: decrypt(u.jev_key_enc), source: 'personal' }; } catch { /* fall through */ } }
+  return process.env.TYPESAFE_API_KEY ? { key: process.env.TYPESAFE_API_KEY, source: 'shared' } : null;
+}
 let lfProject = null; // Langfuse project URL, for deep links
 if (lf.enabled()) lf.projectUrl().then((u) => { lfProject = u; console.log(u ? `Langfuse tracing on: ${u}` : 'Langfuse keys set, but the project lookup failed. Check LANGFUSE_HOST and keys.'); });
 const running = new Map(); // response_id -> { ctl, convId, content, reasoning, retrying, switching }
@@ -86,7 +95,8 @@ async function readJson(req) {
 const prefsOf = (user) => ({ ...DEFAULT_PREFS, ...JSON.parse(user.preferences || '{}') });
 const publicUser = (u) => ({ id: u.id, name: u.name, email: u.email, plan: u.plan, created_at: u.created_at, preferences: prefsOf(u),
   openrouter_key: u.openrouter_key_enc ? { set: true, last4: u.openrouter_key_last4, added_at: u.openrouter_key_added_at } : { set: false },
-  shared_key_available: !!API_KEY });
+  shared_key_available: !!API_KEY,
+  jev_key: u.jev_key_enc ? { set: true, last4: u.jev_key_last4 } : { set: false }, jev_shared_available: !!process.env.TYPESAFE_API_KEY });
 
 // Every lookup is scoped by the authenticated user_id (PRD section 25).
 function ownConversation(user, id) {
@@ -137,6 +147,7 @@ function conversationPayload(conv) {
     langfuse: lf.enabled() && lfProject ? { session_url: `${lfProject}/sessions/${encodeURIComponent(conv.id)}`, trace_base: `${lfProject}/traces/` } : null,
     selections,
     stats,
+    evaluations: db.prepare('SELECT id FROM evaluations WHERE conversation_id=? ORDER BY created_at').all(conv.id).map((e) => evaluationPayload(e.id)),
     memory: conv.conversation_summary ? { summary: conv.conversation_summary, upto: conv.summary_upto } : null,
     skill_ids: db.prepare('SELECT skill_id FROM conversation_skills WHERE conversation_id=?').all(conv.id).map((x) => x.skill_id),
     max_models: MAX_MODELS,
@@ -860,6 +871,211 @@ route('DELETE', '/api/uploads/:id', async (req, res, { user, params }) => {
   await removeFiles([a]);
   db.prepare('DELETE FROM attachments WHERE id=?').run(a.id);
   send(res, 200, { ok: true });
+});
+
+// ---------- evaluation (Jev, or a fallback LLM judge) ----------
+function evalBrief(turn) {
+  const conv = db.prepare('SELECT * FROM conversations WHERE id=?').get(turn.conversation_id);
+  const parts = [];
+  const skills = skillsFor(conv.id);
+  if (skills.length) parts.push(`User instructions (skills):\n${skills.map((k) => `- ${k.name}: ${k.instructions}`).join('\n')}`);
+  const decisions = db.prepare(`SELECT selected_text FROM context_selections WHERE conversation_id=? AND selection_type='canonical' AND active=1 AND created_at < ?`).all(conv.id, turn.created_at);
+  if (decisions.length) parts.push(`Decisions already agreed:\n${decisions.map((d) => `- ${d.selected_text.replace(/\s+/g, ' ').slice(0, 500)}`).join('\n')}`);
+  if (conv.conversation_summary) parts.push(`Conversation so far:\n${conv.conversation_summary}`);
+  const atts = db.prepare('SELECT name, kind, text_content, description FROM attachments WHERE turn_id=?').all(turn.id);
+  if (atts.length) parts.push(`Attached files:\n${atts.map((a) => `- ${a.name}: ${(a.text_content || a.description || '').slice(0, 1500)}`).join('\n')}`);
+  const reply = turn.reply_to_response ? db.prepare('SELECT content FROM responses WHERE id=?').get(turn.reply_to_response) : null;
+  const question = `${turn.user_message}${reply ? `\n\n(The user is replying to this earlier answer: ${(turn.reply_quote || reply.content).slice(0, 1500)})` : ''}`;
+  return buildBrief({ question, context: parts.join('\n\n') });
+}
+
+route('POST', '/api/evaluations', async (req, res, { user }) => {
+  const { response_ids = [], criteria: wanted } = await readJson(req);
+  const ids = [...new Set(response_ids.map(String))];
+  if (!ids.length || ids.length > 6) throw new HttpError(400, 'Pick 1 to 6 answers to evaluate');
+  const criteria = (Array.isArray(wanted) && wanted.length ? wanted : DEFAULT_CRITERIA).filter((k) => CRITERIA[k]);
+  if (!criteria.length) throw new HttpError(400, 'Pick at least one criterion');
+  const rows = ids.map((id) => ownResponse(user, id));
+  if (new Set(rows.map((r) => r.conversation_id)).size > 1) throw new HttpError(400, 'Answers must come from the same chat');
+  const empty = rows.find((r) => !r.content?.trim());
+  if (empty) throw new HttpError(400, `${empty.model_id} has no answer to evaluate`);
+  const turns = new Map(rows.map((r) => [r.turn_id, db.prepare('SELECT * FROM turns WHERE id=?').get(r.turn_id)]));
+  const sameTurn = turns.size === 1;
+  const candidates = rows.map((r) => ({ id: r.id, model_id: r.model_id, content: r.content, brief: evalBrief(turns.get(r.turn_id)), request: sameTurn ? null : turns.get(r.turn_id).user_message }));
+  const conv = db.prepare('SELECT * FROM conversations WHERE id=?').get(rows[0].conversation_id);
+  const commonBrief = sameTurn ? candidates[0].brief : buildBrief({ question: `Choose the best final output for this conversation: "${conv.title}". Each answer is shown with the request it answered.`, context: conv.conversation_summary || '' });
+
+  const jevAuth = jevKeyFor(user);
+  let out;
+  try {
+    out = jevAuth
+      ? await evaluateWithJev({ apiKey: jevAuth.key, base: JEV_BASE, brief: commonBrief, candidates, criteria })
+      : await evaluateWithJudge({ apiKey: keyFor(user).key, models: (await backgroundModels()).map((m) => m.id), brief: commonBrief, candidates, criteria });
+  } catch (e) { throw new HttpError(502, e.message); }
+
+  const evalId = uid();
+  // When the evaluator gives no head-to-head pick, recommend the highest overall score.
+  const overalls = out.results.map((r) => ({ id: r.response_id, overall: overall(r.scores) }));
+  const pick = out.pick || (() => { const best = [...overalls].sort((a, b) => (b.overall ?? -1) - (a.overall ?? -1))[0]; return best ? { response_id: best.id, confidence: null, probabilities: null } : null; })();
+  tx(db, () => {
+    db.prepare(`INSERT INTO evaluations (id, user_id, conversation_id, turn_id, evaluator, evaluator_model, criteria, candidates, recommended_response, recommended_confidence, probabilities, input_tokens, output_tokens, latency_ms, created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(evalId, user.id, conv.id, sameTurn ? rows[0].turn_id : null, out.evaluator, out.evaluator_model, JSON.stringify(criteria), JSON.stringify(ids),
+      pick?.response_id || null, pick?.confidence ?? null, pick?.probabilities ? JSON.stringify(pick.probabilities) : null, out.usage?.input_tokens ?? null, out.usage?.output_tokens ?? null, out.latency_ms, now());
+    const ins = db.prepare('INSERT INTO evaluation_scores (evaluation_id, response_id, model_id, criterion, score, confidence) VALUES (?,?,?,?,?,?)');
+    for (const r of out.results) {
+      const model = rows.find((x) => x.id === r.response_id).model_id;
+      for (const [k, v] of Object.entries(r.scores)) ins.run(evalId, r.response_id, model, k, v.value, v.confidence);
+      ins.run(evalId, r.response_id, model, 'overall', overall(r.scores), null);
+    }
+  });
+  // Mirror the evaluation into Langfuse as scores on each answer's generation.
+  if (lf.enabled()) {
+    for (const r of out.results) {
+      const row = db.prepare('SELECT turn_id, trace_span_id FROM responses WHERE id=?').get(r.response_id);
+      const base = { traceId: lf.traceIdFor(row.turn_id), observationId: row.trace_span_id || undefined, comment: `${out.evaluator} (${out.evaluator_model})` };
+      for (const [k, v] of Object.entries(r.scores)) if (v.value != null) lf.score({ ...base, name: `eval_${k}`, value: v.value / 4 });
+      lf.score({ ...base, name: 'eval_overall', value: overall(r.scores) ?? 0 });
+      lf.score({ ...base, name: 'eval_recommended', value: pick?.response_id === r.response_id ? 1 : 0 });
+    }
+  }
+  send(res, 201, evaluationPayload(evalId));
+});
+
+function evaluationPayload(id) {
+  const e = db.prepare('SELECT * FROM evaluations WHERE id=?').get(id);
+  const scores = db.prepare('SELECT * FROM evaluation_scores WHERE evaluation_id=?').all(id);
+  const by = new Map();
+  for (const sc of scores) { if (!by.has(sc.response_id)) by.set(sc.response_id, { response_id: sc.response_id, model_id: sc.model_id, scores: {} }); by.get(sc.response_id).scores[sc.criterion] = { value: sc.score, confidence: sc.confidence }; }
+  // Did the user's own picks agree with the evaluator?
+  const human = db.prepare(`SELECT DISTINCT winning_response FROM preference_events WHERE user_id=? AND event_type IN ('use_as_context','continue','final','save')
+    AND winning_response IN (${JSON.parse(e.candidates).map(() => '?').join(',')})`).all(e.user_id, ...JSON.parse(e.candidates)).map((x) => x.winning_response);
+  return { ...e, criteria: JSON.parse(e.criteria), candidates: JSON.parse(e.candidates), probabilities: e.probabilities ? JSON.parse(e.probabilities) : null,
+    results: JSON.parse(e.candidates).map((rid) => by.get(rid)).filter(Boolean), human_picks: human,
+    criteria_labels: Object.fromEntries(Object.entries(CRITERIA).map(([k, v]) => [k, v.label])) };
+}
+
+route('GET', '/api/conversations/:id/evaluations', async (req, res, { user, params }) => {
+  const c = ownConversation(user, params.id);
+  send(res, 200, db.prepare('SELECT id FROM evaluations WHERE conversation_id=? ORDER BY created_at DESC').all(c.id).map((e) => evaluationPayload(e.id)));
+});
+
+route('GET', '/api/evaluator', async (req, res, { user }) => {
+  const k = jevKeyFor(user);
+  send(res, 200, { evaluator: k ? 'jev' : 'llm-judge', key_source: k?.source || null, criteria: Object.entries(CRITERIA).map(([key, v]) => ({ key, label: v.label, question: v.q, default: DEFAULT_CRITERIA.includes(key) })) });
+});
+
+route('PUT', '/api/me/jev-key', async (req, res, { user }) => {
+  const key = String((await readJson(req)).key || '').trim();
+  if (key.length < 16 || /\s/.test(key)) throw new HttpError(400, 'That does not look like a TypeSafe API key.');
+  try { await evaluateWithJev({ apiKey: key, base: JEV_BASE, brief: 'Key check.', candidates: [{ id: 'x', content: 'OK' }], criteria: ['clarity'] }); }
+  catch (e) { throw new HttpError(400, `Jev rejected the key: ${e.message}`); }
+  db.prepare('UPDATE users SET jev_key_enc=?, jev_key_last4=? WHERE id=?').run(encrypt(key), key.slice(-4), user.id);
+  send(res, 200, publicUser(userById(user.id)));
+});
+route('DELETE', '/api/me/jev-key', async (req, res, { user }) => {
+  db.prepare('UPDATE users SET jev_key_enc=NULL, jev_key_last4=NULL WHERE id=?').run(user.id);
+  send(res, 200, publicUser(userById(user.id)));
+});
+
+// ---------- metrics for AI PMs ----------
+const pctl = (arr, p) => { const a = arr.filter((x) => x != null).sort((x, y) => x - y); if (!a.length) return null; const i = (a.length - 1) * p; const lo = Math.floor(i), hi = Math.ceil(i); return a[lo] + (a[hi] - a[lo]) * (i - lo); };
+const mean = (arr) => { const a = arr.filter((x) => x != null); return a.length ? a.reduce((x, y) => x + y, 0) / a.length : null; };
+
+route('GET', '/api/metrics', async (req, res, { user }) => {
+  const q = new URL(req.url, 'http://x').searchParams;
+  const days = Number(q.get('days') || 30);
+  const since = days > 0 ? now() - days * 86400_000 : 0;
+  const tz = Number(q.get('tz') || 0); // client offset in minutes (Date#getTimezoneOffset)
+  const convFilter = q.get('conversation') ? ' AND c.id=?' : '';
+  const args = [user.id, since, ...(q.get('conversation') ? [q.get('conversation')] : [])];
+  const R = db.prepare(`SELECT r.id, r.model_id, r.status, r.error_kind, r.latency_ms, r.first_token_ms, r.prompt_tokens, r.completion_tokens, r.cost, r.attempts,
+      r.auto_switched, r.stands_in_for, r.key_source, r.turn_id, r.created_at, r.conversation_id
+    FROM responses r JOIN conversations c ON c.id=r.conversation_id
+    WHERE c.user_id=? AND r.created_at>=? AND r.status NOT IN ('pending','generating')${convFilter}`).all(...args);
+  const T = db.prepare(`SELECT t.id, t.mode, t.target_models, t.conversation_id, t.created_at,
+      (SELECT COUNT(*) FROM attachments a WHERE a.turn_id=t.id) AS files
+    FROM turns t JOIN conversations c ON c.id=t.conversation_id WHERE c.user_id=? AND t.created_at>=?${convFilter}`).all(...args);
+  const picks = new Set(db.prepare(`SELECT p.winning_response FROM preference_events p JOIN conversations c ON c.id=p.conversation_id
+    WHERE p.user_id=? AND p.created_at>=? AND p.event_type IN ('use_as_context','continue','final','save')${convFilter.replace('c.id', 'p.conversation_id')}`).all(...args).map((x) => x.winning_response));
+  const E = db.prepare(`SELECT e.* FROM evaluations e JOIN conversations c ON c.id=e.conversation_id WHERE e.user_id=? AND e.created_at>=?${convFilter}`).all(...args);
+  const ES = E.length ? db.prepare(`SELECT * FROM evaluation_scores WHERE evaluation_id IN (${E.map(() => '?').join(',')})`).all(...E.map((e) => e.id)) : [];
+
+  const completed = R.filter((r) => r.status === 'completed');
+  const throughput = (rows) => mean(rows.filter((r) => r.completion_tokens && r.latency_ms && r.first_token_ms != null && r.latency_ms > r.first_token_ms)
+    .map((r) => r.completion_tokens / ((r.latency_ms - r.first_token_ms) / 1000)));
+  // "Comparable": answer shown next to >= 1 other completed answer in the same message.
+  const completedPerTurn = new Map(); for (const r of completed) completedPerTurn.set(r.turn_id, (completedPerTurn.get(r.turn_id) || 0) + 1);
+  // Evaluator vs human agreement, on evaluations where the user also picked something.
+  let agree = 0, judged = 0;
+  for (const e of E) {
+    const cands = JSON.parse(e.candidates);
+    const human = cands.filter((id) => picks.has(id));
+    if (!human.length || !e.recommended_response) continue;
+    judged++; if (human.includes(e.recommended_response)) agree++;
+  }
+  const summary = {
+    conversations: new Set(T.map((t) => t.conversation_id)).size,
+    messages: T.length,
+    model_calls: R.reduce((n, r) => n + (r.attempts || 0), 0),
+    answers: R.length, completed: completed.length,
+    failed: R.filter((r) => r.status === 'failed').length,
+    rate_limited: R.filter((r) => r.status === 'rate_limited').length,
+    stopped: R.filter((r) => r.status === 'stopped').length,
+    tokens_in: R.reduce((n, r) => n + (r.prompt_tokens || 0), 0),
+    tokens_out: R.reduce((n, r) => n + (r.completion_tokens || 0), 0),
+    cost: R.reduce((n, r) => n + (r.cost || 0), 0),
+    latency_p50: pctl(completed.map((r) => r.latency_ms), 0.5), latency_p95: pctl(completed.map((r) => r.latency_ms), 0.95),
+    ttft_p50: pctl(completed.map((r) => r.first_token_ms), 0.5), ttft_p95: pctl(completed.map((r) => r.first_token_ms), 0.95),
+    throughput: throughput(completed),
+    auto_switches: R.filter((r) => r.auto_switched).length,
+    multi_model_share: T.length ? T.filter((t) => JSON.parse(t.target_models).length > 1).length / T.length : null,
+    avg_models_per_message: mean(T.map((t) => JSON.parse(t.target_models).length)),
+    messages_with_files: T.filter((t) => t.files > 0).length,
+    picks: [...picks].length,
+    evaluations: E.length, evaluator_agreement: judged ? agree / judged : null, evaluator_agreement_n: judged,
+    personal_key_share: R.length ? R.filter((r) => r.key_source === 'personal').length / R.length : null,
+  };
+  // Daily buckets in the viewer's timezone.
+  const dayKey = (ms) => new Date(ms - tz * 60_000).toISOString().slice(0, 10);
+  const daily = new Map();
+  if (since) for (let d = 0; d < days; d++) daily.set(dayKey(now() - (days - 1 - d) * 86400_000), { day: dayKey(now() - (days - 1 - d) * 86400_000), answers: 0, tokens_in: 0, tokens_out: 0, cost: 0, failures: 0 });
+  for (const r of R) {
+    const k = dayKey(r.created_at);
+    if (!daily.has(k)) daily.set(k, { day: k, answers: 0, tokens_in: 0, tokens_out: 0, cost: 0, failures: 0 });
+    const d = daily.get(k); d.answers++; d.tokens_in += r.prompt_tokens || 0; d.tokens_out += r.completion_tokens || 0; d.cost += r.cost || 0;
+    if (r.status === 'failed' || r.status === 'rate_limited') d.failures++;
+  }
+  const catalog = await getCatalog().catch(() => []);
+  const byModel = new Map(); for (const r of R) { if (!byModel.has(r.model_id)) byModel.set(r.model_id, []); byModel.get(r.model_id).push(r); }
+  const per_model = [...byModel].map(([id, rows]) => {
+    const ok = rows.filter((r) => r.status === 'completed');
+    const shown = ok.filter((r) => completedPerTurn.get(r.turn_id) >= 2);
+    const evs = ES.filter((x) => x.model_id === id && x.criterion === 'overall');
+    const evIds = new Set(evs.map((x) => x.evaluation_id));
+    return {
+      model_id: id, name: catalog.find((m) => m.id === id)?.name || id,
+      answers: rows.length, completed: ok.length,
+      failure_rate: rows.length ? rows.filter((r) => r.status === 'failed').length / rows.length : null,
+      rate_limit_rate: rows.length ? rows.filter((r) => r.status === 'rate_limited').length / rows.length : null,
+      tokens_in: rows.reduce((n, r) => n + (r.prompt_tokens || 0), 0), tokens_out: rows.reduce((n, r) => n + (r.completion_tokens || 0), 0),
+      avg_out_tokens: mean(ok.map((r) => r.completion_tokens)),
+      latency_p50: pctl(ok.map((r) => r.latency_ms), 0.5), latency_p95: pctl(ok.map((r) => r.latency_ms), 0.95),
+      ttft_p50: pctl(ok.map((r) => r.first_token_ms), 0.5), throughput: throughput(ok),
+      cost: rows.reduce((n, r) => n + (r.cost || 0), 0),
+      shown_in_comparisons: shown.length, chosen: shown.filter((r) => picks.has(r.id)).length,
+      pick_rate: shown.length ? shown.filter((r) => picks.has(r.id)).length / shown.length : null,
+      eval_overall: mean(evs.map((x) => x.score)), evaluated: evs.length,
+      eval_wins: E.filter((e) => evIds.has(e.id) && db.prepare('SELECT model_id FROM responses WHERE id=?').get(e.recommended_response)?.model_id === id).length,
+      stand_in_for_others: rows.filter((r) => r.stands_in_for && r.auto_switched).length,
+    };
+  }).sort((a, b) => b.answers - a.answers);
+  const crit = [...new Set(ES.map((x) => x.criterion).filter((c) => c !== 'overall'))];
+  const eval_matrix = { criteria: crit.map((k) => ({ key: k, label: CRITERIA[k]?.label || k })),
+    rows: [...new Set(ES.map((x) => x.model_id))].map((m) => ({ model_id: m, name: catalog.find((x) => x.id === m)?.name || m,
+      values: Object.fromEntries(crit.map((k) => [k, mean(ES.filter((x) => x.model_id === m && x.criterion === k).map((x) => x.score))])), n: new Set(ES.filter((x) => x.model_id === m).map((x) => x.evaluation_id)).size })) };
+  const errors = Object.entries(R.filter((r) => r.error_kind && r.status !== 'completed').reduce((m, r) => ((m[r.error_kind] = (m[r.error_kind] || 0) + 1), m), {})).map(([kind, n]) => ({ kind, n })).sort((a, b) => b.n - a.n);
+  send(res, 200, { days, summary, daily: [...daily.values()].sort((a, b) => a.day.localeCompare(b.day)), per_model, eval_matrix, errors,
+    evaluator: jevKeyFor(user) ? 'jev' : 'llm-judge' });
 });
 
 route('GET', '/api/conversations', async (req, res, { user }) => {
