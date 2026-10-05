@@ -35,14 +35,23 @@ test('turns a model skipped are merged as user messages, roles alternate', () =>
   assert.match(messages[3].content, /Only for A[\s\S]*next/);
 });
 
-test('promoted decisions reach every model, including ones that did not write them', () => {
+test('pinned answers reach every model, including ones that did not write them', () => {
   const { db } = seed();
   db.prepare(`INSERT INTO context_selections (id,conversation_id,response_id,selected_text,selection_type,created_at) VALUES ('s','c','a1','Use planner-worker','canonical',25)`).run();
   const { messages } = buildContext(db, { conversation_id: 'c', created_at: 30, user_message: 'next' }, 'B', null, 1000, []);
-  assert.match(messages[0].content, /Use planner-worker/);
-  // ...but not on turns that happened before the decision was made
-  const earlier = buildContext(db, { conversation_id: 'c', created_at: 20, user_message: 'x' }, 'B', null, 1000, []);
-  assert.doesNotMatch(earlier.messages[0].content, /Use planner-worker/);
+  assert.match(messages[0].content, /Pinned memory[\s\S]*Use planner-worker/);
+});
+
+test('pins are never trimmed: long history is condensed but every pin stays', () => {
+  const { db, turn, resp } = seed();
+  for (let i = 0; i < 40; i++) { turn(`x${i}`, `requirement ${i} ` + 'z'.repeat(800), 100 + i); resp(`r${i}`, `x${i}`, 'B', 'y'.repeat(800)); }
+  db.prepare(`INSERT INTO pins (id,conversation_id,source,turn_id,text,created_at,updated_at) VALUES ('p1','c','message','x0','Budget is under 200 dollars a month',101,101)`).run();
+  db.prepare(`INSERT INTO pins (id,conversation_id,source,text,created_at,updated_at) VALUES ('p2','c','note','Always answer in British English',150,150)`).run();
+  const r = buildContext(db, { conversation_id: 'c', created_at: 999, user_message: 'NOW' }, 'B', { context_length: 8000 }, 1000, []);
+  assert.ok(r.droppedTurns > 0, 'history was trimmed');
+  assert.match(r.messages[0].content, /Budget is under 200 dollars a month[\s\S]*Always answer in British English/);
+  assert.ok(r.pinnedTokens > 0 && !r.pinnedTruncated);
+  assert.ok(r.promptTokensEst <= 8000 - 1000);
 });
 
 test('long history is trimmed oldest-first and condensed, never dropping the current message', () => {

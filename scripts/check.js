@@ -115,6 +115,18 @@ await step('Edit and resend the last message', 'Chat', async () => {
   must(status === 200 && data.turns.at(-1).user_message.includes('five words'), 'edit failed');
   await settle(conv);
 });
+await step('Pinned memory reaches every model and survives', 'Context', async () => {
+  const d = (await u('GET', `/api/conversations/${conv}`)).data;
+  const pinMsg = await u('POST', `/api/conversations/${conv}/pins`, { source: 'message', turn_id: d.turns[0].id, text: 'PINNED-REQUIREMENT: code review must be under 30 minutes' });
+  must(pinMsg.status === 201, `pin failed: ${pinMsg.data?.error}`);
+  const note = await u('POST', `/api/conversations/${conv}/pins`, { source: 'note', text: 'PINNED-NOTE: answer in British English' });
+  must(note.status === 201 && note.data.pins.length >= 2, 'note pin failed');
+  await u('POST', `/api/conversations/${conv}/messages`, { message: 'One more benefit, five words.', target: [turn1.responses[0].model_id] });
+  const done = await settle(conv); const ctx = (await u('GET', `/api/responses/${done.turns.at(-1).responses[0].id}/context`)).data.messages;
+  must(ctx[0].content.includes('PINNED-REQUIREMENT') && ctx[0].content.includes('PINNED-NOTE'), 'pins missing from the context sent');
+  const p = note.data.pins.find((x) => x.text.startsWith('PINNED-NOTE'));
+  must((await u('DELETE', `/api/pins/${p.id}`)).data.pins.every((x) => x.id !== p.id), 'unpin failed');
+});
 await step('Skills are applied to the models', 'Skills', async () => {
   const sk = (await u('POST', '/api/skills', { name: 'Check skill', instructions: 'Always end with the word BANANA.' })).data;
   await u('PUT', `/api/conversations/${conv}/skills/${sk.id}`);

@@ -10,7 +10,7 @@ import { hashPassword, verifyPassword, createSession, destroySession, userFromRe
 import { getCatalog, getModel, qualityScore, NOT_CHAT } from './lib/models.js';
 import { healthOf, recordOk, recordLimited, recordBlocked } from './lib/health.js';
 import * as lf from './lib/langfuse.js';
-import { buildContext } from './lib/context.js';
+import { buildContext, pinnedMemory } from './lib/context.js';
 import { streamCompletion, ModelError, probeModel, complete, keyInfo } from './lib/openrouter.js';
 import { initSecrets, encrypt, decrypt } from './lib/secrets.js';
 import { evaluateWithJev, evaluateWithJudge, buildBrief, overall, CRITERIA, DEFAULT_CRITERIA } from './lib/evaluator.js';
@@ -152,6 +152,7 @@ function conversationPayload(conv) {
     selections,
     stats,
     evaluations: db.prepare('SELECT id FROM evaluations WHERE conversation_id=? ORDER BY created_at').all(conv.id).map((e) => evaluationPayload(e.id)),
+    pins: pinnedMemory(db, conv.id),
     memory: conv.conversation_summary ? { summary: conv.conversation_summary, upto: conv.summary_upto } : null,
     skill_ids: db.prepare('SELECT skill_id FROM conversation_skills WHERE conversation_id=?').all(conv.id).map((x) => x.skill_id),
     max_models: MAX_MODELS,
@@ -580,9 +581,7 @@ async function maybeSummarize(convId) {
   if (summarizing.has(convId)) return;
   const conv = db.prepare('SELECT * FROM conversations WHERE id=?').get(convId);
   const turns = db.prepare('SELECT id, user_message, created_at FROM turns WHERE conversation_id=? ORDER BY created_at').all(convId);
-  const decisions = db.prepare(`SELECT s.selected_text, r.model_id FROM context_selections s JOIN responses r ON r.id=s.response_id
-    WHERE s.conversation_id=? AND s.selection_type='canonical' AND s.active=1 ORDER BY s.created_at`).all(convId)
-    .map((d) => `- (from ${d.model_id}) ${d.selected_text.replace(/\s+/g, ' ').slice(0, 600)}`).join('\n');
+  const decisions = pinnedMemory(db, convId).map((d) => `- ${d.text.replace(/\s+/g, ' ').slice(0, 600)}`).join('\n');
   const plan = summaryPlan(turns, conv.summary_upto, decisions);
   if (!plan) return;
   summarizing.add(convId);
@@ -883,8 +882,8 @@ function evalBrief(turn) {
   const parts = [];
   const skills = skillsFor(conv.id);
   if (skills.length) parts.push(`User instructions (skills):\n${skills.map((k) => `- ${k.name}: ${k.instructions}`).join('\n')}`);
-  const decisions = db.prepare(`SELECT selected_text FROM context_selections WHERE conversation_id=? AND selection_type='canonical' AND active=1 AND created_at < ?`).all(conv.id, turn.created_at);
-  if (decisions.length) parts.push(`Decisions already agreed:\n${decisions.map((d) => `- ${d.selected_text.replace(/\s+/g, ' ').slice(0, 500)}`).join('\n')}`);
+  const pinned = pinnedMemory(db, conv.id);
+  if (pinned.length) parts.push(`Pinned by the user (instructions, facts and decisions every answer must respect):\n${pinned.map((d) => `- ${d.text.replace(/\s+/g, ' ').slice(0, 500)}`).join('\n')}`);
   if (conv.conversation_summary) parts.push(`Conversation so far:\n${conv.conversation_summary}`);
   const atts = db.prepare('SELECT name, kind, text_content, description FROM attachments WHERE turn_id=?').all(turn.id);
   if (atts.length) parts.push(`Attached files:\n${atts.map((a) => `- ${a.name}: ${(a.text_content || a.description || '').slice(0, 1500)}`).join('\n')}`);
@@ -1667,10 +1666,11 @@ route('POST', '/api/conversations/:id/estimate', async (req, res, { user, params
   for (const t of targets) {
     const model = await getModel(t.model_id);
     const maxOut = maxOutFor(user, model);
-    const { promptTokensEst, droppedTurns } = buildContext(db, draft, t.model_id, model, maxOut, pins, skills, { summary: summaryOf(c.id), draftAttachments });
+    const { promptTokensEst, droppedTurns, pinnedTokens, pinnedTruncated } = buildContext(db, draft, t.model_id, model, maxOut, pins, skills, { summary: summaryOf(c.id), draftAttachments });
     const min = model ? promptTokensEst * model.prompt_price : null;
     const max = model ? min + maxOut * model.completion_price : null;
-    out.push({ model_id: t.model_id, prompt_tokens: promptTokensEst, max_output: maxOut, free: !!model?.free, cost_min: min, cost_max: max, dropped_turns: droppedTurns });
+    out.push({ model_id: t.model_id, prompt_tokens: promptTokensEst, max_output: maxOut, free: !!model?.free, cost_min: min, cost_max: max, dropped_turns: droppedTurns,
+      pinned_tokens: pinnedTokens, pinned_truncated: pinnedTruncated, context_length: model?.context_length || null });
   }
   send(res, 200, {
     models: out,
@@ -1814,11 +1814,52 @@ route('POST', '/api/responses/:id/use', async (req, res, { user, params }) => {
   const r = ownResponse(user, params.id);
   if (!r.content.trim()) throw new HttpError(400, 'Nothing to use yet');
   const { selected_text } = await readJson(req);
-  const text = String(selected_text || '').trim() || r.content;
-  db.prepare(`INSERT INTO context_selections (id, conversation_id, response_id, selected_text, selection_type, created_at)
-              VALUES (?,?,?,?,'canonical',?)`).run(uid(), r.conversation_id, r.id, text, now());
+  const text = String(selected_text || '').trim().slice(0, 8000) || r.content;
+  const t = now();
+  db.prepare(`INSERT INTO pins (id, conversation_id, source, turn_id, response_id, model_id, text, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)`)
+    .run(uid(), r.conversation_id, 'answer', r.turn_id, r.id, r.model_id, text, t, t);
   logPreference(user, r, 'use_as_context');
   send(res, 200, conversationPayload(ownConversation(user, r.conversation_id)));
+});
+
+// ---------- pinned memory ----------
+// Pin your own message (or part of it), or a free-form note. Answers are pinned through /api/responses/:id/use.
+route('POST', '/api/conversations/:id/pins', async (req, res, { user, params }) => {
+  const c = ownConversation(user, params.id);
+  const b = await readJson(req);
+  const source = b.source === 'message' ? 'message' : 'note';
+  const text = String(b.text || '').trim().slice(0, 8000);
+  if (text.length < 2) throw new HttpError(400, 'Nothing to pin');
+  let turnId = null;
+  if (source === 'message') {
+    const t = db.prepare('SELECT id FROM turns WHERE id=? AND conversation_id=?').get(String(b.turn_id || ''), c.id);
+    if (!t) throw new HttpError(400, 'Message not found in this chat');
+    turnId = t.id;
+  }
+  if (db.prepare('SELECT COUNT(*) n FROM pins WHERE conversation_id=?').get(c.id).n >= 50) throw new HttpError(400, 'Up to 50 pins per chat. Unpin something first.');
+  const t = now();
+  db.prepare('INSERT INTO pins (id, conversation_id, source, turn_id, text, created_at, updated_at) VALUES (?,?,?,?,?,?,?)').run(uid(), c.id, source, turnId, text, t, t);
+  touch(c.id);
+  send(res, 201, conversationPayload(ownConversation(user, c.id)));
+});
+
+const ownPin = (user, id) => db.prepare(`SELECT p.* FROM pins p JOIN conversations c ON c.id=p.conversation_id WHERE p.id=? AND c.user_id=?`).get(id, user.id);
+route('PATCH', '/api/pins/:id', async (req, res, { user, params }) => {
+  const p = ownPin(user, params.id);
+  if (!p) throw new HttpError(404, 'Pin not found');
+  const text = String((await readJson(req)).text || '').trim().slice(0, 8000);
+  if (text.length < 2) throw new HttpError(400, 'A pin needs some text');
+  db.prepare('UPDATE pins SET text=?, updated_at=? WHERE id=?').run(text, now(), p.id);
+  send(res, 200, conversationPayload(ownConversation(user, p.conversation_id)));
+});
+route('DELETE', '/api/pins/:id', async (req, res, { user, params }) => {
+  const p = ownPin(user, params.id);
+  if (p) { db.prepare('DELETE FROM pins WHERE id=?').run(p.id); return send(res, 200, conversationPayload(ownConversation(user, p.conversation_id))); }
+  // Older answers chosen with "Use as context"
+  const s = db.prepare(`SELECT s.* FROM context_selections s JOIN conversations c ON c.id=s.conversation_id WHERE s.id=? AND c.user_id=?`).get(params.id, user.id);
+  if (!s) throw new HttpError(404, 'Pin not found');
+  db.prepare('UPDATE context_selections SET active=0 WHERE id=?').run(s.id);
+  send(res, 200, conversationPayload(ownConversation(user, s.conversation_id)));
 });
 
 route('POST', '/api/responses/:id/continue', async (req, res, { user, params }) => {

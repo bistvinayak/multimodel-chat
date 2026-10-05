@@ -9,6 +9,7 @@ window.addEventListener('error', (e) => { recentErrors.push({ at: Date.now(), ms
 window.addEventListener('unhandledrejection', (e) => { recentErrors.push({ at: Date.now(), msg: String(e.reason?.message || e.reason).slice(0, 300) }); recentErrors.splice(0, recentErrors.length - 10); });
 
 const S = {
+  get memOpen() { return !!window.__memOpen; },
   get ctxOpen() { return !!window.__ctxOpen; },
   me: null,
   models: [], modelMap: new Map(), maxModels: 3, modelsError: null,
@@ -82,8 +83,11 @@ function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTi
 document.addEventListener('selectionchange', () => {
   const sel = window.getSelection();
   if (!sel || sel.isCollapsed) return;
-  const body = sel.anchorNode?.parentElement?.closest?.('.card-body');
+  const el = sel.anchorNode?.parentElement;
+  const body = el?.closest?.('.card-body');
   if (body) S.lastSel = { id: body.closest('.card').dataset.id, text: sel.toString() };
+  const mine = el?.closest?.('.user-msg');
+  if (mine) S.lastSel = { turn: mine.closest('.turn').id.replace('turn-', ''), text: sel.toString() };
 });
 
 // ---------- auth ----------
@@ -552,7 +556,7 @@ function renderHead() {
   const el = $('#conv-head'); if (!el || !S.conv) return;
   const { conversation: c, models, stats, selections } = S.conv;
   const active = models.filter((m) => m.status === 'active').length;
-  const canonical = selections.filter((s) => s.selection_type === 'canonical');
+  const pins = S.conv.pins || [];
   el.innerHTML = `
     <div class="conv-title-row"><input class="conv-title" id="title" value="${esc(c.title)}" aria-label="Conversation title">
       ${S.conv.langfuse?.session_url ? `<a class="btn small ghost" href="${esc(S.conv.langfuse.session_url)}" target="_blank" rel="noopener" title="Open this whole chat as a Langfuse session">Langfuse ↗</a>` : ''}
@@ -564,20 +568,19 @@ function renderHead() {
         <button class="btn small ghost" data-lane="remove" data-model="${esc(m.model_id)}" title="Remove from conversation">✕</button></span>`).join('')}
       <button class="btn small" id="add-model" ${active >= S.conv.max_models ? `disabled title="Max ${S.conv.max_models} active models"` : ''}>+ Add model</button></div>
     ${S.conv.skill_ids?.length ? `<div class="skills-on small">Skills on: ${S.conv.skill_ids.map((id) => S.skills.find((k) => k.id === id)).filter(Boolean).map((k) => `<span class="tag">${esc(k.name)}</span>`).join('')}</div>` : ''}
-    ${S.conv.memory ? `<details class="memory small"><summary>🧠 Memory: older turns are summarized for every model</summary><div class="md">${md(S.conv.memory.summary)}</div>
-      <div class="muted">Built only from your messages and the answers you shared, so each model keeps its own view. It updates as the chat grows.</div></details>` : ''}
     <div class="stats"><span>Conversation cost <b>${fmtCost(stats.cost)}</b></span><span>Model calls <b>${stats.calls}</b></span>
       <span>Messages <b>${stats.messages}</b></span><span>Tokens <b>${fmtTokens(stats.tokens)}</b></span></div>
-    ${canonical.length ? `<details class="context-panel" ${S.ctxOpen ? 'open' : ''} ontoggle="window.__ctxOpen=this.open"><summary>Shared context: ${canonical.length} selected decision${canonical.length > 1 ? 's' : ''} sent to every model</summary>
-      ${canonical.map((s) => `<div class="ctx-item"><span class="dot" style="background:${laneColor(s.model_id)};width:9px;height:9px;border-radius:50%;margin-top:6px"></span>
-        <div class="body"><b>${esc(shortName(s.model_id))}</b><div class="snip">${esc(s.selected_text.slice(0, 400))}</div></div>
-        <button class="btn small ghost" data-unselect="${s.id}" title="Stop sending this to models">✕</button></div>`).join('')}</details>` : ''}`;
+    ${memoryPanelHTML(pins)}`;
   $('#title').onchange = async (e) => { try { setConv(await api('PATCH', `/api/conversations/${c.id}`, { title: e.target.value })); loadConvs(); } catch (err) { fail(err); } };
   $('#finish-btn').onclick = openFinish;
   $('#add-model').onclick = openAddModel;
   el.onclick = async (e) => {
     const lane = e.target.closest('[data-lane]');
-    const un = e.target.closest('[data-unselect]');
+    const un = e.target.closest('[data-unpin]');
+    const ed = e.target.closest('[data-pin-edit]');
+    const addNote = e.target.closest('[data-pin-add]');
+    if (ed) { e.preventDefault(); const p = (S.conv.pins || []).find((x) => x.id === ed.dataset.pinEdit); const v = prompt('Edit this pin', p.text); if (v && v.trim() && v !== p.text) { try { setConv(await api('PATCH', `/api/pins/${p.id}`, { text: v })); renderHead(); renderThread(); estimate(); } catch (err) { fail(err); } } return; }
+    if (addNote) { e.preventDefault(); const v = prompt('Pin a note every model should always keep in mind (for example: "Budget is under $200/month" or "Always answer in British English")'); if (v && v.trim()) { try { setConv(await api('POST', `/api/conversations/${c.id}/pins`, { source: 'note', text: v })); renderHead(); estimate(); toast('Pinned'); } catch (err) { fail(err); } } return; }
     try {
       if (lane) {
         const mid = encodeURIComponent(lane.dataset.model), act = lane.dataset.lane;
@@ -586,7 +589,7 @@ function renderHead() {
           setConv(await api('DELETE', `/api/conversations/${c.id}/models/${mid}`));
         } else setConv(await api('PATCH', `/api/conversations/${c.id}/models/${mid}`, { status: act === 'pause' ? 'paused' : 'active' }));
         renderHead(); renderComposerMeta();
-      } else if (un) { setConv(await api('DELETE', `/api/selections/${un.dataset.unselect}`)); renderHead(); estimate(); }
+      } else if (un) { setConv(await api('DELETE', `/api/pins/${un.dataset.unpin}`)); renderHead(); renderThread(); estimate(); toast('Unpinned'); }
     } catch (err) { fail(err); }
   };
 }
@@ -594,6 +597,23 @@ function renderHead() {
 const replyBody = () => (S.reply ? { response_id: S.reply.id, quote: S.reply.quote || null } : null);
 const activeIds = () => S.conv.models.filter((m) => m.status === 'active').map((m) => m.model_id);
 function targetIds() { return S.target === 'all' ? activeIds() : S.target; }
+
+const PIN_LABEL = { message: 'You', note: 'Note', answer: null };
+function memoryPanelHTML(pins) {
+  const skills = (S.conv.skill_ids || []).map((id) => S.skills.find((k) => k.id === id)).filter(Boolean);
+  const tokens = S.memoryTokens;
+  return `<details class="memory-panel" ${S.memOpen ? 'open' : ''} ontoggle="window.__memOpen=this.open">
+    <summary>📌 Memory · ${pins.length ? `${pins.length} pinned` : 'nothing pinned yet'}${tokens ? ` · ~${fmtTokens(tokens)} tokens in every request` : ''}</summary>
+    <div class="mem-body">
+      <div class="muted small">Every model gets this on every message, and it's never trimmed away in long chats. Pin your own message, an answer, or a highlighted part with 📌, or type <code>/pin</code> in the message box.</div>
+      ${pins.map((p) => `<div class="pin-item"><span class="pin-src" style="--lane:${p.source === 'answer' ? laneColor(p.model_id) : 'var(--accent)'}">${p.source === 'answer' ? esc(shortName(p.model_id)) : PIN_LABEL[p.source]}</span>
+        <div class="pin-text">${esc(p.text.length > 600 ? p.text.slice(0, 600) + '…' : p.text)}</div>
+        <span class="pin-actions">${p.source !== 'answer' ? `<button class="btn small ghost" data-pin-edit="${p.id}" title="Edit">✎</button>` : ''}<button class="btn small ghost" data-unpin="${p.id}" title="Unpin">✕</button></span></div>`).join('')}
+      <button class="btn small" data-pin-add>+ Pin a note</button>
+      ${S.conv.memory ? `<details class="small mem-sub"><summary>Also sent: summary of older turns (automatic)</summary><div class="md">${md(S.conv.memory.summary)}</div></details>` : ''}
+      ${skills.length ? `<div class="small muted">Also sent: skills ${skills.map((k) => `<span class="tag">${esc(k.name)}</span>`).join(' ')}</div>` : ''}
+    </div></details>`;
+}
 
 function renderComposerMeta() {
   if (!S.conv || !$('#send-to')) return;
@@ -629,7 +649,10 @@ const estimate = debounce(async () => {
     const dropped = Math.max(0, ...est.models.map((m) => m.dropped_turns));
     el.innerHTML = `${n} model${n > 1 ? 's' : ''} · ${allFree ? 'Estimated cost: <b>Free</b>' : `Estimated cost: <b>${fmtCost(est.cost_min)} to ${fmtCost(est.cost_max)}</b>`}`
       + ` · ~${fmtTokens(Math.max(...est.models.map((m) => m.prompt_tokens)))} prompt tokens`
-      + (dropped ? ` · <span title="Older turns are condensed to fit the smallest context window">${dropped} older turn${dropped > 1 ? 's' : ''} condensed</span>` : '');
+      + (dropped ? ` · <span title="Older turns are condensed to fit the smallest context window">${dropped} older turn${dropped > 1 ? 's' : ''} condensed</span>` : '')
+      + (est.models.some((m) => m.pinned_truncated) ? ` · <span class="bad" title="Pinned memory is limited to half of each model's context window">⚠ pins too long for ${est.models.filter((m) => m.pinned_truncated).map((m) => esc(shortName(m.model_id))).join(', ')}</span>` : '');
+    const pt = Math.max(0, ...est.models.map((m) => m.pinned_tokens || 0));
+    if (pt !== S.memoryTokens) { S.memoryTokens = pt; renderHead(); }
   } catch (e) { el.textContent = e.message; }
 }, 400);
 
@@ -647,7 +670,9 @@ function turnHTML(t) {
   return `<section class="turn" id="turn-${t.id}">
     ${t.reply_to_response ? replyQuoteHTML(t) : ''}
     ${turnAttachmentsHTML(t)}
-    <div class="user-msg">${esc(t.user_message)}${S.conv.turns.at(-1)?.id === t.id ? `<button class="btn small ghost edit-btn" data-act="edit-turn" data-turn="${t.id}" title="Edit and resend (↑ in an empty box)">✎ Edit</button>` : ''}</div>
+    <div class="user-msg ${isPinned(null, t.id) ? 'pinned' : ''}">${isPinned(null, t.id) ? '<span class="pin-badge" title="Pinned to memory">📌</span>' : ''}${esc(t.user_message)}<span class="msg-tools">
+      <button class="btn small ghost" data-act="pin-msg" data-turn="${t.id}" title="Pin this message, or the part you highlighted, so every model always keeps it in mind">📌 Pin</button>
+      ${S.conv.turns.at(-1)?.id === t.id ? `<button class="btn small ghost" data-act="edit-turn" data-turn="${t.id}" title="Edit and resend (↑ in an empty box)">✎ Edit</button>` : ''}</span></div>
     ${t.mode === 'single' ? `<div class="turn-meta">Asked only ${esc(shortName(t.target_models[0]))}</div>`
       : t.mode === 'subset' ? `<div class="turn-meta">Asked ${t.target_models.map((m) => esc(shortName(m))).join(' and ')}</div>` : ''}
     <div class="lane-tabs">${rs.map((r) => `<button class="${r.id === active ? 'on' : ''}" style="--lane:${laneColor(r.model_id)}" data-act="tab" data-turn="${t.id}" data-id="${r.id}">
@@ -656,6 +681,10 @@ function turnHTML(t) {
     ${rs.filter((r) => r.status === 'completed').length >= 2 ? `<div class="turn-tools"><button class="btn small" data-act="evaluate" data-turn="${t.id}">⚖ Evaluate answers</button>
       ${S.conv.evaluations?.some((e) => e.turn_id === t.id) ? '<span class="muted small">Evaluated. Run again to rescore.</span>' : ''}</div>` : ''}
   </section>`;
+}
+
+function isPinned(responseId, turnId) {
+  return (S.conv?.pins || []).some((p) => (responseId && p.response_id === responseId) || (turnId && p.source === 'message' && p.turn_id === turnId));
 }
 
 function replyQuoteHTML(t) {
@@ -698,7 +727,7 @@ function cardHTML(r, tabActive) {
       ${!live && has && r.status === 'completed' ? `<button class="btn small ghost" data-act="regen" data-id="${r.id}" title="Ask this model again. The current answer is kept as a version.">↻ Regenerate</button>` : ''}
       ${!live && r.version_count ? `<button class="btn small ghost" data-act="versions" data-id="${r.id}" title="Earlier answers from this model">Versions (${r.version_count + 1})</button>` : ''}
       ${has && !live ? `
-        <button class="btn small" data-act="use" data-id="${r.id}" title="Send this answer (or the part you highlighted) to every model on future turns">Use as context</button>
+        <button class="btn small ${isPinned(r.id) ? 'on' : ''}" data-act="use" data-id="${r.id}" title="Pin this answer, or the part you highlighted, so every model always keeps it in mind">📌 Pin</button>
         <button class="btn small" data-act="continue" data-id="${r.id}" title="Your next message builds on this answer, for all models">Continue with this</button>
         <button class="btn small" data-act="reply" data-id="${r.id}" title="Reply to this answer. Highlight part of it first to quote just that part.">↩ Reply</button>
         <button class="btn small ghost" data-act="ask" data-id="${r.id}" title="Send the next message only to this model">Ask this model</button>
@@ -823,6 +852,12 @@ const parsePriceHint = (t) => { const m = t.match(/(?:below|under|less than|fall
 async function sendMessage() {
   const msg = $('#msg'); const text = msg.value.trim();
   // "/watch <link> [below 500]" sets up a price watch instead of sending a message.
+  if (/^\/pin\b/i.test(text)) {
+    const note = text.replace(/^\/pin\s*/i, '').trim();
+    if (!note) return toast('Type what to pin after /pin');
+    try { setConv(await api('POST', `/api/conversations/${S.conv.conversation.id}/pins`, { source: 'note', text: note })); msg.value = ''; renderHead(); estimate(); toast('Pinned to memory'); } catch (e) { fail(e); }
+    return;
+  }
   if (/^\/watch\b/i.test(text)) {
     const url = (text.match(URL_RE) || [])[0];
     openWatchModal({ url: url || '', target: parsePriceHint(text), interval: parseFrequency(text), conversationId: S.conv?.conversation.id });
@@ -996,6 +1031,14 @@ async function onThreadClick(e) {
         renderThread(); renderHead();
         break;
       }
+      case 'pin-msg': {
+        const turn = S.conv.turns.find((x) => x.id === b.dataset.turn);
+        const part = S.lastSel?.turn === turn.id && S.lastSel.text.trim().length > 3 ? S.lastSel.text.trim() : turn.user_message;
+        setConv(await api('POST', `/api/conversations/${S.conv.conversation.id}/pins`, { source: 'message', turn_id: turn.id, text: part }));
+        S.lastSel = null; renderHead(); renderThread(); estimate();
+        toast(part === turn.user_message ? 'Message pinned to memory' : 'Highlighted part pinned to memory');
+        break;
+      }
       case 'evaluate': {
         const turn = S.conv.turns.find((x) => x.id === b.dataset.turn);
         await openEvaluate(turn.responses.filter((r) => r.status === 'completed').map((r) => r.id));
@@ -1010,7 +1053,8 @@ async function onThreadClick(e) {
         const part = S.lastSel?.id === id && S.lastSel.text.trim().length > 20 ? S.lastSel.text.trim() : '';
         setConv(await api('POST', `/api/responses/${id}/use`, { selected_text: part }));
         S.lastSel = null; renderHead(); estimate();
-        toast(part ? 'Highlighted part added to shared context' : `${shortName(r.model_id)}'s answer added to shared context`);
+        renderThread();
+        toast(part ? 'Highlighted part pinned to memory' : `${shortName(r.model_id)}'s answer pinned to memory`);
         break;
       }
       case 'continue':
