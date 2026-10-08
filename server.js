@@ -27,7 +27,10 @@ try { process.loadEnvFile(path.join(ROOT, '.env')); } catch {}
 // Zoho Catalyst AppSail passes the port in X_ZOHO_CATALYST_LISTEN_PORT and needs all interfaces.
 const PORT = Number(process.env.X_ZOHO_CATALYST_LISTEN_PORT || process.env.PORT || 3210);
 const HOST = process.env.HOST || (process.env.X_ZOHO_CATALYST_LISTEN_PORT ? '0.0.0.0' : '127.0.0.1');
-const MAX_MODELS = Number(process.env.MAX_MODELS || 3);
+// Models per chat. More than 3 lanes scroll sideways. Trial users (shared key) stay at TRIAL_MAX_MODELS,
+// because every extra lane spends the shared account's free-model allowance.
+const MAX_MODELS = Number(process.env.MAX_MODELS || 6);
+const TRIAL_MAX_MODELS = Math.min(MAX_MODELS, Number(process.env.TRIAL_MAX_MODELS || 3));
 const RATE_LIMIT_RETRIES = Number(process.env.RATE_LIMIT_RETRIES ?? 4);
 // With auto-switch on, retry briefly, then hand the lane to a model that is answering.
 const AUTO_SWITCH_RETRIES = Number(process.env.AUTO_SWITCH_RETRIES ?? 1);
@@ -93,6 +96,12 @@ function requireOwnKeyForAgents(user) {
   const u = db.prepare('SELECT * FROM users WHERE id=?').get(user.id);
   if (!personalKey(u) && !isAdmin(u)) throw needsKey('Agents keep running on a schedule, so they use your own OpenRouter key. Add it in Settings, then create the agent.');
 }
+function maxModelsFor(user) {
+  const u = (user?.id && db.prepare('SELECT * FROM users WHERE id=?').get(user.id)) || user;
+  return u && (personalKey(u) || isAdmin(u) || !API_KEY) ? MAX_MODELS : TRIAL_MAX_MODELS;
+}
+const convLimit = (convId) => maxModelsFor(userById(db.prepare('SELECT user_id FROM conversations WHERE id=?').get(convId)?.user_id));
+const limitMsg = (n) => `At most ${n} models at once${n < MAX_MODELS ? `. Add your own OpenRouter key in Settings to use up to ${MAX_MODELS}` : ''}.`;
 function requireAdmin(user) { if (!isAdmin(user)) throw new HttpError(403, 'Only the app owner can run this.'); }
 const userById = (id) => db.prepare('SELECT * FROM users WHERE id=?').get(id);
 
@@ -192,7 +201,7 @@ function conversationPayload(conv) {
     pins: pinnedMemory(db, conv.id),
     memory: conv.conversation_summary ? { summary: conv.conversation_summary, upto: conv.summary_upto } : null,
     skill_ids: db.prepare('SELECT skill_id FROM conversation_skills WHERE conversation_id=?').all(conv.id).map((x) => x.skill_id),
-    max_models: MAX_MODELS,
+    max_models: convLimit(conv.id),
   };
 }
 
@@ -243,7 +252,7 @@ function resolveTargets(convId, target) {
   if (!ids.length) throw new HttpError(400, 'Pick at least one model to send to');
   const targets = models.filter((m) => ids.includes(m.model_id) && m.status !== 'removed');
   if (targets.length !== ids.length) throw new HttpError(400, 'One of those models is not part of this conversation');
-  if (targets.length > MAX_MODELS) throw new HttpError(400, `At most ${MAX_MODELS} models per message`);
+  if (targets.length > convLimit(convId)) throw new HttpError(400, limitMsg(convLimit(convId)));
   const isAll = active.length && targets.length === active.length && active.every((a) => ids.includes(a.model_id));
   return { mode: isAll ? 'all' : targets.length === 1 ? 'single' : 'subset', targets };
 }
@@ -393,7 +402,7 @@ function swapLane(r, model_id, auto) {
     db.prepare(`UPDATE conversation_models SET status='paused' WHERE conversation_id=? AND model_id=? AND status='active'`).run(r.conversation_id, r.model_id);
     const existing = rows.find((x) => x.model_id === model_id);
     const activeAfter = rows.filter((x) => x.status === 'active' && x.model_id !== r.model_id && x.model_id !== model_id).length + 1;
-    if (activeAfter > MAX_MODELS) throw new HttpError(400, `At most ${MAX_MODELS} active models`);
+    if (activeAfter > convLimit(r.conversation_id)) throw new HttpError(400, limitMsg(convLimit(r.conversation_id)));
     if (existing) db.prepare(`UPDATE conversation_models SET status='active', removed_at=NULL WHERE conversation_id=? AND model_id=?`).run(r.conversation_id, model_id);
     else db.prepare('INSERT INTO conversation_models (conversation_id, model_id, status, position, added_at) VALUES (?,?,?,?,?)')
       .run(r.conversation_id, model_id, 'active', rows.length, now());
@@ -744,7 +753,7 @@ route('GET', '/api/langfuse/status', async (req, res) => {
   send(res, 200, { ...lf.config(), project_url: lfProject, ...lf.stats, queued_flush: undefined });
 });
 
-route('GET', '/api/models', async (req, res) => {
+route('GET', '/api/models', async (req, res, { user }) => {
   try {
     // App-wide reliability, picks and thumbs (counts only, no content) feed the "best" ranking.
     const models = (await getCatalog()).map((m) => {
@@ -752,7 +761,7 @@ route('GET', '/api/models', async (req, res) => {
       return { ...m, health: healthOf(m.id), chat: !NOT_CHAT.test(m.id), quality: scoreOf(m),
         reliability: r ? { status: r.status, success_rate: r.success_rate, tries: r.tries, recent_success_rate: r.recent_success_rate } : null };
     });
-    send(res, 200, { models, max_models: MAX_MODELS });
+    send(res, 200, { models, max_models: maxModelsFor(user), max_models_all: MAX_MODELS });
   }
   catch (e) { throw new HttpError(502, `Could not load the model catalog: ${e.message}`); }
 });
@@ -1684,7 +1693,7 @@ route('POST', '/api/conversations', async (req, res, { user }) => {
   const { models = [], title, skill_ids } = await readJson(req);
   const ids = [...new Set(models.map(String))];
   if (!ids.length) throw new HttpError(400, 'Pick at least one model');
-  if (ids.length > MAX_MODELS) throw new HttpError(400, `Pick at most ${MAX_MODELS} models`);
+  if (ids.length > maxModelsFor(user)) throw new HttpError(400, limitMsg(maxModelsFor(user)));
   for (const m of ids) if (!(await getModel(m))) throw new HttpError(400, `Unknown model: ${m}`);
   const id = uid(), t = now();
   tx(db, () => {
@@ -1725,8 +1734,8 @@ route('POST', '/api/conversations/:id/models', async (req, res, { user, params }
   const { model_id } = await readJson(req);
   if (!(await getModel(model_id))) throw new HttpError(400, 'Unknown model');
   const rows = db.prepare('SELECT * FROM conversation_models WHERE conversation_id=?').all(c.id);
-  if (rows.filter((r) => r.status === 'active' && r.model_id !== model_id).length >= MAX_MODELS)
-    throw new HttpError(400, `At most ${MAX_MODELS} active models. Pause or remove one first.`);
+  if (rows.filter((r) => r.status === 'active' && r.model_id !== model_id).length >= maxModelsFor(user))
+    throw new HttpError(400, `${limitMsg(maxModelsFor(user))} Pause or remove one first.`);
   const existing = rows.find((r) => r.model_id === model_id);
   if (existing) db.prepare(`UPDATE conversation_models SET status='active', removed_at=NULL WHERE conversation_id=? AND model_id=?`).run(c.id, model_id);
   else db.prepare('INSERT INTO conversation_models (conversation_id, model_id, status, position, added_at) VALUES (?,?,?,?,?)')
@@ -1742,8 +1751,8 @@ route('PATCH', '/api/conversations/:id/models/:model', async (req, res, { user, 
   const rows = db.prepare('SELECT * FROM conversation_models WHERE conversation_id=?').all(c.id);
   const row = rows.find((r) => r.model_id === params.model);
   if (!row) throw new HttpError(404, 'Model not in conversation');
-  if (status === 'active' && row.status !== 'active' && rows.filter((r) => r.status === 'active').length >= MAX_MODELS)
-    throw new HttpError(400, `At most ${MAX_MODELS} active models. Pause or remove one first.`);
+  if (status === 'active' && row.status !== 'active' && rows.filter((r) => r.status === 'active').length >= maxModelsFor(user))
+    throw new HttpError(400, `${limitMsg(maxModelsFor(user))} Pause or remove one first.`);
   db.prepare('UPDATE conversation_models SET status=?, removed_at=NULL WHERE conversation_id=? AND model_id=?').run(status, c.id, params.model);
   send(res, 200, conversationPayload(c));
 });

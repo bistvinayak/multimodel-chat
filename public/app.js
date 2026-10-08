@@ -676,7 +676,29 @@ function renderThread() {
   if (!turns.length) { th.innerHTML = `<div class="empty-thread"><h2>Ask your first question</h2><p>Every active model answers separately. Use the best answer as shared context, and the other models will build on it.</p></div>`; return; }
   th.innerHTML = turns.map(turnHTML).join('');
   enhanceCode(th);
+  syncLanes(S.laneX || 0);
 }
+
+// ---------- more than 3 models: answer columns scroll sideways, every message in step ----------
+const LANES_VISIBLE = 3;
+function syncLanes(x, from) {
+  S.laneX = x;
+  document.querySelectorAll('.lanes.scroll').forEach((el) => {
+    if (el !== from && Math.abs(el.scrollLeft - x) > 1) el.scrollLeft = x;
+    const card = el.querySelector('.card'); const n = el.children.length;
+    const step = card ? card.getBoundingClientRect().width + 12 : 1;
+    const first = Math.min(n - LANES_VISIBLE, Math.round(el.scrollLeft / step)) + 1;
+    const pos = el.previousElementSibling?.querySelector?.('.lane-pos');
+    if (pos) pos.textContent = `Models ${first}–${Math.min(n, first + LANES_VISIBLE - 1)} of ${n}.${first + LANES_VISIBLE - 1 < n ? ' Scroll right for more.' : ''}`;
+  });
+}
+document.addEventListener('scroll', (e) => { if (e.target.classList?.contains('lanes') && e.target.classList.contains('scroll')) syncLanes(e.target.scrollLeft, e.target); }, true);
+document.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-lane-step]'); if (!b) return;
+  const el = b.closest('.turn')?.querySelector('.lanes.scroll'); if (!el) return;
+  const card = el.querySelector('.card');
+  el.scrollBy({ left: Number(b.dataset.laneStep) * (card ? card.getBoundingClientRect().width + 12 : 300), behavior: 'smooth' });
+});
 
 function turnHTML(t) {
   const rs = t.responses;
@@ -691,7 +713,9 @@ function turnHTML(t) {
       : t.mode === 'subset' ? `<div class="turn-meta">Asked ${t.target_models.map((m) => esc(shortName(m))).join(' and ')}</div>` : ''}
     <div class="lane-tabs">${rs.map((r) => `<button class="${r.id === active ? 'on' : ''}" style="--lane:${laneColor(r.model_id)}" data-act="tab" data-turn="${t.id}" data-id="${r.id}">
       <span class="dot" style="background:${laneColor(r.model_id)};width:8px;height:8px;border-radius:50%"></span>${esc(shortName(r.model_id))}${r.status === 'completed' ? ' ✓' : r.status === 'generating' ? ' …' : ['failed', 'rate_limited'].includes(r.status) ? ' ⚠' : ''}</button>`).join('')}</div>
-    <div class="lanes" style="--n:${Math.max(1, rs.length)}">${rs.map((r) => cardHTML(r, r.id === active)).join('')}</div>
+    ${rs.length > LANES_VISIBLE ? `<div class="lane-nav"><span class="muted small lane-pos">Models 1–${LANES_VISIBLE} of ${rs.length}. Scroll right for more.</span>
+      <button class="btn small ghost" data-lane-step="-1" title="Previous model" aria-label="Previous model">◀</button><button class="btn small ghost" data-lane-step="1" title="Next model" aria-label="Next model">▶</button></div>` : ''}
+    <div class="lanes${rs.length > LANES_VISIBLE ? ' scroll' : ''}" style="--n:${Math.max(1, rs.length)}">${rs.map((r) => cardHTML(r, r.id === active)).join('')}</div>
     ${rs.filter((r) => r.status === 'completed').length >= 2 ? `<div class="turn-tools"><button class="btn small" data-act="evaluate" data-turn="${t.id}">⚖ Evaluate answers</button>
       ${S.conv.evaluations?.some((e) => e.turn_id === t.id) ? '<span class="muted small">Evaluated. Run again to rescore.</span>' : ''}</div>` : ''}
   </section>`;
