@@ -14,6 +14,8 @@
     "langfuse:backfill": "node --disable-warning=ExperimentalWarning scripts/langfuse-backfill.js",
     "demo-shop": "node scripts/demo-shop.js",
     "eval": "node --disable-warning=ExperimentalWarning evals/run.js",
-    "check": "node --disable-warning=ExperimentalWarning scripts/check.js"
+    "check": "node --disable-warning=ExperimentalWarning scripts/check.js",
+    "collect:us": "sh research/collect-us.sh",
+    "analyze:us": "python3 research/pain-signals.py data/research/reviews-us.json"
   }
 }

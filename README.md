@@ -46,7 +46,7 @@ Personal keys are encrypted with a master key from `APP_SECRET` (64 hex characte
 | News, jobs and page agents | Describe what to track in plain English, such as "new AI PM roles at AI companies, London or remote", "news about OpenAI launches" or "alert me when this page says applications are open". A planner turns the request into an editable plan for one of four agent types: price, jobs, news or page. Jobs come from 18 company career boards (Greenhouse, Ashby, Lever), HN Who is hiring, Remotive, Remote OK and Arbeitnow. News comes from Google News and Hacker News. Results are keyword-filtered, then AI-screened (Jev when configured), with a reason for each. 👍/👎 on results teach that agent your taste. Results that couldn't be screened are retried next run, never sent as alerts. LinkedIn and Indeed are not scraped, because their terms forbid it. |
 | Feedback | 💬 Feedback on every screen, for a bug, idea, question or praise, with an optional pasted screenshot and automatic context (page, browser, recent errors). There's 👍/👎 on every answer, and an inbox with statuses under Metrics. |
 | Compare models | A page (sidebar: **Compare models**) that puts up to 4 models side by side. Catalog facts: price, context window, max answer length, strengths, estimated rank among free models, and whether each is answering right now. Your own data: answers, how often you picked each one when it was shown next to others, response time, time to first token, answer length, cost, and failure rate. The best value in each row is highlighted. It also shows head-to-head records, a personal leaderboard, and a button to start a chat with the models you're comparing. |
-| Your own OpenRouter key | In Settings, add your own key so your chats run on your OpenRouter account: your credits, your rate limits, and paid models. The key is checked with OpenRouter before saving, encrypted at rest with AES-256-GCM, and never sent back to the browser. Only the last 4 characters are shown. Settings shows its limit, usage and free requests left today. Without a personal key, chats use the shared `OPENROUTER_API_KEY` if the server has one. |
+| Your own OpenRouter key | In Settings, add your own key so your chats run on your OpenRouter account: your credits, your rate limits, and paid models. The key is checked with OpenRouter before saving, encrypted at rest with AES-256-GCM, and never sent back to the browser. Only the last 4 characters are shown. Settings shows its limit, usage and free requests left today. Without a personal key, chats use the shared `OPENROUTER_API_KEY` if the server has one. On a public deployment that is a short free trial (see Public deployment). |
 | Finish | Lists saved and final picks from any model and any turn, with copy and Markdown download. |
 | Preference signal | Use, continue, save and final actions log a preference event with the competing responses and display position, ready for selection-rate analytics. |
 | Mobile | Answers become tabs per turn instead of squeezed columns. |
@@ -96,6 +96,26 @@ npm run langfuse:backfill                   # optional: send chats from before t
 ```
 
 It uses Langfuse's OpenTelemetry endpoint and needs no SDK. Langfuse Cloud shuts down the legacy ingestion API for traces on 2026-11-16. User ids are opaque UUIDs, and emails are never sent. Tracing runs in the background with retries, so a Langfuse outage never slows or breaks a chat. The chat header links to the session, each answer links to its trace, and Settings shows the connection status.
+
+## Public deployment
+
+Live at [vinayakbist.com/chat](https://vinayakbist.com/chat/). Visitors sign up, get a few free messages on the owner's key, then add their own OpenRouter key.
+
+| Setting | What it does |
+|---|---|
+| `ADMIN_EMAILS` | Comma-separated owner emails. Turns on the trial rules for everyone else. Unset (local use) means everyone is an owner and nothing is limited. |
+| `TRIAL_MESSAGES` | Messages a new account can send on the shared key, free models only. Default 5. Sends, edits, retries and model swaps each count as one. |
+| `BASE_PATH` | Serve the app under a sub-path, for example `/chat`. The server adds a `<base>` tag and scopes the session cookie to that path. |
+| `SESSION_COOKIE` | Session cookie name, so the app can share a domain with other apps. Default `sid`. |
+| `COOKIE_SECURE` | `1` adds the Secure flag to the session cookie. Use it behind HTTPS. |
+| `PUBLIC_ORIGIN` | Public URL(s) allowed as the request origin when the app sits behind a proxy, for example `https://vinayakbist.com`. |
+| `APP_SECRET` | Encrypts users' saved keys. Set it in production so keys survive a redeploy. |
+| `KEEPALIVE_URL` | URL the app pings every 4 minutes, so hosts that sleep when idle keep scheduled agents running. |
+
+Rules for non-owners on the shared key:
+- Only free models, and only for chat. Agents need the user's own key because they keep running on a schedule.
+- The shared key's balance is never shown to them.
+- The eval suite and health check can only be started by an owner.
 
 ## Architecture
 

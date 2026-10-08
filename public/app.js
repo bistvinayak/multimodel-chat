@@ -44,10 +44,12 @@ const ERROR_HINT = {
 };
 
 // ---------- utils ----------
+// Sub-path the app is served from (for example "/chat"), taken from the <base> tag the server adds.
+const BASE = (document.querySelector('base')?.getAttribute('href') || '/').replace(/\/+$/, '');
 async function api(method, url, body) {
   // Errors keep any extra fields the server sent (for example suggested links).
   let r;
-  try { r = await fetch(url, { method, headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined }); }
+  try { r = await fetch(BASE + url, { method, headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined }); }
   catch { throw new Error(`Can't reach the app server at ${location.host}. It may be restarting or stopped. Wait a few seconds and try again, or start it with "npm start".`); }
   const data = await r.json().catch(() => null);
   if (r.status === 401 && !url.startsWith('/api/login') && !url.startsWith('/api/signup')) {
@@ -56,6 +58,7 @@ async function api(method, url, body) {
     renderAuth('login', wasSignedIn ? 'Your session ended. Sign in again and you will be back in this conversation, with any unsent message kept.' : '');
     throw new Error('Please sign in');
   }
+  if (r.status === 402 && data?.code === 'needs_key') openKeyPrompt(data.error);
   if (!r.ok) {
     if (r.status >= 500) { recentErrors.push({ at: Date.now(), msg: `${method} ${url} -> ${r.status} ${data?.error || ''}`.slice(0, 300) }); recentErrors.splice(0, recentErrors.length - 10); }
     throw Object.assign(new Error(data?.error || `${r.status} ${r.statusText}`), { data });
@@ -97,6 +100,7 @@ function renderAuth(mode, notice = '') {
     ${notice ? `<div class="notice">${esc(notice)}</div>` : ''}
     <h1>${mode === 'login' ? 'Welcome back' : 'Create your account'}</h1>
     <div class="muted">One conversation. Multiple models. Pick the best response as you go.</div>
+    <div class="small trial-hint" id="trial-hint" hidden></div>
     <form id="auth-form">
       ${mode === 'signup' ? '<input class="input" name="name" placeholder="Name" autocomplete="name" required>' : ''}
       <input class="input" name="email" type="email" placeholder="Email" autocomplete="email" required>
@@ -108,6 +112,11 @@ function renderAuth(mode, notice = '') {
       <a href="#" id="auth-switch">${mode === 'login' ? 'Create one' : 'Sign in'}</a></p>
   </div></div>`;
   $('#auth-switch').onclick = (e) => { e.preventDefault(); renderAuth(mode === 'login' ? 'signup' : 'login', notice); };
+  api('GET', '/api/config').then((c) => {
+    const h = $('#trial-hint'); if (!h || !c.trial_messages) return;
+    h.innerHTML = `Try it free: your first ${c.trial_messages} messages run on free models with no key. After that, add your own <a href="https://openrouter.ai/keys" target="_blank" rel="noopener">OpenRouter key</a> (free to create).`;
+    h.hidden = false;
+  }).catch(() => {});
   $('#auth-form').onsubmit = async (e) => {
     e.preventDefault();
     const fd = Object.fromEntries(new FormData(e.target));
@@ -506,6 +515,7 @@ function renderConv() {
       <div class="attach-tray" hidden></div>
       <div class="small vision-note" id="vision-note"></div>
       <div id="watch-suggest"></div>
+      <div id="trial-note"></div>
       <div class="composer-row">
         <button class="btn attach-btn" id="attach-btn" title="Attach images, PDFs or text files (or drag and drop, or paste)">📎</button>
         <input type="file" id="file-input" multiple hidden accept="${ACCEPT}">
@@ -624,7 +634,7 @@ function renderComposerMeta() {
     ${models.map((m) => `<button class="to-chip ${chosen.has(m.model_id) ? 'on' : ''} ${m.status}" data-to="${esc(m.model_id)}" style="--lane:var(--lane-${m.position % 6})"
         title="${m.status === 'paused' ? 'Paused lane: you can still ask it directly' : 'Click to include or leave out'}">
         <span class="dot" style="background:var(--lane-${m.position % 6})"></span>${esc(shortName(m.model_id))}${chosen.has(m.model_id) ? ' ✓' : ''}</button>`).join('')}`;
-  renderTrays();
+  renderTrays(); renderTrialNote();
   const n = chosen.size;
   $('#send-btn').textContent = S.target === 'all' ? 'Send' : `Send to ${n}`;
   const r = S.reply && S.resp.get(S.reply.id);
@@ -873,7 +883,43 @@ async function sendMessage() {
     try { sessionStorage.removeItem(`draft:${S.conv.conversation.id}`); } catch {}
     setConv(payload); renderHead(); renderThread(); renderComposerMeta(); loadConvs();
     const th = $('#thread'); th.scrollTop = th.scrollHeight;
-  } catch (e) { fail(e); } finally { btn.disabled = false; msg.focus(); }
+    if (S.me.trial) api('GET', '/api/me').then((me) => { S.me = me; renderTrialNote(); }).catch(() => {});
+  } catch (e) { if (e.data?.code !== 'needs_key') fail(e); } finally { btn.disabled = false; msg.focus(); }
+}
+
+// ---------- free trial and bring-your-own-key ----------
+function renderTrialNote() {
+  const box = $('#trial-note'); if (!box) return;
+  const t = S.me?.trial;
+  if (!t) { box.innerHTML = ''; return; }
+  box.innerHTML = t.remaining > 0
+    ? `<div class="trial-note">Free trial: <b>${t.remaining} of ${t.limit}</b> messages left, free models only. <a href="#" data-addkey>Add your OpenRouter key</a> to keep going after that.</div>`
+    : `<div class="trial-note out">You've used your ${t.limit} free messages. <a href="#" data-addkey>Add your OpenRouter key</a> to keep chatting. It's free to create.</div>`;
+  box.querySelector('[data-addkey]').onclick = (e) => { e.preventDefault(); openKeyPrompt(); };
+}
+function openKeyPrompt(reason = '') {
+  if ($('#kp-input')) return; // already open
+  const { el, close } = modal({
+    title: 'Add your OpenRouter key',
+    body: `${reason ? `<div class="notice">${esc(reason)}</div>` : ''}
+      <p style="margin:0">This app runs every model through <b>OpenRouter</b>. With your own key, chats use your account: your free-model allowance, your credits and your rate limits.</p>
+      <ol class="small" style="margin:0;padding-left:18px;line-height:1.7">
+        <li>Sign in at <a href="https://openrouter.ai/keys" target="_blank" rel="noopener">openrouter.ai/keys</a>. It's free.</li>
+        <li>Click <b>Create key</b> and copy it. It starts with <code>sk-or-</code>.</li>
+        <li>Paste it below. Free models work without adding credits.</li></ol>
+      <div class="key-row"><input class="input" id="kp-input" type="password" autocomplete="off" spellcheck="false" placeholder="sk-or-v1-…">
+        <button class="btn primary" id="kp-save">Save key</button></div>
+      <div class="small muted">The key is checked with OpenRouter, encrypted on the server and never shown again. You can remove it any time in Settings.</div>
+      <div class="err-text" id="kp-err"></div>`,
+    foot: '<button class="btn" data-close>Not now</button>',
+  });
+  $('#kp-save', el).onclick = async () => {
+    const btn = $('#kp-save', el); btn.disabled = true; btn.textContent = 'Checking…'; $('#kp-err', el).textContent = '';
+    try {
+      S.me = await api('PUT', '/api/me/openrouter-key', { key: $('#kp-input', el).value });
+      close(); renderTrialNote(); toast('Key saved. Your chats now run on your OpenRouter account.');
+    } catch (e) { $('#kp-err', el).textContent = e.message; btn.disabled = false; btn.textContent = 'Save key'; }
+  };
 }
 
 // ---------- live stream ----------
@@ -889,7 +935,7 @@ function openStream(convId) {
   (async function loop() {
     while (stream?.ctl === ctl) {
       try {
-        const res = await fetch(`/api/conversations/${convId}/stream`, { signal: ctl.signal });
+        const res = await fetch(`${BASE}/api/conversations/${convId}/stream`, { signal: ctl.signal });
         if (res.status === 401) { await api('GET', '/api/me').catch(() => {}); return; }
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         stream.retry = 0; setConn(true);
@@ -1223,6 +1269,7 @@ function openSettings() {
     const box = $('#key-status', el); if (!box) return;
     const usage = k.error ? `⚠ ${esc(k.error)}` : [k.limit != null ? `limit $${Number(k.limit).toFixed(2)}, $${Number(k.limit_remaining ?? 0).toFixed(2)} left` : 'no spending limit',
       k.usage != null ? `$${Number(k.usage).toFixed(2)} used` : '', k.free_daily ? `${k.free_daily.remaining} of ${k.free_daily.limit} free-model requests left today` : ''].filter(Boolean).join(' · ');
+    if (k.source === 'trial') { box.innerHTML = `Free trial: ${k.trial.remaining} of ${k.trial.limit} messages left on this app's key, free models only. Add your key to keep chatting after that.`; return; }
     box.innerHTML = k.source === 'personal' ? `✓ Your chats run on your key ••••${esc(k.last4 || '')}. ${usage}`
       : k.source === 'shared' ? `Your chats run on this app's shared key. ${usage}` : '⚠ No key. Add your OpenRouter key to start chatting.';
   }).catch(() => {});
@@ -1367,8 +1414,8 @@ function turnAttachmentsHTML(t) {
   if (!t.attachments?.length) return '';
   const blind = t.attachments.some((a) => a.kind === 'image') ? t.target_models.filter((id) => S.modelMap.get(id) && !S.modelMap.get(id).vision) : [];
   return `<div class="turn-atts">${t.attachments.map((a) => a.kind === 'image'
-      ? `<a class="att-thumb" href="/api/uploads/${a.id}/raw" target="_blank" rel="noopener" title="${esc(a.name)}"><img src="/api/uploads/${a.id}/raw" alt="${esc(a.name)}" loading="lazy"></a>`
-      : `<a class="att-file" href="/api/uploads/${a.id}/raw" target="_blank" rel="noopener" title="${esc(a.error || a.name)}">${fileIcon(a.kind)} <span>${esc(a.name)}</span> <span class="muted">${fmtSize(a.size)}${a.error ? ' · sent as file' : ''}</span></a>`).join('')}</div>
+      ? `<a class="att-thumb" href="${BASE}/api/uploads/${a.id}/raw" target="_blank" rel="noopener" title="${esc(a.name)}"><img src="${BASE}/api/uploads/${a.id}/raw" alt="${esc(a.name)}" loading="lazy"></a>`
+      : `<a class="att-file" href="${BASE}/api/uploads/${a.id}/raw" target="_blank" rel="noopener" title="${esc(a.error || a.name)}">${fileIcon(a.kind)} <span>${esc(a.name)}</span> <span class="muted">${fmtSize(a.size)}${a.error ? ' · sent as file' : ''}</span></a>`).join('')}</div>
     ${blind.length ? `<div class="turn-meta">${blind.map((id) => esc(shortName(id))).join(', ')} got an AI description of the image${t.attachments.filter((a) => a.kind === 'image').length > 1 ? 's' : ''}</div>` : ''}`;
 }
 

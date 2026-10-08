@@ -13,14 +13,15 @@ const APPS = [
   { app: 'Claude', id: 6473753684 },
   { app: 'Perplexity', id: 1668000334 },
 ];
-const COUNTRIES = ['us', 'gb', 'in', 'ca', 'au'];
+const SORT = process.env.SORT || 'mostrecent'; // or 'mosthelpful' (a different set of up to 500 per country)
+const COUNTRIES = (process.env.COUNTRIES || 'us,gb,in,ca,au').split(',').map((s) => s.trim()).filter(Boolean);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const out = [];
 for (const a of APPS) {
   for (const c of COUNTRIES) {
     let got = 0;
     for (let page = 1; page <= 10; page++) {
-      const url = `https://itunes.apple.com/${c}/rss/customerreviews/page=${page}/id=${a.id}/sortby=mostrecent/json`;
+      const url = `https://itunes.apple.com/${c}/rss/customerreviews/page=${page}/id=${a.id}/sortby=${SORT}/json`;
       let entries = [];
       try {
         const r = await fetch(url, { headers: { 'User-Agent': 'MultiModelWorkspace-Research/1.0' }, signal: AbortSignal.timeout(20000) });
@@ -34,10 +35,11 @@ for (const a of APPS) {
       await sleep(1000);
     }
     console.log(`${a.app.padEnd(10)} ${c}: ${got}`);
+    if (!got) console.error(`warning: ${a.app} ${c} (${SORT}) returned no reviews; Apple feed empty or unavailable`);
   }
 }
 // De-duplicate (the same review can appear on overlapping pages)
 const seen = new Set(); const reviews = out.filter((r) => (seen.has(r.app + r.id) ? false : seen.add(r.app + r.id)));
 mkdirSync(path.join(ROOT, 'data', 'research'), { recursive: true });
-writeFileSync(path.join(ROOT, 'data', 'research', 'app-store-reviews.json'), JSON.stringify({ fetched_at: new Date().toISOString(), source: 'Apple App Store customer-review RSS', countries: COUNTRIES, reviews }, null, 1));
+writeFileSync(process.env.OUT || path.join(ROOT, 'data', 'research', 'app-store-reviews.json'), JSON.stringify({ fetched_at: new Date().toISOString(), source: 'Apple App Store customer-review RSS', sort: SORT, countries: COUNTRIES, reviews }, null, 1));
 console.log('total', reviews.length);

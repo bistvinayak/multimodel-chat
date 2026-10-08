@@ -6,7 +6,7 @@ import { createReadStream, readdirSync, readFileSync, existsSync } from 'node:fs
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { openDb, tx } from './lib/db.js';
-import { hashPassword, verifyPassword, createSession, destroySession, userFromRequest, parseCookies, sessionCookie } from './lib/auth.js';
+import { hashPassword, verifyPassword, createSession, destroySession, userFromRequest, sessionToken, sessionCookie } from './lib/auth.js';
 import { getCatalog, getModel, qualityScore, NOT_CHAT } from './lib/models.js';
 import { healthOf, recordOk, recordLimited, recordBlocked } from './lib/health.js';
 import * as lf from './lib/langfuse.js';
@@ -23,8 +23,9 @@ import { titlePrompt, cleanTitle, summaryPlan, summaryPrompt } from './lib/memor
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 try { process.loadEnvFile(path.join(ROOT, '.env')); } catch {}
 
-const PORT = Number(process.env.PORT || 3210);
-const HOST = process.env.HOST || '127.0.0.1';
+// Zoho Catalyst AppSail passes the port in X_ZOHO_CATALYST_LISTEN_PORT and needs all interfaces.
+const PORT = Number(process.env.X_ZOHO_CATALYST_LISTEN_PORT || process.env.PORT || 3210);
+const HOST = process.env.HOST || (process.env.X_ZOHO_CATALYST_LISTEN_PORT ? '0.0.0.0' : '127.0.0.1');
 const MAX_MODELS = Number(process.env.MAX_MODELS || 3);
 const RATE_LIMIT_RETRIES = Number(process.env.RATE_LIMIT_RETRIES ?? 4);
 // With auto-switch on, retry briefly, then hand the lane to a model that is answering.
@@ -34,6 +35,15 @@ const MAX_AUTO_SWITCHES = 2; // per lane per turn
 const backoffMs = (attempt) => Math.round([3000, 6000, 11000, 18000][Math.min(attempt, 3)] * (0.85 + Math.random() * 0.3));
 const API_KEY = process.env.OPENROUTER_API_KEY;
 if (!API_KEY) console.warn('Note: OPENROUTER_API_KEY is not set. Only users who add their own key in Settings can chat.');
+// Public deployments: each visitor gets a few messages on the shared key, then brings their own OpenRouter key.
+// Without ADMIN_EMAILS (local use) everyone is an admin, so the shared key has no trial limit.
+const TRIAL_MESSAGES = Math.max(0, Number(process.env.TRIAL_MESSAGES ?? 5));
+const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+const isAdmin = (u) => !ADMIN_EMAILS.length || ADMIN_EMAILS.includes(String(u?.email || '').toLowerCase());
+// Served under a sub-path, for example BASE_PATH=/chat for vinayakbist.com/chat/.
+const BASE_PATH = (process.env.BASE_PATH || '').replace(/\/+$/, '');
+// Hosts allowed as Origin for POSTs when the app sits behind a proxy (comma-separated URLs).
+const PUBLIC_HOSTS = (process.env.PUBLIC_ORIGIN || '').split(',').map((s) => s.trim()).filter(Boolean).map((o) => new URL(o).host);
 
 const DB_FILE = process.env.DB_PATH || path.join(ROOT, 'data', 'app.db');
 const db = openDb(DB_FILE);
@@ -49,14 +59,40 @@ function personalKey(user) {
   try { const key = decrypt(user.openrouter_key_enc); keyCache.set(user.id, { blob: user.openrouter_key_enc, key }); return key; }
   catch { console.warn(`[keys] could not decrypt the key for user ${user.id}. Was data/secret.key or APP_SECRET changed?`); return null; }
 }
-/** The key a user's requests run on: their own if they added one, else the shared server key. */
-function keyFor(user) {
-  const fresh = user?.id ? db.prepare('SELECT id, openrouter_key_enc FROM users WHERE id=?').get(user.id) : null;
-  const own = personalKey(fresh || user);
+const trialOf = (u) => ({ limit: TRIAL_MESSAGES, used: u?.trial_used || 0, remaining: Math.max(0, TRIAL_MESSAGES - (u?.trial_used || 0)) });
+/**
+ * The key a user's requests run on: their own if they added one, else the shared server key.
+ * Non-admins use the shared key only while their trial lasts. `charged` marks work for a message that was
+ * already counted (its answers, title, summary, fallback), so the last trial message still completes.
+ * Agents run on a schedule forever, so they never use the shared key for non-admins.
+ */
+function keyFor(user, { charged = false, agent = false } = {}) {
+  const u = (user?.id && db.prepare('SELECT * FROM users WHERE id=?').get(user.id)) || user;
+  const own = personalKey(u);
   if (own) return { key: own, source: 'personal' };
-  if (API_KEY) return { key: API_KEY, source: 'shared' };
-  throw new ModelError('no_key', 'No OpenRouter key is available. Add your own key in Settings.');
+  if (API_KEY && isAdmin(u)) return { key: API_KEY, source: 'shared' };
+  if (API_KEY && !agent && (charged || trialOf(u).remaining > 0)) return { key: API_KEY, source: 'trial' };
+  throw new ModelError('no_key', agent ? 'Agents run on your own OpenRouter key. Add it in Settings.'
+    : API_KEY ? `Your ${TRIAL_MESSAGES} free messages are used up. Add your own OpenRouter key in Settings to keep going.` : 'No OpenRouter key is available. Add your own key in Settings.');
 }
+const needsKey = (msg) => new HttpError(402, msg, { code: 'needs_key' });
+/** Counts one trial message for users on the shared key. Throws 402 needs_key when the trial is over. */
+async function chargeTrial(user, modelIds = []) {
+  const u = db.prepare('SELECT * FROM users WHERE id=?').get(user.id);
+  if (personalKey(u) || isAdmin(u)) return;
+  if (!API_KEY) throw needsKey('Add your OpenRouter key in Settings to start chatting.');
+  if (trialOf(u).remaining < 1) throw needsKey(`You have used your ${TRIAL_MESSAGES} free messages. Add your own OpenRouter key to keep chatting. It's free to create one at openrouter.ai/keys.`);
+  for (const id of modelIds) {
+    const m = await getModel(id);
+    if (m && !m.free) throw needsKey(`The free trial covers free models only. Remove ${m.name || id}, or add your own OpenRouter key to use paid models.`);
+  }
+  db.prepare('UPDATE users SET trial_used=trial_used+1 WHERE id=?').run(u.id);
+}
+function requireOwnKeyForAgents(user) {
+  const u = db.prepare('SELECT * FROM users WHERE id=?').get(user.id);
+  if (!personalKey(u) && !isAdmin(u)) throw needsKey('Agents keep running on a schedule, so they use your own OpenRouter key. Add it in Settings, then create the agent.');
+}
+function requireAdmin(user) { if (!isAdmin(user)) throw new HttpError(403, 'Only the app owner can run this.'); }
 const userById = (id) => db.prepare('SELECT * FROM users WHERE id=?').get(id);
 
 // Jev (TypeSafe) key: the user's own, else the server's TYPESAFE_API_KEY, else none (fallback judge).
@@ -99,7 +135,7 @@ async function readJson(req) {
 const prefsOf = (user) => ({ ...DEFAULT_PREFS, ...JSON.parse(user.preferences || '{}') });
 const publicUser = (u) => ({ id: u.id, name: u.name, email: u.email, plan: u.plan, created_at: u.created_at, preferences: prefsOf(u),
   openrouter_key: u.openrouter_key_enc ? { set: true, last4: u.openrouter_key_last4, added_at: u.openrouter_key_added_at } : { set: false },
-  shared_key_available: !!API_KEY,
+  shared_key_available: !!API_KEY, admin: isAdmin(u), trial: !API_KEY || isAdmin(u) || u.openrouter_key_enc ? null : trialOf(u),
   jev_key: u.jev_key_enc ? { set: true, last4: u.jev_key_last4 } : { set: false }, jev_shared_available: !!process.env.TYPESAFE_API_KEY });
 
 // Every lookup is scoped by the authenticated user_id (PRD section 25).
@@ -437,7 +473,7 @@ async function runResponse(user, resp) {
   };
 
   try {
-    const auth = keyFor(user); // throws a clear error if neither a personal nor a shared key exists
+    const auth = keyFor(user, { charged: true }); // throws a clear error if neither a personal nor a shared key exists
     const model = await getModel(resp.model_id);
     maxOut = maxOutFor(user, model);
     await awaitAttachments(turn.id);
@@ -513,7 +549,7 @@ async function runResponse(user, resp) {
       emit({ type: 'switching' });
       events.push({ name: 'auto_switch_started', time: now() });
       try {
-        const alt = await pickStandIn(getResponseRow(resp.id), keyFor(user).key);
+        const alt = await pickStandIn(getResponseRow(resp.id), keyFor(user, { charged: true }).key);
         if (alt) {
           const newId = swapLane(getResponseRow(resp.id), alt.id, true);
           events.push({ name: 'auto_switched', time: now(), attributes: { from: resp.model_id, to: alt.id, new_response_id: newId } });
@@ -564,7 +600,7 @@ async function maybeTitle(convId) {
   try {
     for (const m of await backgroundModels([answer.model_id])) {
       try {
-        const title = cleanTitle(await complete({ apiKey: keyFor(userById(conv.user_id)).key, model: m.id, messages: titlePrompt(first.user_message, answer.content), maxTokens: 400, timeoutMs: 30_000 }));
+        const title = cleanTitle(await complete({ apiKey: keyFor(userById(conv.user_id), { charged: true }).key, model: m.id, messages: titlePrompt(first.user_message, answer.content), maxTokens: 400, timeoutMs: 30_000 }));
         if (!title) continue;
         const cur = db.prepare('SELECT title_source FROM conversations WHERE id=?').get(convId);
         if (cur?.title_source !== 'auto') return; // the user renamed it meanwhile
@@ -588,7 +624,7 @@ async function maybeSummarize(convId) {
   try {
     for (const m of await backgroundModels()) {
       try {
-        const text = await complete({ apiKey: keyFor(userById(conv.user_id)).key, model: m.id, messages: summaryPrompt(conv.conversation_summary, plan.fold, decisions), maxTokens: 2500, timeoutMs: 90_000 });
+        const text = await complete({ apiKey: keyFor(userById(conv.user_id), { charged: true }).key, model: m.id, messages: summaryPrompt(conv.conversation_summary, plan.fold, decisions), maxTokens: 2500, timeoutMs: 90_000 });
         if (text.length < 40) continue;
         db.prepare('UPDATE conversations SET conversation_summary=?, summary_upto=? WHERE id=?').run(text, plan.upto, convId);
         publish(convId, { type: 'summary', upto: plan.upto });
@@ -627,11 +663,13 @@ route('POST', '/api/login', async (req, res) => {
 }, { auth: false });
 
 route('POST', '/api/logout', async (req, res) => {
-  destroySession(db, parseCookies(req.headers.cookie).sid);
+  destroySession(db, sessionToken(req));
   send(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie('', 0) });
 }, { auth: false });
 
 route('GET', '/api/me', async (req, res, { user }) => send(res, 200, publicUser(user)));
+// Public, before sign-in: whether new accounts get free trial messages on the shared key.
+route('GET', '/api/config', async (req, res) => send(res, 200, { trial_messages: API_KEY && ADMIN_EMAILS.length ? TRIAL_MESSAGES : 0 }), { auth: false });
 
 // ---------- personal OpenRouter key (encrypted at rest, never returned to the browser) ----------
 route('PUT', '/api/me/openrouter-key', async (req, res, { user }) => {
@@ -648,6 +686,7 @@ route('PUT', '/api/me/openrouter-key', async (req, res, { user }) => {
 
 route('GET', '/api/me/openrouter-key', async (req, res, { user }) => {
   const own = personalKey(user);
+  if (!own && API_KEY && !isAdmin(user)) return send(res, 200, { source: 'trial', trial: trialOf(user) });
   const target = own || API_KEY;
   if (!target) return send(res, 200, { source: 'none' });
   try { send(res, 200, { source: own ? 'personal' : 'shared', last4: own ? user.openrouter_key_last4 : null, ...(await keyInfo(target)) }); }
@@ -1119,7 +1158,7 @@ async function inspectUrlInner(user, url) {
     } catch (e) { console.warn('[browser]', e.message); }
   }
   if (x.price == null) {
-    const ai = await extractWithAI({ apiKey: keyFor(user).key, models: (await backgroundModels()).map((m) => m.id), html, url: finalUrl });
+    const ai = await extractWithAI({ apiKey: keyFor(user, { agent: true }).key, models: (await backgroundModels()).map((m) => m.id), html, url: finalUrl });
     x = { ...x, ...ai, title: ai.title || x.title, method: rendered ? 'browser+ai' : 'ai' };
     if (x.price == null) {
       const suggestions = buyLinks(html, finalUrl);
@@ -1199,6 +1238,7 @@ function watchSettings(body, base = {}) {
 }
 
 route('POST', '/api/watches/preview', async (req, res, { user }) => {
+  requireOwnKeyForAgents(user);
   const { url } = await readJson(req);
   send(res, 200, await inspectUrl(user, String(url || '').trim()));
 });
@@ -1208,6 +1248,7 @@ route('GET', '/api/watches', async (req, res, { user }) => {
 });
 
 route('POST', '/api/watches', async (req, res, { user }) => {
+  requireOwnKeyForAgents(user);
   const body = await readJson(req);
   const url = String(body.url || '').trim();
   if (db.prepare(`SELECT COUNT(*) n FROM watches WHERE user_id=? AND status<>'paused'`).get(user.id).n >= MAX_WATCHES) throw new HttpError(400, `You can watch up to ${MAX_WATCHES} links at once. Pause or delete one first.`);
@@ -1299,7 +1340,8 @@ function normalizeMonitor(body, base = {}) {
 async function runMonitor(m, { preview = false } = {}) {
   const user = userById(m.user_id) || m._user;
   if (!user) return { ok: false, error: 'Owner missing' };
-  const apiKey = keyFor(user).key;
+  let apiKey;
+  try { apiKey = keyFor(user, { agent: true }).key; } catch (e) { return { ok: false, error: e.message }; }
   const models = (await backgroundModels()).map((x) => x.id);
   if (m.kind === 'page') {
     if (!(await checkRobots(m.url, watchFetchOpts()))) throw new HttpError(400, "This site's robots.txt does not allow automated checks of that page.");
@@ -1396,7 +1438,8 @@ route('POST', '/api/agents/plan', async (req, res, { user }) => {
   const request = String((await readJson(req)).request || '').trim().slice(0, 1500);
   if (request.length < 8) throw new HttpError(400, 'Describe what you want to track.');
   let plan;
-  try { plan = await planRequest({ request, apiKey: keyFor(user).key, models: (await backgroundModels()).map((m) => m.id) }); }
+  requireOwnKeyForAgents(user);
+  try { plan = await planRequest({ request, apiKey: keyFor(user, { agent: true }).key, models: (await backgroundModels()).map((m) => m.id) }); }
   catch (e) { throw new HttpError(502, e.message); }
   if (plan.type === 'price') {
     plan.interval_minutes = nearestInterval(Number(plan.interval_minutes || 288), WATCH_INTERVALS);
@@ -1412,11 +1455,13 @@ route('GET', '/api/monitors', async (req, res, { user }) => {
 });
 
 route('POST', '/api/monitors/preview', async (req, res, { user }) => {
+  requireOwnKeyForAgents(user);
   const cfg = normalizeMonitor(await readJson(req));
   send(res, 200, await runMonitor({ ...cfg, id: 'preview', user_id: user.id, _user: user, state: '{}', failures: 0 }, { preview: true }));
 });
 
 route('POST', '/api/monitors', async (req, res, { user }) => {
+  requireOwnKeyForAgents(user);
   const body = await readJson(req);
   if (db.prepare(`SELECT COUNT(*) n FROM monitors WHERE user_id=? AND status<>'paused'`).get(user.id).n >= MAX_MONITORS) throw new HttpError(400, `Up to ${MAX_MONITORS} active trackers. Pause or delete one first.`);
   const cfg = normalizeMonitor(body);
@@ -1483,7 +1528,8 @@ route('GET', '/api/evals', async (req, res) => {
   send(res, 200, { latest, history, running: evalRun ? { started_at: evalRun.started_at, log: evalRun.log.slice(-12) } : null,
     feedback_cases: db.prepare('SELECT COUNT(*) n FROM monitor_items WHERE feedback IS NOT NULL').get().n });
 });
-route('POST', '/api/evals/run', async (req, res) => {
+route('POST', '/api/evals/run', async (req, res, { user }) => {
+  requireAdmin(user);
   if (evalRun) throw new HttpError(409, 'An evaluation run is already in progress.');
   if (now() - lastEvalStart < 10 * 60_000) throw new HttpError(429, 'The suite ran less than 10 minutes ago. Try again later.');
   lastEvalStart = now();
@@ -1549,7 +1595,8 @@ route('GET', '/api/checks', async (req, res) => {
   const latest = existsSync(path.join(CHECK_DIR, 'latest.json')) ? JSON.parse(readFileSync(path.join(CHECK_DIR, 'latest.json'), 'utf8')) : null;
   send(res, 200, { latest, running: checkRun ? { started_at: checkRun.started_at, log: checkRun.log.slice(-25) } : null });
 });
-route('POST', '/api/checks/run', async (req, res) => {
+route('POST', '/api/checks/run', async (req, res, { user }) => {
+  requireAdmin(user);
   if (checkRun) throw new HttpError(409, 'A health check is already running.');
   if (now() - lastCheckStart < 5 * 60_000) throw new HttpError(429, 'The check ran less than 5 minutes ago. Try again shortly.');
   lastCheckStart = now(); checkRun = { started_at: now(), log: [] };
@@ -1687,6 +1734,7 @@ route('POST', '/api/conversations/:id/messages', async (req, res, { user, params
   if (!text) throw new HttpError(400, 'Message is empty');
   const { mode, targets } = resolveTargets(c.id, target);
   const ref = replyRef(c.id, reply_to);
+  await chargeTrial(user, targets.map((x) => x.model_id));
   const turnId = uid(), t = now();
   tx(db, () => {
     db.prepare('INSERT INTO turns (id, conversation_id, user_message, mode, target_models, reply_to_response, reply_quote, created_at) VALUES (?,?,?,?,?,?,?,?)')
@@ -1710,6 +1758,7 @@ route('POST', '/api/responses/:id/run', async (req, res, { user, params }) => {
   const r = ownResponse(user, params.id);
   const { regenerate } = await readJson(req);
   if (r.status === 'completed' && !regenerate) throw new HttpError(400, 'Response already completed');
+  await chargeTrial(user, [r.model_id]);
   startRun(user, r.id, { regenerate: !!r.content?.trim() });
   send(res, 202, { ok: true });
 });
@@ -1770,6 +1819,7 @@ route('POST', '/api/turns/:id/edit', async (req, res, { user, params }) => {
   if (resps.some((r) => running.has(r.id))) throw new HttpError(409, 'Stop the running answers first');
   // Stand-ins stay; replaced (busy) lanes are not rerun.
   const rerun = resps.filter((r) => !r.replaced_by);
+  await chargeTrial(user, rerun.map((r) => r.model_id));
   tx(db, () => {
     db.prepare('UPDATE turns SET user_message=?, traced=0 WHERE id=?').run(text, turn.id);
     for (const r of rerun) { archiveVersion(r); db.prepare(`UPDATE responses SET status='pending', content='', reasoning='', error=NULL, error_kind=NULL WHERE id=?`).run(r.id); }
@@ -1793,6 +1843,7 @@ route('POST', '/api/responses/:id/replace', async (req, res, { user, params }) =
   const { model_id } = await readJson(req);
   if (!(await getModel(model_id))) throw new HttpError(400, 'Unknown model');
   if (model_id === r.model_id) throw new HttpError(400, 'Pick a different model');
+  await chargeTrial(user, [model_id]);
   const newId = swapLane(r, model_id, false);
   startRun(user, newId);
   send(res, 200, { ...conversationPayload(ownConversation(user, r.conversation_id)), new_response_id: newId });
@@ -1895,30 +1946,42 @@ route('DELETE', '/api/selections/:id', async (req, res, { user, params }) => {
 
 // ---------- static ----------
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml' };
+// The page gets a <base> tag so relative asset and API paths work under BASE_PATH.
+async function sendIndex(res) {
+  const html = (await readFile(path.join(ROOT, 'public', 'index.html'), 'utf8')).replace('<head>', `<head>\n  <base href="${BASE_PATH}/">`);
+  res.writeHead(200, { 'Content-Type': MIME['.html'], 'Cache-Control': 'no-cache' }); res.end(html);
+}
 async function serveStatic(req, res, pathname) {
   const file = pathname === '/' ? 'index.html' : pathname.slice(1);
   if (file.includes('..')) return send(res, 400, { error: 'Bad path' });
+  if (file === 'index.html') return sendIndex(res);
   try {
     const buf = await readFile(path.join(ROOT, 'public', file));
     res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-cache' });
     res.end(buf);
   } catch {
-    // SPA fallback
-    const buf = await readFile(path.join(ROOT, 'public', 'index.html'));
-    res.writeHead(200, { 'Content-Type': MIME['.html'] }); res.end(buf);
+    return sendIndex(res); // SPA fallback
   }
 }
 
 export const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   try {
-    if (!url.pathname.startsWith('/api/')) return await serveStatic(req, res, url.pathname);
-    // Basic CSRF guard for a cookie-authenticated JSON API.
-    if (req.method !== 'GET' && req.headers.origin && new URL(req.headers.origin).host !== req.headers.host)
-      throw new HttpError(403, 'Cross-origin request blocked');
+    let pathname = url.pathname;
+    if (BASE_PATH) {
+      if (pathname === BASE_PATH) { res.writeHead(301, { Location: `${BASE_PATH}/${url.search}` }); return res.end(); }
+      if (pathname.startsWith(BASE_PATH + '/')) pathname = pathname.slice(BASE_PATH.length);
+    }
+    if (pathname === '/healthz') return send(res, 200, { ok: true });
+    if (!pathname.startsWith('/api/')) return await serveStatic(req, res, pathname);
+    // Basic CSRF guard for a cookie-authenticated JSON API. Behind a proxy, the public host is allowed too.
+    if (req.method !== 'GET' && req.headers.origin) {
+      const from = new URL(req.headers.origin).host;
+      if (from !== req.headers.host && !PUBLIC_HOSTS.includes(from)) throw new HttpError(403, 'Cross-origin request blocked');
+    }
     for (const r of routes) {
       if (r.method !== req.method) continue;
-      const m = url.pathname.match(r.re);
+      const m = pathname.match(r.re);
       if (!m) continue;
       const params = Object.fromEntries(r.keys.map((k, i) => [k, decodeURIComponent(m[i + 1])]));
       const user = userFromRequest(db, req);
@@ -1942,6 +2005,8 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  server.listen(PORT, HOST, () => console.log(`Multi-model workspace running at http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}`));
+  server.listen(PORT, HOST, () => console.log(`Multi-model workspace running at http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}${BASE_PATH}/`));
+  // Hosts that sleep when idle would also pause scheduled agents. KEEPALIVE_URL pings the app every 4 minutes.
+  if (process.env.KEEPALIVE_URL) setInterval(() => fetch(process.env.KEEPALIVE_URL, { signal: AbortSignal.timeout(20_000) }).catch(() => {}), 4 * 60_000).unref();
 }
 export { db };
