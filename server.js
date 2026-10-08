@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { openDb, tx } from './lib/db.js';
 import { hashPassword, verifyPassword, createSession, destroySession, userFromRequest, sessionToken, sessionCookie } from './lib/auth.js';
 import { getCatalog, getModel, qualityScore, NOT_CHAT } from './lib/models.js';
+import { computeReliability } from './lib/reliability.js';
 import { healthOf, recordOk, recordLimited, recordBlocked } from './lib/health.js';
 import * as lf from './lib/langfuse.js';
 import { buildContext, pinnedMemory } from './lib/context.js';
@@ -283,10 +284,33 @@ const ATT_PUBLIC = 'id, name, kind, mime, size, status, error, created_at, (desc
 const attJobs = new Map(); // attachment id -> Promise (PDF extraction / image description)
 const attRow = (id) => db.prepare('SELECT * FROM attachments WHERE id=?').get(id);
 
+// ---------- app-wide model reliability (all users, counts only) ----------
+// A model that keeps failing for everyone should not be promoted in "Free & best", fallbacks or background work.
+let relCache = { at: 0, map: new Map() };
+const REL_WINDOW_DAYS = 7;
+function reliability({ days = REL_WINDOW_DAYS, fresh = false } = {}) {
+  if (!fresh && days === REL_WINDOW_DAYS && now() - relCache.at < 60_000) return relCache.map;
+  const since = now() - days * 86400_000;
+  const rows = db.prepare(`SELECT r.model_id, r.status, r.error_kind, r.latency_ms, r.first_token_ms, r.completion_tokens, r.created_at, c.user_id
+    FROM responses r JOIN conversations c ON c.id=r.conversation_id WHERE r.created_at > ?`).all(since);
+  const picks = new Map(db.prepare(`SELECT winning_model, COUNT(*) n FROM preference_events WHERE created_at > ?
+    AND event_type IN ('use_as_context','final','continue','save') GROUP BY winning_model`).all(since).map((r) => [r.winning_model, r.n]));
+  const ratings = new Map(db.prepare(`SELECT model_id, SUM(rating=1) up, SUM(rating=-1) down FROM responses WHERE rating IS NOT NULL AND created_at > ? GROUP BY model_id`)
+    .all(since).map((r) => [r.model_id, { up: r.up || 0, down: r.down || 0 }]));
+  const map = computeReliability(rows, { picks, ratings });
+  if (days === REL_WINDOW_DAYS) relCache = { at: now(), map };
+  return map;
+}
+const relOf = (id) => reliability().get(id);
+const demoted = (id) => relOf(id)?.status === 'demoted';
+/** One ranking for every place that picks models: catalog heuristics + live health + app-wide reliability, picks and thumbs. */
+const scoreOf = (m) => Math.round((qualityScore(m, { health: healthOf(m.id) }) + (relOf(m.id)?.adj || 0)) * 10) / 10;
+const usable = (m) => !['busy', 'blocked'].includes(healthOf(m.id)) && !demoted(m.id);
+
 async function visionModels(prefer = []) {
   const catalog = await getCatalog();
-  const ranked = catalog.filter((m) => m.free && m.vision && !NOT_CHAT.test(m.id) && !['busy', 'blocked'].includes(healthOf(m.id)) && m.id.endsWith(':free'))
-    .sort((a, b) => qualityScore(b, { health: healthOf(b.id) }) - qualityScore(a, { health: healthOf(a.id) }));
+  const ranked = catalog.filter((m) => m.free && m.vision && !NOT_CHAT.test(m.id) && usable(m) && m.id.endsWith(':free'))
+    .sort((a, b) => scoreOf(b) - scoreOf(a));
   return [...prefer.map((id) => ranked.find((m) => m.id === id)).filter(Boolean), ...ranked].filter((m, i, arr) => arr.indexOf(m) === i).slice(0, 4);
 }
 
@@ -348,7 +372,7 @@ async function rankAlternatives(r) {
   const limited = r.error_kind === 'rate_limit' || r.status === 'rate_limited';
   const hasImages = !!db.prepare(`SELECT 1 FROM attachments WHERE turn_id=? AND kind='image' LIMIT 1`).get(r.turn_id);
   const score = (m) => ({ ok: 4, unknown: 1 }[healthOf(m.id)] || 0)
-    + qualityScore(m, { health: healthOf(m.id) }) / 4                       // prefer stronger models
+    + scoreOf(m) / 4                                                       // prefer stronger, reliable models
     + m.tags.filter((t) => wantTags.has(t)).length
     + (m.context_length >= (cur?.context_length || 0) ? 1 : 0)
     + (m.id.endsWith(':free') ? 1 : 0)                                    // zero-priced non-:free endpoints can still demand credits
@@ -357,7 +381,7 @@ async function rankAlternatives(r) {
   return (await getCatalog())
     .filter((m) => !inConv.has(m.id) && !NOT_CHAT.test(m.id))
     .filter((m) => (cur && !cur.free) || m.free)                          // a free lane only gets free stand-ins
-    .filter((m) => !['busy', 'blocked'].includes(healthOf(m.id)))
+    .filter(usable)                                                       // not busy, unavailable or failing for everyone
     .sort((a, b) => score(b) - score(a) || b.created - a.created);
 }
 
@@ -583,8 +607,8 @@ function onTurnSettled(user, turnId) {
 // Strong, currently-healthy free models first, for background jobs.
 async function backgroundModels(prefer = []) {
   const catalog = await getCatalog();
-  const ranked = catalog.filter((m) => m.free && !NOT_CHAT.test(m.id) && !['busy', 'blocked'].includes(healthOf(m.id)) && m.id.endsWith(':free'))
-    .sort((a, b) => qualityScore(b, { health: healthOf(b.id) }) - qualityScore(a, { health: healthOf(a.id) }));
+  const ranked = catalog.filter((m) => m.free && !NOT_CHAT.test(m.id) && usable(m) && m.id.endsWith(':free'))
+    .sort((a, b) => scoreOf(b) - scoreOf(a));
   const preferred = prefer.map((id) => ranked.find((m) => m.id === id)).filter(Boolean);
   return [...new Set([...preferred, ...ranked])].slice(0, 4);
 }
@@ -722,13 +746,11 @@ route('GET', '/api/langfuse/status', async (req, res) => {
 
 route('GET', '/api/models', async (req, res) => {
   try {
-    // Aggregate preference wins (counts only, no content) feed the "best" ranking.
-    const wins = new Map(db.prepare(`SELECT winning_model, COUNT(*) n FROM preference_events
-      WHERE created_at > ? AND event_type IN ('use_as_context','final','continue') GROUP BY winning_model`)
-      .all(now() - 30 * 86400_000).map((r) => [r.winning_model, r.n]));
+    // App-wide reliability, picks and thumbs (counts only, no content) feed the "best" ranking.
     const models = (await getCatalog()).map((m) => {
-      const health = healthOf(m.id);
-      return { ...m, health, chat: !NOT_CHAT.test(m.id), quality: qualityScore(m, { health, wins: wins.get(m.id) || 0 }) };
+      const r = relOf(m.id);
+      return { ...m, health: healthOf(m.id), chat: !NOT_CHAT.test(m.id), quality: scoreOf(m),
+        reliability: r ? { status: r.status, success_rate: r.success_rate, tries: r.tries, recent_success_rate: r.recent_success_rate } : null };
     });
     send(res, 200, { models, max_models: MAX_MODELS });
   }
@@ -843,11 +865,11 @@ route('GET', '/api/compare', async (req, res, { user }) => {
   const ids = [...new Set((new URL(req.url, 'http://x').searchParams.get('models') || '').split(',').map((x) => x.trim()).filter(Boolean))].slice(0, 4);
   const catalog = await getCatalog();
   const freeRank = new Map(catalog.filter((m) => m.free && !NOT_CHAT.test(m.id) && healthOf(m.id) !== 'blocked')
-    .map((m) => [m.id, qualityScore(m, { health: healthOf(m.id) })]).sort((a, b) => b[1] - a[1]).map(([id], i) => [id, i + 1]));
+    .filter((m) => !demoted(m.id)).map((m) => [m.id, scoreOf(m)]).sort((a, b) => b[1] - a[1]).map(([id], i) => [id, i + 1]));
   const usage = new Map(usageStats(user.id, ids.length ? ids : null).map((u) => [u.model_id, u]));
   const models = ids.map((id) => {
     const m = catalog.find((x) => x.id === id);
-    return { id, catalog: m ? { ...m, health: healthOf(id), quality: qualityScore(m, { health: healthOf(id) }), free_rank: freeRank.get(id) || null } : null, usage: usage.get(id) || null };
+    return { id, catalog: m ? { ...m, health: healthOf(id), quality: scoreOf(m), reliability: relOf(id)?.status || null, free_rank: freeRank.get(id) || null } : null, usage: usage.get(id) || null };
   });
   // Leaderboard: every model this user has used, best pick rate first (needs a few comparisons to rank).
   const leaderboard = usageStats(user.id).map((u) => ({ ...u, name: catalog.find((m) => m.id === u.model_id)?.name || u.model_id }))
@@ -1539,6 +1561,38 @@ route('POST', '/api/evals/run', async (req, res, { user }) => {
   child.stdout.on('data', onData); child.stderr.on('data', onData);
   child.on('close', () => { evalRun = null; });
   send(res, 202, { ok: true });
+});
+
+// ---------- admin: app-wide view across all users (owners only) ----------
+route('GET', '/api/admin/overview', async (req, res, { user }) => {
+  requireAdmin(user);
+  const days = Math.min(90, Math.max(1, Number(new URL(req.url, 'http://x').searchParams.get('days')) || REL_WINDOW_DAYS));
+  const since = now() - days * 86400_000;
+  const rel = reliability({ days });
+  const catalog = await getCatalog();
+  const byId = new Map(catalog.map((m) => [m.id, m]));
+  // Rank exactly as "Free & best" does, so the admin sees what users are offered.
+  const freeRanked = catalog.filter((m) => m.free && !NOT_CHAT.test(m.id) && healthOf(m.id) !== 'blocked' && !demoted(m.id)).sort((a, b) => scoreOf(b) - scoreOf(a));
+  const freeRank = new Map(freeRanked.map((m, i) => [m.id, i + 1]));
+  const ids = new Set([...rel.keys(), ...freeRanked.slice(0, 20).map((m) => m.id)]);
+  const models = [...ids].map((id) => {
+    const m = byId.get(id), r = rel.get(id);
+    return { model_id: id, name: m?.name || id, free: !!m?.free, in_catalog: !!m, health: healthOf(id), base_score: m ? qualityScore(m, { health: healthOf(id) }) : null,
+      score: m ? scoreOf(m) : null, free_rank: freeRank.get(id) || null, promoted: (freeRank.get(id) || 99) <= 6, ...(r || { status: 'no data', tries: 0 }) };
+  }).sort((a, b) => (a.free_rank || 999) - (b.free_rank || 999) || b.tries - a.tries);
+  const one = (sql, ...a) => db.prepare(sql).get(...a).n;
+  const totals = {
+    users: one('SELECT COUNT(*) n FROM users'),
+    new_users: one('SELECT COUNT(*) n FROM users WHERE created_at > ?', since),
+    active_users: one('SELECT COUNT(DISTINCT c.user_id) n FROM turns t JOIN conversations c ON c.id=t.conversation_id WHERE t.created_at > ?', since),
+    own_keys: one('SELECT COUNT(*) n FROM users WHERE openrouter_key_enc IS NOT NULL'),
+    trial_finished: TRIAL_MESSAGES ? one('SELECT COUNT(*) n FROM users WHERE trial_used >= ? AND openrouter_key_enc IS NULL', TRIAL_MESSAGES) : 0,
+    messages: one('SELECT COUNT(*) n FROM turns WHERE created_at > ?', since),
+    answers: [...rel.values()].reduce((a, r) => a + r.tries, 0),
+    answers_ok: [...rel.values()].reduce((a, r) => a + r.ok, 0),
+    demoted: [...rel.values()].filter((r) => r.status === 'demoted').length,
+  };
+  send(res, 200, { days, rules: { prior: '2 of 3', demote: 'under 35% success in the last 24 h with at least 4 tries', unreliable: 'under 60% success over the window' }, totals, models });
 });
 
 // ---------- user feedback ----------

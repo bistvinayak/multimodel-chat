@@ -141,6 +141,7 @@ function renderShell() {
         <div class="brand"><span class="brand-mark"><i style="background:var(--lane-0)"></i><i style="background:var(--lane-1)"></i><i style="background:var(--lane-2)"></i></span>Multi-Model Workspace</div>
         <button class="btn primary" id="new-btn">+ New conversation</button>
         <div class="nav-row"><button class="btn" id="compare-btn">⚖ Compare</button><button class="btn" id="metrics-btn">📊 Metrics</button></div>
+        ${S.me?.admin ? '<div class="nav-row"><button class="btn" id="admin-btn" title="App-wide model reliability and usage across all users">🛡 Admin</button></div>' : ''}
         <button class="btn" id="watches-btn">🔔 Agents <span class="count-badge" id="w-badge" hidden>0</span></button>
       </div>
       <div class="search-wrap"><input class="input" id="conv-search" placeholder="Search chats  (/)" aria-label="Search chats"></div>
@@ -156,6 +157,7 @@ function renderShell() {
   $('#new-btn').onclick = () => { location.hash = '#/new'; closeNav(); };
   $('#compare-btn').onclick = () => { location.hash = '#/compare'; closeNav(); };
   $('#metrics-btn').onclick = () => { location.hash = '#/metrics'; closeNav(); };
+  if ($('#admin-btn')) $('#admin-btn').onclick = () => { location.hash = '#/admin'; closeNav(); };
   $('#watches-btn').onclick = () => { location.hash = '#/agents'; closeNav(); };
   pollNotifications();
   $('#logout-btn').onclick = async () => { await api('POST', '/api/logout').catch(() => {}); S.me = null; renderAuth('login'); };
@@ -315,6 +317,7 @@ function route() {
   if (m) openConversation(m[1]);
   else if (location.hash.startsWith('#/compare')) renderCompare();
   else if (location.hash.startsWith('#/metrics')) renderMetrics();
+  else if (location.hash.startsWith('#/admin') && S.me?.admin) renderAdmin();
   else if (location.hash.startsWith('#/watches')) { S.agentTab = 'prices'; location.replace('#/agents'); }
   else if (location.hash.startsWith('#/agents')) renderAgents();
   else renderNew();
@@ -325,8 +328,9 @@ window.addEventListener('hashchange', () => S.me && route());
 const FILTERS = [['best', '★ Free & best'], ['free', 'Free only'], ['fast', 'Fast'], ['reasoning', 'Best reasoning'], ['coding', 'Coding'], ['popular', 'Popular']];
 // Free chat models ranked by the server's estimated quality score (size, reasoning, context,
 // recency, live health and how often people here pick them).
+// Models failing for most users recently (status "demoted") are left out.
 function bestFree() {
-  return S.models.filter((m) => m.free && m.chat && m.health !== 'blocked').sort((a, b) => b.quality - a.quality);
+  return S.models.filter((m) => m.free && m.chat && m.health !== 'blocked' && m.reliability?.status !== 'demoted').sort((a, b) => b.quality - a.quality);
 }
 function filteredModels(exclude = []) {
   const f = S.filters, q = f.q.trim().toLowerCase();
@@ -377,7 +381,7 @@ function mountPicker(el, opts) {
       const on = sel.includes(m.id), dis = !on && full;
       return `<label class="model-row ${dis ? 'disabled' : ''}" data-id="${esc(m.id)}">
         <input type="checkbox" ${on ? 'checked' : ''} ${dis ? 'disabled' : ''}>
-        <div><div class="model-name">${rankOf?.get(m.id) <= 10 ? `<span class="rank">#${rankOf.get(m.id)}</span> ` : ''}${esc(m.name)}${m.health === 'busy' ? ' <span class="tag busy">busy now</span>' : m.health === 'blocked' ? ' <span class="tag busy">unavailable</span>' : m.health === 'ok' ? ' <span class="tag ok">responding</span>' : ''}</div><div class="model-id">${esc(m.id)}</div>
+        <div><div class="model-name">${rankOf?.get(m.id) <= 10 ? `<span class="rank">#${rankOf.get(m.id)}</span> ` : ''}${esc(m.name)}${m.health === 'busy' ? ' <span class="tag busy">busy now</span>' : m.health === 'blocked' ? ' <span class="tag busy">unavailable</span>' : m.health === 'ok' ? ' <span class="tag ok">responding</span>' : ''}${m.reliability?.status === 'demoted' ? ` <span class="tag busy" title="Most recent answers from this model failed for people using this app">failing often</span>` : m.reliability?.status === 'unreliable' ? ` <span class="tag busy" title="Answered ${pct(m.reliability.success_rate)} of ${m.reliability.tries} recent requests">unreliable</span>` : ''}</div><div class="model-id">${esc(m.id)}</div>
           <div>${m.tags.filter((t) => t !== 'free').map((t) => `<span class="tag">${t}</span>`).join('')}${m.context_length ? `<span class="tag">${fmtTokens(m.context_length)} context</span>` : ''}</div>
           <div class="model-desc">${esc(m.description)}</div></div>
         <div class="price">${priceLabel(m)}</div></label>`;
@@ -1594,6 +1598,51 @@ let metricsState = { days: 30, conversation: '' };
 const fmtNum = (n) => (n == null ? '—' : n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e4 ? `${Math.round(n / 1e3)}K` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}K` : String(Math.round(n)));
 const ERROR_LABEL = { rate_limit: 'Rate limited', insufficient_credits: 'No credits', context_limit: 'Context too long', invalid_model: 'Model unavailable', forbidden: 'Refused for this app',
   timeout: 'Timed out', network: 'Network error', provider_unavailable: 'Provider down', safety: 'Safety filter', empty: 'Empty answer', truncated: 'Cut off at max length', interrupted: 'Server restart', no_key: 'No API key', stopped: 'Stopped by user', unknown: 'Other' };
+
+// ---------- admin: app-wide model reliability (owners only) ----------
+const adminState = { days: 7 };
+const REL_LABEL = { good: ['ok', 'Promoted when ranked'], new: ['', 'Not enough data yet'], unreliable: ['busy', 'Ranked lower'], demoted: ['busy', 'Not promoted'], 'no data': ['', 'No answers yet'] };
+function renderAdmin() {
+  closeStream();
+  S.conv = null; S.resp = new Map(); renderSidebar(); renderSkills();
+  $('#main').innerHTML = `${mobileTop('Admin')}<div class="new-wrap"><div class="new-inner metrics">
+    <div class="m-head"><div><h1>Admin</h1><p class="muted" style="margin:4px 0 0">Model reliability and usage across all users. This is what decides which free models are promoted.</p></div>
+      <div class="m-filters"><div class="seg" role="group" aria-label="Time range">${[[1, '24 h'], [7, '7 days'], [30, '30 days'], [90, '90 days']].map(([d, l]) => `<button data-days="${d}" class="${adminState.days === d ? 'on' : ''}">${l}</button>`).join('')}</div></div></div>
+    <div id="a-body"><div class="muted">Loading…</div></div></div></div>`;
+  $('.m-filters').onclick = (e) => { const b = e.target.closest('[data-days]'); if (!b) return; adminState.days = Number(b.dataset.days); document.querySelectorAll('.seg button').forEach((x) => x.classList.toggle('on', x === b)); loadAdmin(); };
+  loadAdmin();
+}
+async function loadAdmin() {
+  const box = $('#a-body'); if (!box) return;
+  try {
+    const d = await api('GET', `/api/admin/overview?days=${adminState.days}`);
+    const t = d.totals;
+    const tile = (label, value, sub = '') => `<div class="tile"><div class="tile-label">${label}</div><div class="tile-value">${value}</div>${sub ? `<div class="tile-sub">${sub}</div>` : ''}</div>`;
+    const errs = (e) => Object.entries(e || {}).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${esc(k.replace(/_/g, ' '))} ${n}`).join(' · ') || '—';
+    box.innerHTML = `<div class="tiles">
+        ${tile('Users', fmtNum(t.users), `${t.new_users} new · ${t.active_users} active`)}
+        ${tile('Messages', fmtNum(t.messages), `last ${d.days === 1 ? '24 h' : d.days + ' days'}`)}
+        ${tile('Answers that worked', pct(t.answers ? t.answers_ok / t.answers : null), `${fmtNum(t.answers_ok)} of ${fmtNum(t.answers)}`)}
+        ${tile('Own OpenRouter key', fmtNum(t.own_keys), `${t.trial_finished} finished the trial without one`)}
+        ${tile('Models not promoted', t.demoted, 'failing for most users')}
+      </div>
+      <section class="m-card" style="margin-top:14px"><div class="m-card-head"><h2>Free model ranking and reliability</h2></div>
+        <p class="small muted" style="margin:0">Score = catalog estimate (size, reasoning, context, recency, live health) + reliability across all users + picks and 👍/👎.
+          New models start at about 67% success. A model is <b>not promoted</b> when ${esc(d.rules.demote)}, and <b>ranked lower</b> when ${esc(d.rules.unreliable)}. The top 6 free models are what "Free & best" offers.</p>
+        <div class="cmp-wrap"><table class="cmp"><thead><tr><th>#</th><th>Model</th><th>Status</th><th>Score</th><th>Answers</th><th>Worked</th><th>Last 24 h</th><th>Rate limited</th><th>Failed</th><th>Errors</th><th>Users</th><th>p50 time</th><th>First token</th><th>Speed</th><th>Picks</th><th>👍 / 👎</th><th>Last error</th></tr></thead><tbody>
+        ${d.models.map((m) => { const [cls, hint] = REL_LABEL[m.status] || ['', '']; return `<tr>
+          <td>${m.free_rank ? `${m.promoted ? '<b>' : ''}#${m.free_rank}${m.promoted ? '</b>' : ''}` : '—'}</td>
+          <td><b>${esc(shortName(m.model_id))}</b>${m.free ? ' <span class="tag ok">free</span>' : ''}${!m.in_catalog ? ' <span class="tag busy">retired</span>' : ''}<div class="model-id">${esc(m.model_id)}</div></td>
+          <td><span class="tag ${cls}" title="${esc(hint)}">${esc(m.status)}</span>${m.health === 'busy' ? ' <span class="tag busy">busy now</span>' : m.health === 'blocked' ? ' <span class="tag busy">unavailable</span>' : ''}</td>
+          <td title="Catalog estimate ${m.base_score ?? '—'}, adjustment ${m.adj > 0 ? '+' : ''}${m.adj ?? 0}">${m.score ?? '—'} <span class="muted small">(${m.adj > 0 ? '+' : ''}${m.adj ?? 0})</span></td>
+          <td>${m.tries || 0}</td><td class="${m.success_rate >= 0.8 ? 'good' : m.success_rate != null && m.success_rate < 0.5 ? 'bad' : ''}">${pct(m.success_rate)}</td>
+          <td>${m.recent_tries ? `${pct(m.recent_success_rate)} <span class="muted small">(${m.recent_tries})</span>` : '—'}</td>
+          <td>${pct(m.rate_limit_rate)}</td><td>${pct(m.failure_rate)}</td><td class="small muted">${errs(m.errors)}</td><td>${m.users ?? 0}</td>
+          <td>${fmtMs(m.latency_p50)}</td><td>${fmtMs(m.ttft_p50)}</td><td>${m.tokens_per_sec ? `${Math.round(m.tokens_per_sec)} tok/s` : '—'}</td>
+          <td>${m.picks ?? 0}</td><td>${m.thumbs_up ?? 0} / ${m.thumbs_down ?? 0}</td><td class="small muted">${m.last_error_at ? ago(m.last_error_at) : '—'}</td></tr>`; }).join('')}
+        </tbody></table></div></section>`;
+  } catch (e) { box.innerHTML = `<div class="err-box">${esc(e.message)}</div>`; }
+}
 
 function renderMetrics() {
   closeStream();
