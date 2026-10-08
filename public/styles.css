@@ -563,3 +563,6 @@ table.heat td.hcell.dark { color: #ffffff; }
 .trial-note { font-size: 13px; padding: 6px 10px; margin-bottom: 8px; border-radius: 8px; background: color-mix(in srgb, var(--accent) 8%, transparent); border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent); }
 .trial-note.out { background: color-mix(in srgb, var(--warn) 12%, transparent); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
 .trial-hint { margin: 10px 0 0; padding: 8px 10px; border-radius: 8px; background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.warn-text { color: var(--warn); font-weight: 600; }
+.fb-kinds { display: flex; flex-wrap: wrap; gap: 8px; }
+.fb-kind { display: flex; gap: 6px; align-items: center; padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px; cursor: pointer; font-size: 14px; }

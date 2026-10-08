@@ -1672,11 +1672,84 @@ const SUITE_INFO = {
   price: ['Price reader', 'Finds the current price on a product page'],
 };
 let evalPoll = null;
+// ---------- feedback ----------
+const FB_KINDS = [['bug', '🐞 Bug'], ['idea', '💡 Idea'], ['question', '❓ Question'], ['praise', '👏 Praise']];
+function openFeedback(kind = 'bug') {
+  const { el, close } = modal({
+    title: 'Send feedback',
+    body: `<div class="fb-kinds">${FB_KINDS.map(([k, l]) => `<label class="fb-kind"><input type="radio" name="fb-kind" value="${k}" ${k === kind ? 'checked' : ''}> ${l}</label>`).join('')}</div>
+      <textarea class="textarea" id="fb-msg" rows="5" placeholder="What happened, or what would make this better?" style="width:100%"></textarea>
+      <label class="small">Screenshot (optional)<input type="file" id="fb-shot" accept="image/png,image/jpeg,image/webp"></label>
+      <div class="small muted">The page you are on and any recent error messages are attached to help reproduce the problem. Nothing from your chats is included.</div>
+      <div class="err-text" id="fb-err"></div>`,
+    foot: '<button class="btn" data-close>Cancel</button><button class="btn primary" id="fb-send">Send</button>',
+  });
+  $('#fb-msg', el).focus();
+  $('#fb-send', el).onclick = async () => {
+    const btn = $('#fb-send', el); btn.disabled = true; $('#fb-err', el).textContent = '';
+    try {
+      const file = $('#fb-shot', el).files[0];
+      if (file && file.size > 2_500_000) throw new Error('The screenshot is too large. Keep it under 2.5 MB.');
+      const screenshot = file ? await new Promise((ok, bad) => { const r = new FileReader(); r.onload = () => ok(r.result); r.onerror = () => bad(new Error('Could not read the screenshot')); r.readAsDataURL(file); }) : undefined;
+      await api('POST', '/api/feedback', {
+        kind: el.querySelector('input[name="fb-kind"]:checked')?.value || 'idea',
+        message: $('#fb-msg', el).value, screenshot, route: location.hash || '#/',
+        context: { conversation_id: S.conv?.conversation.id || null, user_agent: navigator.userAgent, viewport: `${innerWidth}x${innerHeight}`, recent_errors: recentErrors.slice(-5) },
+      });
+      close(); toast('Thanks! Your feedback was sent.'); loadFeedbackInbox();
+    } catch (e) { $('#fb-err', el).textContent = e.message; btn.disabled = false; }
+  };
+}
+async function loadFeedbackInbox() {
+  const box = $('#fb-body'); if (!box) return;
+  try {
+    const list = await api('GET', '/api/feedback');
+    if (!list.length) { box.innerHTML = 'No feedback yet. Use 💬 next to your name, or + New, to report a bug or suggest an idea.'; return; }
+    const label = Object.fromEntries(FB_KINDS);
+    box.className = '';
+    box.innerHTML = `<div class="cmp-wrap"><table class="cmp"><thead><tr><th>Type</th><th>Message</th><th>Where</th><th>When</th><th>Status</th></tr></thead><tbody>
+      ${list.map((f) => `<tr><td class="small">${label[f.kind] || esc(f.kind)}</td>
+        <td class="small">${esc(f.message)}${f.has_screenshot ? ` <a href="${BASE}/api/feedback/${f.id}/screenshot" target="_blank" rel="noopener">screenshot</a>` : ''}${f.context?.recent_errors?.length ? ` <span class="muted">· ${f.context.recent_errors.length} error${f.context.recent_errors.length > 1 ? 's' : ''} attached</span>` : ''}</td>
+        <td class="small muted">${esc(f.route || '')}</td><td class="small muted">${ago(f.created_at)}</td>
+        <td><select class="input fb-status" data-id="${f.id}" style="padding:2px 6px;font-size:12px">${['new', 'triaged', 'done'].map((st) => `<option ${st === (f.status || 'new') ? 'selected' : ''}>${st}</option>`).join('')}</select></td></tr>`).join('')}
+      </tbody></table></div>`;
+    box.querySelectorAll('.fb-status').forEach((sel) => (sel.onchange = async () => {
+      try { await api('PATCH', `/api/feedback/${sel.dataset.id}`, { status: sel.value }); toast('Status updated'); } catch (e) { fail(e); }
+    }));
+  } catch (e) { box.innerHTML = `<div class="err-box">${esc(e.message)}</div>`; }
+}
+
+let checkPoll = null;
+// App health check card on the Metrics page (owner-only on public deployments).
+async function loadChecks() {
+  const box = $('#checks-body'); if (!box) return;
+  const btn = $('#check-run-btn');
+  if (S.me && S.me.admin === false) { btn.hidden = true; box.textContent = 'The app owner runs this end-to-end check of sign-up, chat, memory, uploads, evaluation and agents.'; }
+  try {
+    const d = await api('GET', '/api/checks');
+    if (S.me?.admin !== false) {
+      btn.disabled = !!d.running; btn.textContent = d.running ? 'Running…' : 'Run check';
+      btn.onclick = async () => { try { await api('POST', '/api/checks/run'); toast('Health check started. It takes a minute or two.'); loadChecks(); } catch (e) { fail(e); } };
+    }
+    clearTimeout(checkPoll); if (d.running) checkPoll = setTimeout(loadChecks, 4000);
+    const L = d.latest;
+    const log = d.running ? `<pre class="eval-log">${esc(d.running.log.join('\n'))}</pre>` : '';
+    if (!L) { if (S.me?.admin !== false) box.innerHTML = `No health check has run yet. It starts a separate copy of the app and tests every main flow.${log}`; return; }
+    const icon = { pass: '<span class="good">✓</span>', warn: '<span class="warn-text">⚠</span>', fail: '<span class="bad">✗</span>' };
+    const { pass = 0, warn = 0, fail: failed = 0 } = L.summary || {};
+    box.className = '';
+    box.innerHTML = `<div class="small muted" style="margin-bottom:6px">Last run ${ago(L.run_at)} · <span class="good">${pass} passed</span> · ${warn} warnings · ${failed ? `<span class="bad">${failed} failed</span>` : '0 failed'}</div>
+      <div class="cmp-wrap"><table class="cmp"><thead><tr><th></th><th>Step</th><th>Area</th><th>Time</th><th>Detail</th></tr></thead><tbody>
+      ${(L.results || []).map((r) => `<tr><td>${icon[r.status] || esc(r.status)}</td><td>${esc(r.name)}</td><td class="muted small">${esc(r.area || '')}</td><td class="small">${(r.ms / 1000).toFixed(1)}s</td><td class="small muted">${esc(r.detail || '')}</td></tr>`).join('')}
+      </tbody></table></div>${log}`;
+  } catch (e) { box.innerHTML = `<div class="err-box">${esc(e.message)}</div>`; }
+}
 async function loadEvals() {
   const box = $('#evals-body'); if (!box) return;
   try {
     const d = await api('GET', '/api/evals');
     const btn = $('#eval-run-btn');
+    if (S.me?.admin === false) btn.hidden = true; // only the owner can start the suite
     btn.disabled = !!d.running; btn.textContent = d.running ? 'Running…' : 'Run evals';
     btn.onclick = async () => { try { await api('POST', '/api/evals/run'); toast('Evaluation started. It takes about 2 minutes.'); loadEvals(); } catch (e) { fail(e); } };
     clearTimeout(evalPoll); if (d.running) evalPoll = setTimeout(loadEvals, 5000);
