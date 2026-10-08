@@ -99,13 +99,13 @@ It uses Langfuse's OpenTelemetry endpoint and needs no SDK. Langfuse Cloud shuts
 
 ## Public deployment
 
-Live at [vinayakbist.com/chat](https://vinayakbist.com/chat/). Visitors sign up, get a few free messages on the owner's key, then add their own OpenRouter key.
+Live at [vinayakbist.com/projects/vigyan/app](https://vinayakbist.com/projects/vigyan/app/) as **Vigyan** (project page: [vinayakbist.com/projects/vigyan](https://vinayakbist.com/projects/vigyan/)). Visitors sign up, get a few free messages on the owner's key, then add their own OpenRouter key.
 
 | Setting | What it does |
 |---|---|
 | `ADMIN_EMAILS` | Comma-separated owner emails. Turns on the trial rules for everyone else. Unset (local use) means everyone is an owner and nothing is limited. |
 | `TRIAL_MESSAGES` | Messages a new account can send on the shared key, free models only. Default 5. Sends, edits, retries and model swaps each count as one. |
-| `BASE_PATH` | Serve the app under a sub-path, for example `/chat`. The server adds a `<base>` tag and scopes the session cookie to that path. |
+| `BASE_PATH` | Serve the app under a sub-path, for example `/projects/vigyan/app`. The server adds a `<base>` tag and scopes the session cookie to that path. |
 | `SESSION_COOKIE` | Session cookie name, so the app can share a domain with other apps. Default `sid`. |
 | `COOKIE_SECURE` | `1` adds the Secure flag to the session cookie. Use it behind HTTPS. |
 | `PUBLIC_ORIGIN` | Public URL(s) allowed as the request origin when the app sits behind a proxy, for example `https://vinayakbist.com`. |
