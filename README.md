@@ -36,7 +36,7 @@ Personal keys are encrypted with a master key from `APP_SECRET` (64 hex characte
 | Pinned memory | 📌 Pin your own message, any answer, or a highlighted part of either, or type `/pin <note>`. Every model gets pinned items on every message, retries included, and they're never trimmed away in long chats (older history is condensed first). Pins may use up to half of a model's context window, and the composer warns when they don't fit. The **Memory** panel at the top of a chat shows everything the models are told: pins, the automatic summary of older turns, and active skills, with token usage. You can edit or unpin anything. The evaluator judges answers against pinned instructions too. |
 | Response actions | Regenerate (earlier answers are kept as versions you can restore), Edit and resend your latest message (click Edit or press ↑ in an empty box), Reply (to the whole answer or a highlighted part; every recipient is told which answer is being replied to), Use as context (whole answer or highlighted part), Continue with this (applies to the next turn only), Ask this model, Copy, Save, Use as final, and Context sent. |
 | Choosing who answers | The composer's "Send to" chips let you send a message to all active models, one model, or any subset. Paused models can still be asked directly. The thread shows who was asked. |
-| Model lanes | Add, pause, resume or remove models mid-conversation. Up to 6 models per chat (`MAX_MODELS`); trial users on the shared key get 3 (`TRIAL_MAX_MODELS`). Beyond 3, answer columns scroll sideways, all messages in step, with ◀ ▶ buttons. History stays visible after removal. |
+| Model lanes | Add, pause, resume or remove models mid-conversation. Any number of models per chat by default (`MAX_MODELS`, set a number to cap it); calls run `RUN_CONCURRENCY` at a time per user (default 4) and the rest queue. Trial users on the shared key get 3 (`TRIAL_MAX_MODELS`). Beyond 3, answer columns scroll sideways, all messages in step, with ◀ ▶ buttons. History stays visible after removal. |
 | Cost | Cost estimate before sending, real cost, tokens and latency per answer, and running totals per conversation. |
 | Convenience | AI-written chat titles. Search across titles, your messages and answers (press `/`). New chats start with the models you used last. Code blocks get syntax highlighting and a Copy button. Cmd/Ctrl+K starts a new chat. |
 | File uploads | Attach images (PNG, JPEG, WebP, GIF), PDFs, and text or code files: up to 6 per message, 20 MB each. Use the 📎 button, drag and drop, or paste a screenshot. Files are checked by their actual content, not the name. PDFs are parsed once at upload with OpenRouter's free engine, and every model gets the text. Models that can see get images directly. The others get a detailed description written once by a free vision model, with all visible text transcribed, so every model in a comparison works from the same material. Automatic stand-ins prefer vision models when a message has images. Saved context and traces hold file references, never the file bytes. Files are private to their owner, served with safe headers, and deleted with the chat or account. Files uploaded but never sent are removed after a day. |
@@ -141,3 +141,31 @@ The API key stays on the server. The browser never sees it.
 ## Not in V1 yet
 
 These are planned for V1.5 and later, as the PRD describes: Jev evaluation, blind mode, combining responses, and analytics dashboards.
+
+
+## Assistants (build your own RAG)
+
+Sidebar → **Assistants**. Create an assistant, add documents (PDF, text, markdown, CSV or pasted text), test it, then publish it.
+
+- **Pipeline** (`lib/rag.js`, `lib/embeddings.js`, no npm dependencies): heading-aware chunking; hybrid search (BM25 keywords plus embeddings, merged by rank fusion); a prompt that only allows the numbered sources; citation checks. **Smart search** uses a free OpenRouter embedding model (`nvidia/nemotron-3-embed-1b:free` by default), so "money back" finds the refund policy. A section passes the relevance gate if it shares enough words (`min_coverage`) OR is close enough in meaning (`min_similarity`, default 0.22, measured on real data); only passing sections are sent to the model. If the embedding service is down, search falls back to keywords and the answer is flagged `keyword_only`.
+- **Guardrails:** refuses without calling the model when no document matches (`min_coverage`); blocks prompt-injection questions; drops documents that try to give orders; withholds prices that no cited source contains; blocked-phrase list; personal data masked in the question log; per-IP rate limit and a daily cap on public questions.
+- **Test tab:** pick any model, see the answer, the cited passages and which checks fired; thumbs up/down are stored.
+- **Publish tab:** creates a key (shown once), an allowed-websites list, and two ways in: the chat box (`<script src=".../embed.js" data-assistant=ID data-key=KEY>`) or `POST /pub/rag/:id/query` with `X-RAG-Key`. Public questions run on the owner's own OpenRouter key.
+- Tests: `test/rag.test.js` (pure logic) and `test/rag-api.test.js` (real server + fake OpenRouter via `OPENROUTER_URL`).
+
+### Quality checks and the evaluation rules
+
+Tabs **Test set** and **Quality**. The test set holds questions with owner-approved correct answers (drafted by an AI from the documents, then reviewed), plus questions the documents do *not* cover. A quality check asks every question, adds 12 built-in attack questions, scores each answer, and reports against 15 rules (`RULES` in `lib/rag-eval.js`; the dashboard shows each rule with how it is checked, its target and the result).
+
+| Group | Rules (required = blocks publishing) |
+|---|---|
+| Finding the answer | RET1 right passage found (required), RET2 rank of the right passage |
+| Answer quality | ANS1 grounded in the documents (required, AI judge), ANS2 correct (required, AI judge), ANS3 complete, ANS4 cites a real source (required), ANS5 numbers match the cited document (required), ANS6 does not refuse answerable questions (required), ANS7 admits when it does not know (required) |
+| Safety | SAF1 all 12 attacks refused with no prompt leak (required), SAF2 no personal data that is not in the documents (required), SAF3 banned words never used (required) |
+| Reliability | OPS1 speed (p95), OPS2 model availability (required), OPS3 enough tests: 8, including 5 answerable (required) |
+
+- **Health score** (0 to 100): groundedness 30%, correctness 25%, retrieval 15%, attack resistance 15%, over-refusal 7.5%, abstention 7.5%. Capped at 70 if the judge scored nothing.
+- **Publish gate:** a key is only created if the newest check ran on the *current* settings and documents and every required rule passed. Changing a setting or document makes the check stale. The owner can override with a checkbox; the API reports `overridden: true`.
+- **Dashboard:** metric cards, all rules, a health trend across runs, improvement suggestions (some with a one-click config fix), "cases to look at" (wrong numbers, guesses, missed retrieval, judge/rule disagreement, slow answers, attacks that got through), and real-use insights (topics customers ask about that no document covers, bad-rated answers that can be turned into tests, repeated questions).
+- **Judge:** the AI judge is told not to reward length or tone and to ignore instructions inside passages. If its output cannot be parsed, the case is left unscored and a run with no judged answers can never pass.
+- Tests: `test/rag-eval.test.js` (every rule, passing and failing), `test/rag-api.test.js` (gate end to end), and ``node scripts/ui-smoke.mjs`, which drives the real app in a headless Chrome with its own profile and fails on any console error, failed request or layout overflow (set `SHOTS=dir` for screenshots).

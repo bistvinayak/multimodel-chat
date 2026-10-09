@@ -1,4 +1,5 @@
 // Multi-Model Workspace frontend. Vanilla JS, no build step.
+import { renderRag } from './rag.js';
 const $ = (s, el = document) => el.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const app = $('#app');
@@ -142,6 +143,7 @@ function renderShell() {
         <button class="btn primary" id="new-btn">+ New conversation</button>
         <div class="nav-row"><button class="btn" id="compare-btn">⚖ Compare</button><button class="btn" id="metrics-btn">📊 Metrics</button></div>
         ${S.me?.admin ? '<div class="nav-row"><button class="btn" id="admin-btn" title="App-wide model reliability and usage across all users">🛡 Admin</button></div>' : ''}
+        <button class="btn" id="assistants-btn" title="Build an AI assistant from your own documents and put it on your website">🧩 Assistants</button>
         <button class="btn" id="watches-btn">🔔 Agents <span class="count-badge" id="w-badge" hidden>0</span></button>
       </div>
       <div class="search-wrap"><input class="input" id="conv-search" placeholder="Search chats  (/)" aria-label="Search chats"></div>
@@ -158,6 +160,7 @@ function renderShell() {
   $('#compare-btn').onclick = () => { location.hash = '#/compare'; closeNav(); };
   $('#metrics-btn').onclick = () => { location.hash = '#/metrics'; closeNav(); };
   if ($('#admin-btn')) $('#admin-btn').onclick = () => { location.hash = '#/admin'; closeNav(); };
+  $('#assistants-btn').onclick = () => { location.hash = '#/assistants'; closeNav(); };
   $('#watches-btn').onclick = () => { location.hash = '#/agents'; closeNav(); };
   pollNotifications();
   $('#logout-btn').onclick = async () => { await api('POST', '/api/logout').catch(() => {}); S.me = null; renderAuth('login'); };
@@ -315,6 +318,7 @@ function renderSidebar() {
 function route() {
   const m = location.hash.match(/^#\/c\/([\w-]+)/);
   if (m) openConversation(m[1]);
+  else if (location.hash.startsWith('#/assistants')) renderRag({ $, api, esc, toast, fail, mobileTop, models: () => S.models, base: BASE }, location.hash);
   else if (location.hash.startsWith('#/compare')) renderCompare();
   else if (location.hash.startsWith('#/metrics')) renderMetrics();
   else if (location.hash.startsWith('#/admin') && S.me?.admin) renderAdmin();
@@ -413,13 +417,16 @@ function mountPicker(el, opts) {
 }
 
 // ---------- new conversation ----------
-let newState = { text: '', selected: [], skills: null };
+let newState = { text: '', selected: [], skills: null, count: 0 };
+const clampCols = (n) => Math.max(1, Math.min(Number(n) || 1, S.maxModels, 99));
 const newSkillIds = () => newState.skills ?? S.skills.filter((k) => k.auto).map((k) => k.id);
 function renderNew() {
   closeStream();
   S.conv = null; S.resp = new Map(); S.live = new Set(); renderSidebar(); renderSkills();
   // Start from the models used last time, if they still exist.
   if (!newState.selected.length && S.me.preferences.last_models?.length) newState.selected = S.me.preferences.last_models.filter((id) => !S.models.length || S.modelMap.has(id)).slice(0, S.maxModels);
+  newState.count = clampCols(newState.count || Math.max(newState.selected.length, 3));
+  newState.selected = newState.selected.slice(0, newState.count);
   $('#main').innerHTML = `${mobileTop('New conversation')}<div class="new-wrap"><div class="new-inner">
     <h1>What would you like help with?</h1>
     <div class="new-box"><textarea class="textarea" id="new-text" rows="4" placeholder="Describe your task, or drop files here. Every model you pick will answer, and the conversation keeps its context.">${esc(newState.text)}</textarea>
@@ -427,8 +434,10 @@ function renderNew() {
       <div class="new-box-bar"><button class="btn small" id="attach-btn" title="Attach images, PDFs or text files">📎 Attach files</button>
         <span class="muted small">Images, PDFs, text and code. Drag and drop or paste works too.</span>
         <input type="file" id="file-input" multiple hidden accept="${ACCEPT}"></div></div>
-    <div><div class="section-title" style="flex-wrap:wrap">Choose models <span class="muted small" style="flex:1">One model is a normal chat. Two or three gives you a side-by-side comparison on every turn.</span>
-        <button class="btn small" id="best-btn" title="Picks the top-ranked free models, from different vendors where possible">★ Pick ${S.maxModels} best free models</button></div>
+    <div><div class="section-title" style="flex-wrap:wrap">Choose models <span class="muted small" style="flex:1">One model is a normal chat. Two or more give you a side-by-side comparison on every turn; extra columns scroll sideways.</span>
+        <span class="col-count" title="How many model columns this chat starts with"><label for="col-n" class="muted small">Columns</label>
+          <button class="btn small" id="col-minus" aria-label="Fewer columns">−</button><input class="input" id="col-n" type="number" min="1" max="${Math.min(S.maxModels, 99)}" value="${newState.count}" style="width:56px;text-align:center"><button class="btn small" id="col-plus" aria-label="More columns">+</button></span>
+        <button class="btn small" id="best-btn" title="Fills the columns with the top-ranked free models, from different vendors where possible">★ Fill with best free models</button></div>
       <div id="new-picker"></div></div>
     <div style="display:flex;gap:10px;justify-content:flex-end;align-items:center"><span class="err-text" id="new-err"></span>
       <button class="btn primary" id="start-btn">Start conversation</button></div>
@@ -438,7 +447,16 @@ function renderNew() {
   bindFileInput($('#file-input'));
   renderTrays();
   $('#new-text').onkeydown = (e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) $('#start-btn').click(); };
-  mountPicker($('#new-picker'), { selected: newState.selected, max: S.maxModels, onChange: (s) => (newState.selected = s) });
+  const pickerOpts = { selected: newState.selected, max: newState.count, onChange: (s) => (newState.selected = s) };
+  mountPicker($('#new-picker'), pickerOpts);
+  const setCols = (n) => {
+    newState.count = clampCols(n); $('#col-n').value = newState.count; pickerOpts.max = newState.count;
+    if (pickerOpts.selected.length > newState.count) { pickerOpts.selected = pickerOpts.selected.slice(0, newState.count); newState.selected = pickerOpts.selected; }
+    $('#new-picker')._redraw();
+  };
+  $('#col-minus').onclick = () => setCols(newState.count - 1);
+  $('#col-plus').onclick = () => setCols(newState.count + 1);
+  $('#col-n').onchange = (e) => setCols(e.target.value);
   $('#best-btn').onclick = async () => {
     const btn = $('#best-btn'); const label = btn.textContent;
     btn.disabled = true; btn.textContent = 'Checking which free models are answering…';
@@ -449,7 +467,7 @@ function renderNew() {
       if (candidates.length) await api('POST', '/api/models/probe', { ids: candidates });
       await loadModels();
     } catch (e) { fail(e); } finally { btn.disabled = false; btn.textContent = label; }
-    const ids = pickBestFree(S.maxModels);
+    const ids = pickBestFree(newState.count);
     if (!ids.length) return toast('No free models are available right now');
     $('#new-picker')._setSelected(ids);
     toast(`Picked: ${ids.map(shortName).join(', ')}`);
@@ -463,7 +481,7 @@ function renderNew() {
       const text = newState.text.trim();
       if (uploadsBusy()) { err.textContent = 'Wait for the uploads to finish.'; btn.disabled = false; return; }
       if (text || pendingIds().length) { payload = await api('POST', `/api/conversations/${payload.conversation.id}/messages`, { message: text, target: 'all', attachment_ids: pendingIds() }); clearPending(); }
-      newState = { text: '', selected: [], skills: null };
+      newState = { text: '', selected: [], skills: null, count: 0 };
       S.target = 'all'; S.reply = null;
       setConv(payload);
       history.replaceState(null, '', `#/c/${payload.conversation.id}`);

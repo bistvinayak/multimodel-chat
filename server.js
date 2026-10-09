@@ -19,6 +19,7 @@ import { safeFetch, checkRobots, extractStructured, extractWithAI, conditionMet,
 import { renderPage, browserEnabled, shutdownBrowser } from './lib/browser.js';
 import { SOURCES, COMPANY_PRESETS, resolveCompany, collect, prefilter, dedupeKey, scoreRelevance, pageDigest, judgePage, planRequest, terms as monTerms } from './lib/monitor.js';
 import { detect, safeName, LIMITS, MAX_PER_MESSAGE, extractPdfText, describeImage, materialize } from './lib/attachments.js';
+import { registerRag } from './lib/rag-routes.js';
 import { titlePrompt, cleanTitle, summaryPlan, summaryPrompt } from './lib/memory.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -27,10 +28,14 @@ try { process.loadEnvFile(path.join(ROOT, '.env')); } catch {}
 // Zoho Catalyst AppSail passes the port in X_ZOHO_CATALYST_LISTEN_PORT and needs all interfaces.
 const PORT = Number(process.env.X_ZOHO_CATALYST_LISTEN_PORT || process.env.PORT || 3210);
 const HOST = process.env.HOST || (process.env.X_ZOHO_CATALYST_LISTEN_PORT ? '0.0.0.0' : '127.0.0.1');
-// Models per chat. More than 3 lanes scroll sideways. Trial users (shared key) stay at TRIAL_MAX_MODELS,
-// because every extra lane spends the shared account's free-model allowance.
-const MAX_MODELS = Number(process.env.MAX_MODELS || 6);
+// Models per chat. More than 3 lanes scroll sideways. Unlimited by default (MAX_MODELS=0 or "unlimited");
+// runs are queued per user (RUN_CONCURRENCY) so many lanes don't trip provider rate limits. Trial users
+// (shared key) stay at TRIAL_MAX_MODELS, because every extra lane spends the shared account's free-model allowance.
+const MAX_MODELS = (() => { const v = process.env.MAX_MODELS; return !v || /^(0|unlimited)$/i.test(v) ? Infinity : Number(v); })();
+const RUN_CONCURRENCY = Math.max(1, Number(process.env.RUN_CONCURRENCY || 4));
+const UNLIMITED = 9999; // what the client sees for "no limit"
 const TRIAL_MAX_MODELS = Math.min(MAX_MODELS, Number(process.env.TRIAL_MAX_MODELS || 3));
+const clientMax = (n) => (Number.isFinite(n) ? n : UNLIMITED);
 const RATE_LIMIT_RETRIES = Number(process.env.RATE_LIMIT_RETRIES ?? 4);
 // With auto-switch on, retry briefly, then hand the lane to a model that is answering.
 const AUTO_SWITCH_RETRIES = Number(process.env.AUTO_SWITCH_RETRIES ?? 1);
@@ -101,7 +106,7 @@ function maxModelsFor(user) {
   return u && (personalKey(u) || isAdmin(u) || !API_KEY) ? MAX_MODELS : TRIAL_MAX_MODELS;
 }
 const convLimit = (convId) => maxModelsFor(userById(db.prepare('SELECT user_id FROM conversations WHERE id=?').get(convId)?.user_id));
-const limitMsg = (n) => `At most ${n} models at once${n < MAX_MODELS ? `. Add your own OpenRouter key in Settings to use up to ${MAX_MODELS}` : ''}.`;
+const limitMsg = (n) => `At most ${n} models at once${n < MAX_MODELS ? `. Add your own OpenRouter key in Settings to use ${Number.isFinite(MAX_MODELS) ? `up to ${MAX_MODELS}` : 'any number of models'}` : ''}.`;
 function requireAdmin(user) { if (!isAdmin(user)) throw new HttpError(403, 'Only the app owner can run this.'); }
 const userById = (id) => db.prepare('SELECT * FROM users WHERE id=?').get(id);
 
@@ -478,7 +483,20 @@ function startRun(user, respId, { regenerate = false } = {}) {
   if (regenerate) archiveVersion(resp);
   // Reserve the slot synchronously so double clicks can't start two runs.
   running.set(respId, { ctl: new AbortController(), convId: resp.conversation_id, content: '', reasoning: '', retrying: null, switching: false });
-  runResponse(user, resp).catch((e) => console.error('[run]', e));
+  runQueued(user.id, () => runResponse(user, resp)).catch((e) => console.error('[run]', e));
+}
+
+// At most RUN_CONCURRENCY model calls in flight per user; the rest wait their turn in order.
+const runSlots = new Map(); // user id -> { active, waiting: [] }
+async function runQueued(userId, fn) {
+  const q = runSlots.get(userId) || runSlots.set(userId, { active: 0, waiting: [] }).get(userId);
+  if (q.active >= RUN_CONCURRENCY) await new Promise((go) => q.waiting.push(go));
+  else q.active++;
+  try { return await fn(); }
+  finally {
+    const next = q.waiting.shift();
+    if (next) next(); else if (--q.active === 0) runSlots.delete(userId);
+  }
 }
 
 function archiveVersion(resp) {
@@ -675,6 +693,9 @@ const route = (method, pattern, handler, { auth = true } = {}) => {
   routes.push({ method, re, keys, handler, auth });
 };
 
+// RAG builder: assistants, documents, playground, and the public widget/API endpoint.
+const rag = registerRag({ route, db, send, readJson, HttpError, uid, now, keyFor, chargeTrial, getModel, complete, detect, safeName, extractPdfText, userById, log: (e) => console.error('[rag]', e) });
+
 route('POST', '/api/signup', async (req, res) => {
   const { name, email, password } = await readJson(req);
   const em = String(email || '').trim().toLowerCase();
@@ -761,7 +782,7 @@ route('GET', '/api/models', async (req, res, { user }) => {
       return { ...m, health: healthOf(m.id), chat: !NOT_CHAT.test(m.id), quality: scoreOf(m),
         reliability: r ? { status: r.status, success_rate: r.success_rate, tries: r.tries, recent_success_rate: r.recent_success_rate } : null };
     });
-    send(res, 200, { models, max_models: maxModelsFor(user), max_models_all: MAX_MODELS });
+    send(res, 200, { models, max_models: clientMax(maxModelsFor(user)), max_models_all: clientMax(MAX_MODELS) });
   }
   catch (e) { throw new HttpError(502, `Could not load the model catalog: ${e.message}`); }
 });
@@ -2036,6 +2057,7 @@ export const server = http.createServer(async (req, res) => {
       if (pathname.startsWith(BASE_PATH + '/')) pathname = pathname.slice(BASE_PATH.length);
     }
     if (pathname === '/healthz') return send(res, 200, { ok: true });
+    if (pathname.startsWith('/pub/rag/') && await rag.handlePublic(req, res, pathname)) return;
     if (!pathname.startsWith('/api/')) return await serveStatic(req, res, pathname);
     // Basic CSRF guard for a cookie-authenticated JSON API. Behind a proxy, the public host is allowed too.
     if (req.method !== 'GET' && req.headers.origin) {
