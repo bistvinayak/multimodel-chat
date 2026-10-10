@@ -2036,8 +2036,16 @@ route('DELETE', '/api/selections/:id', async (req, res, { user, params }) => {
 // ---------- static ----------
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml' };
 // The page gets a <base> tag so relative asset and API paths work under BASE_PATH.
+// Cloudflare caches script and style files for hours, so their URLs carry a hash of their contents: a changed file is a new URL.
+// app.js imports rag.js, so its URL also changes when rag.js does.
+const assetHash = async (...files) => {
+  const h = crypto.createHash('sha256');
+  for (const f of files) h.update(await readFile(path.join(ROOT, 'public', f)).catch(() => ''));
+  return h.digest('hex').slice(0, 8);
+};
 async function sendIndex(res) {
-  const html = (await readFile(path.join(ROOT, 'public', 'index.html'), 'utf8')).replace('<head>', `<head>\n  <base href="${BASE_PATH}/">`);
+  const html = (await readFile(path.join(ROOT, 'public', 'index.html'), 'utf8')).replace('<head>', `<head>\n  <base href="${BASE_PATH}/">`)
+    .replace('src="app.js"', `src="app.js?v=${await assetHash('app.js', 'rag.js')}"`).replace('href="styles.css"', `href="styles.css?v=${await assetHash('styles.css')}"`);
   res.writeHead(200, { 'Content-Type': MIME['.html'], 'Cache-Control': 'no-cache' }); res.end(html);
 }
 async function serveStatic(req, res, pathname) {
@@ -2045,7 +2053,8 @@ async function serveStatic(req, res, pathname) {
   if (file.includes('..')) return send(res, 400, { error: 'Bad path' });
   if (file === 'index.html') return sendIndex(res);
   try {
-    const buf = await readFile(path.join(ROOT, 'public', file));
+    let buf = await readFile(path.join(ROOT, 'public', file));
+    if (file === 'app.js') buf = Buffer.from(buf.toString('utf8').replace("from './rag.js'", `from './rag.js?v=${await assetHash('rag.js')}'`));
     res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-cache' });
     res.end(buf);
   } catch {

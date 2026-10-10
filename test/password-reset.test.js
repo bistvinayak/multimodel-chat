@@ -171,3 +171,14 @@ test('no email configured: a public site never writes the link to its logs; a lo
     assert.equal((await local.post('/api/reset-password', { token, password: 'dev-new-password' })).status, 200);
   } finally { pub.stop(); local.stop(); }
 });
+
+test('script and style URLs change with their content, so a CDN can never serve a stale copy', async () => {
+  const { createHash } = await import('node:crypto'); const { readFileSync } = await import('node:fs');
+  const h = (...f) => { const x = createHash('sha256'); for (const n of f) x.update(readFileSync(path.join('public', n))); return x.digest('hex').slice(0, 8); };
+  const html = await (await fetch(`${base}/`)).text();
+  assert.ok(html.includes(`src="app.js?v=${h('app.js', 'rag.js')}"`), 'app.js carries a hash of itself and rag.js');
+  assert.ok(html.includes(`href="styles.css?v=${h('styles.css')}"`));
+  const js = await (await fetch(`${base}/app.js?v=${h('app.js', 'rag.js')}`)).text();
+  assert.ok(js.includes(`from './rag.js?v=${h('rag.js')}'`), 'the import of rag.js is versioned too');
+  assert.ok(!js.includes("from './rag.js'"));
+});
