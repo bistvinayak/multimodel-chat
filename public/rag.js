@@ -1,7 +1,7 @@
 // "Assistants": build, test and publish a RAG assistant from your own documents.
 // app.js hands in its helpers so this file stays self-contained.
 let H;                                  // { $, api, esc, toast, fail, mobileTop, models, base }
-const R = { apps: [], templates: [], app: null, tab: 'docs', thread: [], queries: [], busy: false, poll: null, quality: null };
+const R = { apps: [], templates: [], app: null, tab: 'docs', thread: [], queries: [], busy: false, poll: null, quality: null, picks: [], picksFor: null };
 
 const fmtDate = (t) => new Date(t).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
 const FLAG_TEXT = {
@@ -60,7 +60,7 @@ async function openApp(id) {
 
 function modelOptions(selected) {
   const { esc } = H;
-  const ms = [...H.models()].filter((m) => m.tags?.includes('free') || m.free).slice(0, 60);
+  const ms = [...H.models()].filter((m) => (m.tags?.includes('free') || m.free) && m.chat !== false).slice(0, 60);
   if (selected && !ms.some((m) => m.id === selected)) ms.unshift({ id: selected, name: selected });
   return `<option value="">Choose a model…</option>` + ms.map((m) => `<option value="${esc(m.id)}" ${m.id === selected ? 'selected' : ''}>${esc(m.name || m.id)}</option>`).join('');
 }
@@ -117,45 +117,95 @@ function paneDocs() {
   }));
 }
 
-// ---- playground ----
-const answerHTML = (text, sources, cited) => {
+// ---- playground: ask once, compare several models side by side ----
+const answerHTML = (text, sources) => {
   const { esc } = H;
   return esc(text).replace(/\[(\d{1,2})\]/g, (m, n) => `<sup class="cite" data-cite="${n}" title="${esc(sources[n - 1] ? `${sources[n - 1].doc_name}${sources[n - 1].heading ? ' · ' + sources[n - 1].heading : ''}` : '')}">${n}</sup>`).replace(/\n/g, '<br>');
 };
-function turnHTML(t) {
+const shortModel = (id) => String(id).split('/').pop().replace(/:free$/, '');
+const MODEL_ERR = { rate_limit: 'This free model is busy right now. Try again in a minute, or pick another model.', timeout: 'This model took too long to answer. Try another one.',
+  insufficient_credits: 'This model needs credits on your OpenRouter account. Pick a free one.', empty: 'This model sent an empty reply. Try another one.', request: 'The request failed.' };
+const modelErrText = (r) => MODEL_ERR[r.error_kind] || (r.error ? `The model said: ${String(r.error).slice(0, 160)}` : 'The model could not answer.');
+
+/** Passages grouped by document, so three passages from one file read as one document, not three sources. */
+function sourcesHTML(sources, used = true) {
   const { esc } = H;
-  const flags = t.flags.map((f) => `<span class="tag ${['no_relevant_source', 'uncited'].includes(f) ? '' : 'busy'}">${esc(FLAG_TEXT[f] || f)}</span>`).join(' ');
-  return `<div class="rag-turn"><div class="rag-q">${esc(t.question)}</div>
-    <div class="rag-a ${t.refused ? 'refused' : ''}">${answerHTML(t.answer, t.sources, t.cited)}</div>
-    ${t.error ? `<div class="small err-text">The model said: ${esc(String(t.error).slice(0, 200))} Try again, or choose another model.</div>` : ''}
-    <div class="small muted">${flags} ${t.model ? esc(t.model) + ' · ' : ''}${t.latency_ms} ms · match ${Math.round(Math.max(t.coverage || 0, t.similarity || 0) * 100)}%
-      <button class="btn small ghost" data-rate="1" data-q="${esc(t.query_id)}" title="Good answer">👍</button><button class="btn small ghost" data-rate="-1" data-q="${esc(t.query_id)}" title="Bad answer">👎</button></div>
-    ${t.sources.length ? `<details class="rag-src"><summary>${t.sources.length} source${t.sources.length === 1 ? '' : 's'} used</summary>${t.sources.map((s, i) =>
-      `<div class="rag-snip"><b>[${i + 1}] ${esc(s.doc_name)}${s.heading ? ' · ' + esc(s.heading) : ''}</b> <span class="muted small">words ${Math.round(s.coverage * 100)}%${s.sim != null ? ` · meaning ${Math.round(s.sim * 100)}%` : ''}</span><div>${esc(s.text)}</div></div>`).join('')}</details>` : ''}</div>`;
+  if (!sources?.length) return '';
+  const docs = new Map();
+  sources.forEach((s, i) => { if (!docs.has(s.doc_name)) docs.set(s.doc_name, []); docs.get(s.doc_name).push({ ...s, n: i + 1 }); });
+  const n = sources.length, d = docs.size;
+  const title = used ? `Used ${n} passage${n === 1 ? '' : 's'} from ${d} document${d === 1 ? '' : 's'}` : `Closest ${n} passage${n === 1 ? '' : 's'} from ${d} document${d === 1 ? '' : 's'}, none close enough to answer from`;
+  return `<details class="rag-src"><summary>${title}: ${[...docs.keys()].map(esc).join(', ')}</summary>${[...docs].map(([name, list]) =>
+    `<div class="rag-doc"><b>${esc(name)}</b>${list.map((s) => `<div class="rag-snip"><b>[${s.n}] ${s.heading ? esc(s.heading) : 'Passage'}</b> <span class="muted small">words ${Math.round(s.coverage * 100)}%${s.sim != null ? ` · meaning ${Math.round(s.sim * 100)}%` : ''}</span><div>${esc(s.text)}</div></div>`).join('')}</div>`).join('')}</details>`;
 }
+
+function colHTML(c, ti, ci) {
+  const { esc } = H;
+  const head = `<div class="rag-colhead"><b title="${esc(c.model)}">${esc(shortModel(c.model))}</b>${c.status === 'done' && c.result.latency_ms != null ? `<span class="muted small">${(c.result.latency_ms / 1000).toFixed(1)}s</span>` : ''}</div>`;
+  if (c.status === 'pending') return `<div class="rag-col">${head}<div class="muted">Thinking… <span data-sec="${c.t0}">0</span>s</div></div>`;
+  const r = c.result;
+  if (c.status === 'error' || (r.flags || []).includes('model_error'))
+    return `<div class="rag-col err">${head}<div class="small">${esc(modelErrText(r))}</div><div><button class="btn small" data-retry="${ti}:${ci}">Try again</button></div></div>`;
+  const flags = (r.flags || []).map((f) => `<span class="tag ${['no_relevant_source', 'uncited'].includes(f) ? '' : 'busy'}">${esc(FLAG_TEXT[f] || f)}</span>`).join(' ');
+  return `<div class="rag-col">${head}<div class="rag-a ${r.refused ? 'refused' : ''}">${answerHTML(r.answer, r.sources || [])}</div>
+    <div class="small muted">${flags} match ${Math.round(Math.max(r.coverage || 0, r.similarity || 0) * 100)}%
+      <button class="btn small ghost" data-rate="1" data-q="${esc(r.query_id)}" title="Good answer">👍</button><button class="btn small ghost" data-rate="-1" data-q="${esc(r.query_id)}" title="Bad answer">👎</button></div>
+    <div><button class="btn small ghost" data-use="${esc(c.model)}" title="Make this the model your assistant uses">Use this model</button></div></div>`;
+}
+function turnHTML(t, ti) {
+  const { esc } = H;
+  const withSrc = t.cols.find((c) => c.status === 'done' && c.result.sources?.length);
+  return `<div class="rag-turn"><div class="rag-q">${esc(t.q)}</div>
+    <div class="rag-cols">${t.cols.map((c, ci) => colHTML(c, ti, ci)).join('')}</div>${sourcesHTML(withSrc?.result.sources, !(withSrc?.result.flags || []).includes('no_relevant_source'))}</div>`;
+}
+
 function paneTry() {
-  const { $, esc, api, fail } = H;
+  const { $, esc, api, fail, toast } = H;
   const a = R.app;
-  $('#rag-pane').innerHTML = `<div class="rag-try"><div class="rag-model"><label class="small muted">Model</label><select class="select" id="rag-model">${modelOptions(a.config.model)}</select></div>
-    <div id="rag-thread">${R.thread.length ? R.thread.map(turnHTML).join('') : '<div class="muted">Ask a question a customer might ask. You will see the answer, which documents it came from, and which safety checks fired.</div>'}</div>
-    <div class="rag-ask"><textarea class="textarea" id="rag-q" rows="2" placeholder="Ask a question…"></textarea><button class="btn primary" id="rag-go">Ask</button></div></div>`;
-  const go = async () => {
-    const q = $('#rag-q').value.trim(); if (!q || R.busy) return;
-    const model = $('#rag-model').value; if (!model) return fail(new Error('Choose a model first.'));
-    R.busy = true; $('#rag-go').disabled = true; $('#rag-go').textContent = 'Thinking…';
+  if (!R.picks.length || R.picksFor !== a.id) { R.picks = [a.config.model || '']; R.picksFor = a.id; }
+  const pending = () => R.thread.some((t) => t.cols.some((c) => c.status === 'pending'));
+  const picksHTML = () => R.picks.map((m, i) => `<span class="rag-pick"><select class="select" data-pick="${i}" ${i === 0 ? 'id="rag-model"' : ''} aria-label="Model ${i + 1}">${modelOptions(m)}</select>${R.picks.length > 1 ? `<button class="btn small ghost" data-rmpick="${i}" title="Remove this model" aria-label="Remove model ${i + 1}">×</button>` : ''}</span>`).join('');
+  $('#rag-pane').innerHTML = `<div class="rag-picks" id="rag-picks">${picksHTML()}<button class="btn small" id="rag-addpick" title="Ask several models at once and compare their answers">+ Compare another model</button></div>
+    <div id="rag-thread"></div>
+    <div class="rag-ask"><textarea class="textarea" id="rag-q" rows="2" placeholder="Ask a question…"></textarea><button class="btn primary" id="rag-go">Ask</button></div>`;
+
+  const drawThread = () => {
+    const el = $('#rag-thread'); if (!el) return;
+    el.innerHTML = R.thread.length ? R.thread.map(turnHTML).join('') : '<div class="muted">Ask a question a customer might ask. Add more models to compare how each one answers from the same documents. You will see which passages were used and which safety checks fired.</div>';
+    const go = $('#rag-go'); if (go) { go.disabled = pending(); go.textContent = pending() ? 'Waiting…' : 'Ask'; }
+    el.querySelectorAll('[data-rate]').forEach((b) => (b.onclick = async () => { try { await api('PATCH', `/api/rag/queries/${b.dataset.q}`, { rating: Number(b.dataset.rate) }); b.classList.add('on'); } catch (err) { fail(err); } }));
+    el.querySelectorAll('[data-retry]').forEach((b) => (b.onclick = () => { const [ti, ci] = b.dataset.retry.split(':').map(Number); run(R.thread[ti], ci); }));
+    el.querySelectorAll('[data-use]').forEach((b) => (b.onclick = async () => { try { R.app = { ...(await api('PATCH', `/api/rag/apps/${a.id}`, { config: { model: b.dataset.use } })), docs: a.docs, search: a.search }; toast(`${shortModel(b.dataset.use)} is now this assistant's model`); } catch (err) { fail(err); } }));
+  };
+  const tick = () => document.querySelectorAll('[data-sec]').forEach((e) => { e.textContent = Math.round((Date.now() - Number(e.dataset.sec)) / 1000); });
+  clearInterval(R.poll); R.poll = setInterval(tick, 1000);
+
+  async function run(turn, ci) {
+    const c = turn.cols[ci]; c.status = 'pending'; c.t0 = Date.now(); drawThread();
     try {
-      const r = await api('POST', `/api/rag/apps/${a.id}/ask`, { question: q, model });
-      if (model !== a.config.model) { R.app = await api('PATCH', `/api/rag/apps/${a.id}`, { config: { model } }); R.app.docs = a.docs; }
-      R.thread.push(r); $('#rag-q').value = '';
-    } catch (e) { fail(e); } finally { R.busy = false; }
-    paneTry(); $('#rag-thread').lastElementChild?.scrollIntoView({ block: 'nearest' });
+      c.result = await api('POST', `/api/rag/apps/${a.id}/ask`, { question: turn.q, model: c.model, quick: true }); c.status = 'done';
+      // the first successful model becomes the assistant's model when none is saved yet (publishing needs one)
+      if (!R.app.config.model && !(c.result.flags || []).includes('model_error')) R.app = { ...(await api('PATCH', `/api/rag/apps/${a.id}`, { config: { model: c.model } })), docs: a.docs, search: a.search };
+    } catch (e) { c.status = 'error'; c.result = { error: e.message, error_kind: 'request', flags: ['model_error'] }; }
+    drawThread();
+  }
+  const ask = () => {
+    const q = $('#rag-q').value.trim(); if (!q || pending()) return;
+    const models = [...new Set(R.picks.filter(Boolean))]; if (!models.length) return fail(new Error('Choose a model first.'));
+    const turn = { q, cols: models.map((m) => ({ model: m, status: 'pending', t0: Date.now() })) };
+    R.thread.push(turn); $('#rag-q').value = ''; drawThread();
+    turn.cols.forEach((_, ci) => run(turn, ci));
+    $('#rag-thread').lastElementChild?.scrollIntoView({ block: 'nearest' });
   };
-  $('#rag-go').onclick = go;
-  $('#rag-q').onkeydown = (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); go(); } };
-  $('#rag-thread').onclick = async (e) => {
-    const b = e.target.closest('[data-rate]'); if (!b) return;
-    try { await api('PATCH', `/api/rag/queries/${b.dataset.q}`, { rating: Number(b.dataset.rate) }); b.classList.add('on'); } catch (err) { fail(err); }
-  };
+  const redrawPicks = () => { $('#rag-picks').innerHTML = `${picksHTML()}<button class="btn small" id="rag-addpick">+ Compare another model</button>`; bindPicks(); };
+  function bindPicks() {
+    $('#rag-picks').querySelectorAll('[data-pick]').forEach((sel) => (sel.onchange = () => { R.picks[Number(sel.dataset.pick)] = sel.value; }));
+    $('#rag-picks').querySelectorAll('[data-rmpick]').forEach((b) => (b.onclick = () => { R.picks.splice(Number(b.dataset.rmpick), 1); redrawPicks(); }));
+    $('#rag-addpick').onclick = () => { if (R.picks.length >= 8) return toast('Up to 8 models at once'); R.picks.push(''); redrawPicks(); };
+  }
+  bindPicks(); drawThread();
+  $('#rag-go').onclick = ask;
+  $('#rag-q').onkeydown = (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); ask(); } };
 }
 
 // ---- settings ----

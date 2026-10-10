@@ -154,3 +154,12 @@ test('only passages that pass the relevance gate are sent to the model', async (
   assert.equal(r.sources.length, 1); assert.equal(r.sources[0].heading, 'Returns');
   assert.ok(!seen.includes('nuts, milk') && !seen.includes('Monday to Friday'), 'irrelevant passages are left out');
 });
+
+test('prices are compared as amounts: sentence punctuation and formatting do not cause false refusals', async () => {
+  const chunks = [{ id: 'a', doc_id: 'd', doc_name: 'faq', heading: 'Delivery', text: 'Delivery costs $4.99, and is free for orders over $40. A gold cake is $1,200.' }];
+  const ask = (a) => answerQuestion({ chunks, question: 'How much is delivery?', config: { model: 'm' }, complete: async () => a });
+  for (const ok of ['Delivery costs $4.99. [1]', 'Delivery costs $4.99 [1].', 'It is $4.99, and free over $40. [1]', 'Free over $40.00 [1]', 'The gold cake is $1200 [1].', 'It costs 4.99 USD [1].'])
+    assert.equal((await ask(ok)).refused, false, ok);
+  for (const bad of ['Delivery costs $9.99. [1]', 'Delivery costs $4.90 [1].', 'It is free over $4 [1].', 'The cake is $120 [1].'])
+    assert.ok((await ask(bad)).flags.includes('unsupported_price'), bad);
+});

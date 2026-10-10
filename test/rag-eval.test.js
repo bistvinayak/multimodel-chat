@@ -209,3 +209,9 @@ test('an answer the judge scored correct is not reported as a retrieval miss', (
   assert.ok(!types.includes('retrieval_miss')); assert.ok(types.includes('judge_disagreement'));
   assert.ok(findOutliers([{ ...r, judge: { groundedness: 4, correctness: 0, completeness: 0 } }]).some((o) => o.type === 'retrieval_miss'));
 });
+
+test('numbers are compared by value, so formatting differences are not errors', () => {
+  assert.deepEqual(unsupportedNumbers('Free over $40.00 and 4.990 for delivery', ['Delivery costs $4.99 and is free over $40']), []);
+  assert.deepEqual(unsupportedNumbers('Free over $45', ['free over $40']), ['45']);
+  assert.deepEqual(unsupportedNumbers('Costs 1,200', ['It costs 1200.00']), []);
+});

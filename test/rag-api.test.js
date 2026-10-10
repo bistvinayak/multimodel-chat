@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 let fake, child, dir, base, cookie = '', answer = 'Delivery costs $4.99 [1].';
-let embedCalls = 0, embedFail = false;
+let embedCalls = 0, embedFail = false, busyCalls = 0;
 const CONCEPTS = { refund: ['refund', 'refunds', 'money', 'back', 'return', 'returns', 'replace', 'damaged'], allergy: ['allergy', 'allergies', 'allergen', 'allergens', 'sensitivity', 'sensitivities', 'nuts', 'wheat', 'soy', 'eggs', 'milk'],
   delivery: ['deliver', 'delivery', 'delivered', 'brought', 'shipping', 'dispatch'], hours: ['open', 'hours', 'opening', 'closed', 'close', 'saturday', 'sunday', 'holidays'], cake: ['cake', 'cakes', 'custom', 'birthday', 'gluten'] };
 const hashN = (str) => [...str].reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7);
@@ -45,7 +45,9 @@ before(async () => {
       const msgs = JSON.parse(raw || '{}').messages || [];
       const sys = msgs[0]?.content || '', usr = msgs.at(-1)?.content || '';
       let content;
-      const maxTokens = JSON.parse(raw || '{}').max_tokens || 0;
+      const parsed = JSON.parse(raw || '{}'); const maxTokens = parsed.max_tokens || 0;
+      if (parsed.model === 'test/slow') return setTimeout(() => res.end(JSON.stringify({ choices: [{ message: { content: 'too late [1]' } }] })), 1500);
+      if (parsed.model === 'test/busy') { busyCalls++; res.statusCode = 429; return res.end(JSON.stringify({ error: { message: 'temporarily rate-limited upstream', code: 429 } })); }
       if (thinking && maxTokens < 1000) { emptyReplies++; return res.end(JSON.stringify({ choices: [{ message: { content: '' }, finish_reason: 'length' }] })); }
       if (/test question writer/.test(sys) && /per passage/.test(sys)) { const i = genCalls++ * 2; content = JSON.stringify(POOL.slice(i, i + 2).map((q) => ({ ...q, source: 1 }))); }
       else if (/test question writer/.test(sys)) content = JSON.stringify(['Do you sell kayaks?', 'Can I pay with cryptocurrency?', 'Do you offer a loyalty scheme?', 'Is there a vegan sushi counter?']);
@@ -59,7 +61,7 @@ before(async () => {
   dir = mkdtempSync(path.join(tmpdir(), 'rag-test-'));
   base = `http://127.0.0.1:${PORT}`;
   child = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', 'server.js'], { cwd: path.resolve('.'), stdio: 'ignore',
-    env: { ...process.env, PORT: String(PORT), HOST: '127.0.0.1', DB_PATH: path.join(dir, 'app.db'), APP_SECRET: 'a'.repeat(64), OPENROUTER_API_KEY: 'test-key', OPENROUTER_URL: `http://127.0.0.1:${fake.address().port}/v1/chat`, ADMIN_EMAILS: '', RAG_EVAL_RETRY_MS: '5', RAG_EMBED_RETRY_MS: '5' } });
+    env: { ...process.env, PORT: String(PORT), HOST: '127.0.0.1', DB_PATH: path.join(dir, 'app.db'), APP_SECRET: 'a'.repeat(64), OPENROUTER_API_KEY: 'test-key', OPENROUTER_URL: `http://127.0.0.1:${fake.address().port}/v1/chat`, ADMIN_EMAILS: '', RAG_EVAL_RETRY_MS: '5', RAG_EMBED_RETRY_MS: '5', RAG_QUICK_TIMEOUT_MS: '300' } });
   for (let i = 0; i < 50; i++) { try { if ((await fetch(base + '/healthz')).ok) break; } catch {} await new Promise((ok) => setTimeout(ok, 100)); }
   const s = await call('POST', '/api/signup', { name: 'Test', email: 'o@example.com', password: 'password123' });
   assert.equal(s.status, 201, JSON.stringify(s.body));
@@ -281,4 +283,21 @@ test('smart search: paraphrases, switching it off, the service being down, and r
   assert.equal(fixed.body.embedded, fixed.body.total);
   const parking = await call('POST', `/api/rag/apps/${id}/ask`, { question: 'Is there free parking behind the shop?', model: 'test/model' });
   assert.equal(parking.body.refused, false); assert.equal(parking.body.sources[0].heading, 'Parking');
+});
+
+test('interactive asks fail fast and say why: a slow model times out, a busy one gets one retry', async () => {
+  cookie = '';
+  await call('POST', '/api/login', { email: 'o@example.com', password: 'password123' });
+  answer = null; thinking = false; embedFail = false;
+  const { body: a } = await call('POST', '/api/rag/apps', { name: 'Fast fail', sample: true });
+  const t0 = Date.now();
+  const slow = await call('POST', `/api/rag/apps/${a.id}/ask`, { question: 'What are your opening hours?', model: 'test/slow', quick: true });
+  assert.ok(Date.now() - t0 < 1200, `gave up quickly (${Date.now() - t0}ms), no retry after a timeout`);
+  assert.equal(slow.body.error_kind, 'timeout'); assert.ok(slow.body.flags.includes('model_error')); assert.equal(slow.body.refused, true);
+  busyCalls = 0;
+  const busy = await call('POST', `/api/rag/apps/${a.id}/ask`, { question: 'What are your opening hours?', model: 'test/busy', quick: true });
+  assert.equal(busy.body.error_kind, 'rate_limit'); assert.equal(busyCalls, 2, 'one try plus one retry, not three');
+  // another model is unaffected by the failed ones
+  const fine = await call('POST', `/api/rag/apps/${a.id}/ask`, { question: 'What are your opening hours?', model: 'test/model', quick: true });
+  assert.equal(fine.body.refused, false); assert.deepEqual(fine.body.cited, [1]);
 });

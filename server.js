@@ -20,6 +20,7 @@ import { renderPage, browserEnabled, shutdownBrowser } from './lib/browser.js';
 import { SOURCES, COMPANY_PRESETS, resolveCompany, collect, prefilter, dedupeKey, scoreRelevance, pageDigest, judgePage, planRequest, terms as monTerms } from './lib/monitor.js';
 import { detect, safeName, LIMITS, MAX_PER_MESSAGE, extractPdfText, describeImage, materialize } from './lib/attachments.js';
 import { registerRag } from './lib/rag-routes.js';
+import { registerPasswordReset } from './lib/password-reset.js';
 import { titlePrompt, cleanTitle, summaryPlan, summaryPrompt } from './lib/memory.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -692,6 +693,10 @@ const route = (method, pattern, handler, { auth = true } = {}) => {
   const re = new RegExp('^' + pattern.replace(/:(\w+)/g, (_, k) => { keys.push(k); return '([^/]+)'; }) + '$');
   routes.push({ method, re, keys, handler, auth });
 };
+
+// Forgot / reset password. Links use PUBLIC_ORIGIN (never the Host header, which a caller controls).
+registerPasswordReset({ route, db, send, readJson, HttpError, hashPassword, basePath: BASE_PATH,
+  origin: () => (process.env.PUBLIC_ORIGIN || '').split(',')[0].trim() || `http://127.0.0.1:${PORT}` });
 
 // RAG builder: assistants, documents, playground, and the public widget/API endpoint.
 const rag = registerRag({ route, db, send, readJson, HttpError, uid, now, keyFor, chargeTrial, getModel, complete, detect, safeName, extractPdfText, userById, log: (e) => console.error('[rag]', e) });

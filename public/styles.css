@@ -651,3 +651,14 @@ table.heat td.hcell.dark { color: #ffffff; }
 .main { min-width: 0; }
 .rag-wrap, .rag-scroll { min-width: 0; max-width: 100%; }
 .rag-rules td.wrap { white-space: normal; min-width: 120px; }
+
+/* Try tab: compare models side by side */
+.rag-picks { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
+.rag-pick { display: inline-flex; gap: 2px; align-items: center; }
+.rag-pick .select { width: auto; max-width: 280px; }
+.rag-cols { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(260px, 1fr); gap: 10px; overflow-x: auto; padding-bottom: 6px; margin: 8px 0 4px; }
+.rag-col { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; background: var(--panel); display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.rag-col.err { border-style: dashed; }
+.rag-colhead { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+.rag-col .rag-a { border: none; background: none; padding: 0; margin: 0; }
+.rag-doc { margin: 6px 0 10px; }

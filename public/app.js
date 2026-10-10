@@ -95,6 +95,73 @@ document.addEventListener('selectionchange', () => {
 });
 
 // ---------- auth ----------
+// Analytics (GoatCounter). Event names only: never an email address, token or anything the user typed.
+function track(name, title) {
+  const send = () => window.goatcounter?.count?.({ path: `vigyan/${name}`, title: title || name, event: true });
+  try { if (window.goatcounter?.count) send(); else setTimeout(() => { try { send(); } catch {} }, 1500); } catch { /* analytics must never break the app */ }
+}
+
+function renderForgot(email = '') {
+  track('forgot-password-opened', 'Forgot password: opened');
+  app.innerHTML = `<div class="auth"><div class="auth-card">
+    <h1>Reset your password</h1>
+    <div class="muted">Enter the email you signed up with and we will send you a link to choose a new password.</div>
+    <form id="forgot-form">
+      <input class="input" name="email" type="email" placeholder="Email" autocomplete="email" value="${esc(email)}" required>
+      <div class="err-text" id="auth-err"></div>
+      <button class="btn primary" type="submit">Send reset link</button>
+    </form>
+    <p class="small muted" style="margin:14px 0 0"><a href="#" id="back-login">Back to sign in</a></p>
+  </div></div>`;
+  $('#back-login').onclick = (e) => { e.preventDefault(); renderAuth('login'); };
+  $('#forgot-form').onsubmit = async (e) => {
+    e.preventDefault();
+    const btn = e.target.querySelector('button'); btn.disabled = true; $('#auth-err').textContent = '';
+    try {
+      const r = await api('POST', '/api/forgot-password', { email: new FormData(e.target).get('email') });
+      track('forgot-password-requested', 'Forgot password: link requested');
+      $('.auth-card').innerHTML = `<h1>Check your email</h1><div class="notice" id="forgot-done">${esc(r.message)}</div>
+        <p class="small muted" style="margin:14px 0 0"><a href="#" id="back-login">Back to sign in</a></p>`;
+      $('#back-login').onclick = (ev) => { ev.preventDefault(); renderAuth('login'); };
+    } catch (err) { $('#auth-err').textContent = err.message; btn.disabled = false; }
+  };
+}
+
+async function renderReset(token) {
+  track('reset-password-link-opened', 'Reset password: link opened');
+  history.replaceState(null, '', location.pathname + location.search); // keep the token out of the address bar and history
+  app.innerHTML = '<div class="boot">Checking your link…</div>';
+  let valid = false;
+  try { valid = (await api('POST', '/api/reset-password/check', { token })).valid; } catch (e) { valid = false; }
+  if (!valid) {
+    track('reset-password-link-invalid', 'Reset password: link invalid or expired');
+    app.innerHTML = `<div class="auth"><div class="auth-card"><h1>This link has expired</h1>
+      <div class="muted">Reset links work once, for one hour. Ask for a new one and use it straight away.</div>
+      <p><button class="btn primary" id="again">Send me a new link</button></p></div></div>`;
+    $('#again').onclick = () => renderForgot();
+    return;
+  }
+  app.innerHTML = `<div class="auth"><div class="auth-card">
+    <h1>Choose a new password</h1>
+    <form id="reset-form">
+      <input class="input" name="password" type="password" placeholder="New password (8+ characters)" autocomplete="new-password" required minlength="8">
+      <input class="input" name="again" type="password" placeholder="Type it again" autocomplete="new-password" required minlength="8">
+      <div class="err-text" id="auth-err"></div>
+      <button class="btn primary" type="submit">Save new password</button>
+    </form></div></div>`;
+  $('#reset-form').onsubmit = async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    if (fd.get('password') !== fd.get('again')) { $('#auth-err').textContent = 'The two passwords do not match.'; return; }
+    const btn = e.target.querySelector('button'); btn.disabled = true;
+    try {
+      await api('POST', '/api/reset-password', { token, password: fd.get('password') });
+      track('reset-password-completed', 'Reset password: completed');
+      S.me = null; renderAuth('login', 'Your password was changed. Sign in with the new one.');
+    } catch (err) { $('#auth-err').textContent = err.message; btn.disabled = false; }
+  };
+}
+
 function renderAuth(mode, notice = '') {
   $('#modal-root').innerHTML = '';
   app.innerHTML = `<div class="auth"><div class="auth-card">
@@ -108,10 +175,12 @@ function renderAuth(mode, notice = '') {
       <input class="input" name="password" type="password" placeholder="Password (8+ characters)" autocomplete="${mode === 'login' ? 'current-password' : 'new-password'}" required minlength="8">
       <div class="err-text" id="auth-err"></div>
       <button class="btn primary" type="submit">${mode === 'login' ? 'Sign in' : 'Create account'}</button>
+      ${mode === 'login' ? '<a href="#" id="forgot-link" class="small" style="text-align:center">Forgot your password?</a>' : ''}
     </form>
     <p class="small muted" style="margin:14px 0 0">${mode === 'login' ? 'No account yet?' : 'Already have an account?'}
       <a href="#" id="auth-switch">${mode === 'login' ? 'Create one' : 'Sign in'}</a></p>
   </div></div>`;
+  const fl = $('#forgot-link'); if (fl) fl.onclick = (e) => { e.preventDefault(); renderForgot($('#auth-form [name=email]').value); };
   $('#auth-switch').onclick = (e) => { e.preventDefault(); renderAuth(mode === 'login' ? 'signup' : 'login', notice); };
   api('GET', '/api/config').then((c) => {
     const h = $('#trial-hint'); if (!h || !c.trial_messages) return;
@@ -316,6 +385,8 @@ function renderSidebar() {
 }
 
 function route() {
+  const reset = location.hash.match(/^#\/reset\/([\w-]{20,})$/);
+  if (reset) return renderReset(reset[1]);
   const m = location.hash.match(/^#\/c\/([\w-]+)/);
   if (m) openConversation(m[1]);
   else if (location.hash.startsWith('#/assistants')) renderRag({ $, api, esc, toast, fail, mobileTop, models: () => S.models, base: BASE }, location.hash);
@@ -2452,6 +2523,8 @@ document.addEventListener('keydown', (e) => {
 
 // ---------- boot ----------
 (async () => {
+  const reset = location.hash.match(/^#\/reset\/([\w-]{20,})$/);
+  if (reset) return renderReset(reset[1]);
   try { S.me = await api('GET', '/api/me'); await startApp(); }
   catch { if (!S.me) renderAuth('login'); }
 })();

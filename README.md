@@ -171,3 +171,23 @@ Tabs **Test set** and **Quality**. The test set holds questions with owner-appro
 - Tests: `test/rag-eval.test.js` (every rule, passing and failing), `test/rag-api.test.js` (gate end to end), and ``node scripts/ui-smoke.mjs`, which drives the real app in a headless Chrome with its own profile and fails on any console error, failed request or layout overflow (set `SHOTS=dir` for screenshots).
 
 **Hosting note (Catalyst AppSail):** the platform gateway answers CORS preflights itself with an empty 200 and no CORS headers, so any cross-origin request that needs a preflight is blocked in browsers. The chat box therefore sends a "simple" request (`Content-Type: text/plain`, key in the JSON body, no custom headers). Servers can still send the key as `X-RAG-Key` or `Authorization: Bearer`. `RAG_SIMULATE_GATEWAY_PREFLIGHT=1` makes this app behave like the gateway so `scripts/ui-smoke.mjs` catches regressions.
+
+## Forgot password
+
+The sign-in screen has "Forgot your password?". The user enters their email, gets a one-hour, single-use link, and chooses a new password. Resetting signs the account out everywhere and sends a "your password was changed" notice.
+
+- **Email** (`lib/mail.js`, no dependencies) works with any SMTP provider. Set `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`, `MAIL_FROM` (for example `Vigyan <no-reply@yourdomain.com>`), and optionally `SMTP_PORT` (465 uses implicit TLS, 587 uses STARTTLS) and `SMTP_SECURE` (`tls`, `starttls` or `none`, which is for local testing only). It refuses to send a password over an unencrypted connection to another machine.
+- **Links** are built from `PUBLIC_ORIGIN` (the first entry) plus `BASE_PATH`, never from the request's Host header. The token sits in the URL fragment and is removed from the address bar as soon as the page opens.
+- **Without email configured**, a local run prints the reset link to the console so development works. When `PUBLIC_ORIGIN` is set (a public site), the link is never written to the logs; a warning says email is not configured.
+- **Safety:** the answer to "forgot password" is identical and instant whether or not the email has an account; tokens are stored only as hashes; a new request cancels older links; limits apply per email (3 an hour), per address (20 an hour) and to guessing.
+- **Owner recovery** with no email at all: `node scripts/reset-password.mjs you@example.com` sets a random password and prints it once (or pass your own as a second argument). It uses `DB_PATH` and signs the account out everywhere.
+- **Analytics:** the app loads GoatCounter (the same account as the portfolio pages) and records these events, names only, never an email or token: `vigyan/forgot-password-opened`, `vigyan/forgot-password-requested`, `vigyan/reset-password-link-opened`, `vigyan/reset-password-link-invalid`, `vigyan/reset-password-completed`.
+- Tests: `test/mail.test.js` (a fake SMTP server that also speaks TLS and STARTTLS), `test/password-reset.test.js` (the full flow and every rule above), and the forgot/reset steps in `scripts/ui-smoke.mjs`. The browser test supplies its own model catalog (`OPENROUTER_MODELS_URL`), so it no longer depends on the internet.
+
+### Try tab: compare models
+
+"+ Compare another model" asks several models at once (up to 8) and shows their answers side by side, each with its own timer and its own reason if it fails ("busy right now", "too slow", "needs credits"), a "Try again" button, and "Use this model" to make a winner the assistant's model. The passages used are listed once, grouped by document ("Used 2 passages from 1 document"); for a refusal they are labelled "Closest passages, none close enough". Classifier models such as "Content Safety" are not offered as chat models.
+
+Interactive asks fail fast (`quick`): one retry, and a 25 second limit per model (`RAG_QUICK_TIMEOUT_MS`), because a person is watching. Quality checks stay patient. Free models are often slow or rate limited, so compare a few. `RAG_DEBUG_RAW=1` logs each raw model reply to the server console for debugging.
+
+Price guardrail: amounts are compared by value, so "$4.99." at the end of a sentence and "$40.00" against a document saying "$40" are accepted; a price that is not in the cited document is still withheld.
