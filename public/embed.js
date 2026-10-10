@@ -22,8 +22,10 @@
   root.querySelector('.h').textContent = title;
   var panel = root.querySelector('.p'), msgs = root.querySelector('.m'), input = root.querySelector('input');
   function add(cls, text) { var d = document.createElement('div'); d.className = cls; d.textContent = text; msgs.appendChild(d); msgs.scrollTop = msgs.scrollHeight; return d; }
+  // A "simple" cross-origin request (text/plain, no custom headers) so browsers send it without a preflight.
   function post(path, body) {
-    return fetch(base + '/pub/rag/' + id + '/' + path, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-RAG-Key': key }, body: JSON.stringify(body) })
+    body.key = key;
+    return fetch(base + '/pub/rag/' + id + '/' + path, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=UTF-8' }, body: JSON.stringify(body) })
       .then(function (r) { return r.json().then(function (j) { if (!r.ok) throw new Error(j.error || 'Something went wrong'); return j; }); });
   }
   root.querySelector('.b').onclick = function () { panel.classList.toggle('o'); if (panel.classList.contains('o')) { if (!msgs.children.length) add('a', 'Hi! Ask me about our business.'); input.focus(); } };

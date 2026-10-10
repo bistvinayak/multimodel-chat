@@ -116,6 +116,16 @@ test('build, test, publish and embed an assistant', async () => {
   const pre = await fetch(`${base}/pub/rag/${id}/query`, { method: 'OPTIONS', headers: { Origin: 'https://www.mybakery.com' } });
   assert.equal(pre.status, 204);
 
+  // The chat box sends a "simple" request (text/plain, key in the body) so no preflight is needed. Catalyst's gateway
+  // answers preflights without CORS headers, so this is the path real browsers take in production.
+  const simple = (key, origin) => fetch(`${base}/pub/rag/${id}/query`, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=UTF-8', Origin: origin }, body: JSON.stringify({ question: 'How much is delivery?', key }) })
+    .then(async (r) => ({ status: r.status, acao: r.headers.get('access-control-allow-origin'), body: await r.json() }));
+  const viaBody = await simple(token, 'https://www.mybakery.com');
+  assert.equal(viaBody.status, 200); assert.equal(viaBody.acao, 'https://www.mybakery.com'); assert.ok(viaBody.body.answer);
+  assert.equal((await simple('rag_wrong', 'https://www.mybakery.com')).status, 401);
+  assert.equal((await simple(token, 'https://evil.example')).status, 403);
+  assert.equal((await simple(token, 'https://evil.example')).acao, null, 'no CORS grant for a stranger');
+
   // feedback and the question log
   assert.equal((await call('POST', `/pub/rag/${id}/feedback`, { query_id: web.body.query_id, rating: -1 }, { 'X-RAG-Key': token })).body.ok, true);
   const log = await call('GET', `/api/rag/apps/${id}/queries`);

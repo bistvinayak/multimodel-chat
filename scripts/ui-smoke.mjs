@@ -59,7 +59,7 @@ const dir = mkdtempSync(path.join(tmpdir(), 'ui-smoke-'));
 const PORT = 4100 + Math.floor(Math.random() * 400);
 const base = `http://127.0.0.1:${PORT}`;
 const server = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', 'server.js'], { cwd: ROOT, stdio: ['ignore', 'ignore', 'pipe'],
-  env: { ...process.env, PORT: String(PORT), HOST: '127.0.0.1', DB_PATH: path.join(dir, 'app.db'), APP_SECRET: 'b'.repeat(64), OPENROUTER_API_KEY: 'test-key', OPENROUTER_URL: `http://127.0.0.1:${fake.address().port}/v1/chat`, ADMIN_EMAILS: '', BROWSER_RENDER: 'off', RAG_EVAL_RETRY_MS: '5', RAG_EMBED_RETRY_MS: '5' } });
+  env: { ...process.env, PORT: String(PORT), HOST: '127.0.0.1', DB_PATH: path.join(dir, 'app.db'), APP_SECRET: 'b'.repeat(64), OPENROUTER_API_KEY: 'test-key', OPENROUTER_URL: `http://127.0.0.1:${fake.address().port}/v1/chat`, ADMIN_EMAILS: '', BROWSER_RENDER: 'off', RAG_EVAL_RETRY_MS: '5', RAG_EMBED_RETRY_MS: '5', RAG_SIMULATE_GATEWAY_PREFLIGHT: '1' } });
 let serverErr = ''; server.stderr.on('data', (d) => (serverErr += d));
 for (let i = 0; i < 60; i++) { try { if ((await fetch(base + '/healthz')).ok) break; } catch {} await sleep(100); }
 
