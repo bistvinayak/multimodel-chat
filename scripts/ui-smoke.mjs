@@ -220,7 +220,7 @@ try {
   const snippet = await p.ev(`document.querySelector('.rag-code').innerText`);
   const attrs = Object.fromEntries([...snippet.matchAll(/data-(\w+)="([^"]*)"/g)].map((m) => [m[1], m[2]]));
   const src = snippet.match(/src="([^"]+)"/)?.[1];
-  step('embed snippet has script src, assistant id and key', !!(src && attrs.assistant && attrs.key?.startsWith('rag_')), src);
+  step('embed snippet has a versioned script src, assistant id and key', !!(src && /embed\.js\?v=[0-9a-f]{8}$/.test(src) && attrs.assistant && attrs.key?.startsWith('rag_')), src);
 
   // Questions tab
   await p.ev(`document.querySelector('[data-tab="log"]').click()`);

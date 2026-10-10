@@ -196,7 +196,7 @@ async function panePublish() {
   const { $, esc, api, fail, toast } = H;
   const a = R.app;
   const origin = location.origin + H.base;
-  const snippet = (token) => `<script src="${origin}/embed.js" data-assistant="${a.id}" data-key="${token}" data-title="${esc(a.name)}" async></script>`;
+  const snippet = (token) => `<script src="${origin}/embed.js?v=${a.embed_version || 1}" data-assistant="${a.id}" data-key="${token}" data-title="${esc(a.name)}" async></script>`;
   $('#rag-pane').innerHTML = '<div class="muted">Loading…</div>';
   let q; try { q = await api('GET', `/api/rag/apps/${a.id}/quality`); } catch (e) { return fail(e); }
   const g = q.gate;

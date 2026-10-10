@@ -71,6 +71,7 @@ test('build, test, publish and embed an assistant', async () => {
   assert.equal(created.status, 201);
   const id = created.body.id;
   const app = await call('GET', `/api/rag/apps/${id}`);
+  assert.match(app.body.embed_version, /^[0-9a-f]{8}$/, 'embed script URL is versioned so a CDN cannot serve a stale copy');
   assert.equal(app.body.docs.length, 1); assert.ok(app.body.docs[0].chunks >= 3);
 
   // paste a second doc; a duplicate is refused
